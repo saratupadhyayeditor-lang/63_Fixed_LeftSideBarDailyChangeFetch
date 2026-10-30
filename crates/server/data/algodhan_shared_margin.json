@@ -1,0 +1,53 @@
+{
+  "paperTotal": 1000000.0,
+  "realTotal": 0.0,
+  "realSource": "dhan",
+  "realLive": 0.0,
+  "realFetchedAt": 0,
+  "engines": {
+    "equitypaper": {
+      "enabled": true,
+      "mode": "pct",
+      "pct": 25.0,
+      "amount": 0.0
+    },
+    "paper": {
+      "enabled": true,
+      "mode": "pct",
+      "pct": 100.0,
+      "amount": 0.0
+    },
+    "paper2": {
+      "enabled": true,
+      "mode": "pct",
+      "pct": 100.0,
+      "amount": 0.0
+    },
+    "paper3": {
+      "enabled": true,
+      "mode": "pct",
+      "pct": 25.0,
+      "amount": 0.0
+    },
+    "realtime": {
+      "enabled": true,
+      "mode": "pct",
+      "pct": 100.0,
+      "amount": 0.0
+    },
+    "realtime2": {
+      "enabled": true,
+      "mode": "pct",
+      "pct": 100.0,
+      "amount": 0.0
+    },
+    "realtime3": {
+      "enabled": true,
+      "mode": "pct",
+      "pct": 100.0,
+      "amount": 0.0
+    }
+  },
+  "legacyMigrated": true,
+  "paperSeeded": true
+}

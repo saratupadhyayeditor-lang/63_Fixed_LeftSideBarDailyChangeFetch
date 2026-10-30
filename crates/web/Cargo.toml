@@ -1,0 +1,62 @@
+[package]
+name = "algo-web"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+algo-core = { path = "../core" }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde-wasm-bindgen = "0.6"
+serde_json = "1"
+console_error_panic_hook = "0.1"
+
+[dependencies.web-sys]
+version = "0.3"
+features = [
+    "Window",
+    "Document",
+    "Element",
+    "HtmlElement",
+    "HtmlCanvasElement",
+    "CanvasRenderingContext2d",
+    "TextMetrics",
+    "HtmlInputElement",
+    "HtmlSelectElement",
+    "HtmlButtonElement",
+    "Event",
+    "EventTarget",
+    "CustomEvent",
+    "CustomEventInit",
+    "Storage",
+    "MouseEvent",
+    "WheelEvent",
+    "KeyboardEvent",
+    "Touch",
+    "TouchEvent",
+    "DomRect",
+    "NodeList",
+    "HtmlCollection",
+    "Text",
+    "CssStyleDeclaration",
+    "Performance",
+    "console",
+    "DomTokenList",
+    "Headers",
+    "Request",
+    "RequestInit",
+    "RequestMode",
+    "Response",
+    "AbortController",
+    "AbortSignal",
+    "WebSocket",
+    "MessageEvent",
+    "CloseEvent",
+    "BinaryType",
+    "Location",
+]

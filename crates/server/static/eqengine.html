@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Equity Trading Engine</title>
+<link rel="stylesheet" href="./eqengine.css?v=9">
+</head>
+<body>
+<div class="eq-wrap">
+  <div class="eq-head">
+    <div>
+      <div class="eq-title" id="eqTitle">Equity Paper Engine</div>
+      <div class="eq-sub" id="eqSub">Long-term Buy calls from Equity Research, simulated delivery fills (no real orders).</div>
+    </div>
+    <div class="eq-spacer"></div>
+    <span class="eq-badge" id="eqMode">PAPER</span>
+    <span class="eq-broker" id="eqBroker">Dhan: checking</span>
+    <button class="eq-btn primary" id="eqToggle">Connect</button>
+  </div>
+  <div class="eq-banner" id="eqLiveBanner" style="display:none">LIVE MODE: real Dhan CNC delivery orders will be placed from the Equity Research calls. Entry/exit uses MARKET orders; target and stop are engine-level.</div>
+  <div class="eq-cards" id="eqStats"></div>
+  <div class="eq-book-actions">
+    <button class="eq-btn" id="eqAutoBuy" data-on="0" title="Auto Buy Mode: ON par engine research Buy calls se khud naye positions kholta hai. OFF par sirf position management (LTP, target, stop, exit) chalta rahega - koi naya automatic buy nahi. Manual Buy hamesha kaam karta hai.">Auto Buy Mode: OFF</button>
+    <button class="eq-btn small" id="eqResetPnl" title="Sirf PAPER: realised P&L reset karta hai - closed trades hat jaate hain, open positions safe rehti hain.">Reset P&amp;L</button>
+    <button class="eq-btn small danger" id="eqClearBook" title="Sirf PAPER: book ke saare added stocks (open + closed) hata deta hai aur realised P&amp;L reset karta hai.">Clear all added stocks</button>
+  </div>
+  <div class="eq-settings">
+    <div class="eq-field"><label>Per trade %</label><input type="number" id="sPer" min="1" max="50" step="1"></div>
+    <div class="eq-field"><label>Max positions</label><input type="number" id="sMax" min="1" max="50" step="1"></div>
+    <div class="eq-field"><label>Min confidence</label><input type="number" id="sConf" min="0" max="100" step="1"></div>
+    <div class="eq-field"><label>Min upside %</label><input type="number" id="sUp" min="0" max="300" step="1"></div>
+    <div class="eq-field"><label>Max holding days</label><input type="number" id="sDays" min="1" max="1000" step="1"></div>
+    <div class="eq-field"><label>Quantity (0 = auto)</label><input type="number" id="sQty" min="0" step="1"></div>
+    <div class="eq-field"><label>Only these symbols (comma, blank = all)</label><input type="text" id="sWatch" style="width:250px" placeholder="e.g. ITC, TCS, BEL"></div>
+    <label class="eq-check"><input type="checkbox" id="sAuto"> Auto exit on target / stop / Avoid</label>
+    <label class="eq-check"><input type="checkbox" id="sAcc"> Also enter Accumulate calls</label>
+    <label class="eq-check" title="Bacha hua shared margin bache hue free slots me barabar baant kar har buy ki qty nikalta hai - is tarah poora margin deploy ho jaata hai. ON hone par Per trade % aur Quantity ignore hote hain."><input type="checkbox" id="sDist"> Auto-distribute margin across slots</label>
+    <label class="eq-check" title="ON: har order me broker charges (brokerage + STT + exchange txn + SEBI + stamp + GST) reserve karke quantity nikalti hai, aur aise stock ko skip karti hai jiska target profit apne hi charges cover na kar paaye - taaki chhote profit par trade net loss me na jaaye."><input type="checkbox" id="sCharges"> Charge-aware quantity (STT + GST + brokerage)</label>
+    <div class="eq-field" title="Percentage trailing stop: jab position profit me aaye, stop peak profit ke peeche ratchet hota jaata hai. Ye utna % running profit wapas de sakta hai. 0 = band.">
+      <label>Trail SL %</label>
+      <input type="number" id="sTrailPct" min="0" max="95" step="1" placeholder="25">
+    </div>
+    <label class="eq-check" title="ON hone par profit peak ke hisaab se trailing stop lagega (fixed Stop ke upar, jo bhi tight ho wo chalega)."><input type="checkbox" id="sTrailOn"> Percentage trailing stop</label>
+    <div class="eq-field" title="Net Take-Profit arms only after net profit (after delivery charges) crosses this rupee amount. 0 = band.">
+      <label>Net TP min (Rs)</label>
+      <input type="number" id="sNetTpMin" min="0" step="100" placeholder="0">
+    </div>
+    <div class="eq-field" title="Peak net profit ka kitna % wapas jaane par exit ho. Default 25%.">
+      <label>Net TP give-back %</label>
+      <input type="number" id="sNetTpGb" min="0" max="99" step="1" placeholder="25">
+    </div>
+    <label class="eq-check" title="Net profit (delivery charges ke baad) ka peak track karke, peak se give-back % girawat par position exit kar dega."><input type="checkbox" id="sNetTpOn"> Net Take-Profit (give-back)</label>
+    <button class="eq-btn" id="eqSave">Save settings</button>
+    <button class="eq-btn" id="eqRefresh">Refresh</button>
+  </div>
+  <div class="eq-manual">
+    <b>Manual order</b>
+    <input type="text" id="mSym" placeholder="Symbol" autocomplete="off" list="eqSyms">
+    <input type="number" id="mQty" placeholder="Qty (0 = engine qty)" min="0" step="1">
+    <button class="eq-btn primary" id="mBuy">Buy now</button>
+    <span class="dim">Engine Quantity 0 = shared margin-based auto. Manual buy call filters bypass karta hai, lekin shared margin aur max-position limit lagti hai. Sell ke liye open position par Exit dabao.</span>
+    <datalist id="eqSyms"></datalist>
+  </div>
+  <div class="eq-error" id="eqError"></div>
+  <h3 class="eq-h">Buy calls <span class="dim" id="eqCallCount"></span></h3>
+  <div class="eq-table-wrap">
+    <table class="eq-t">
+      <thead><tr><th>Symbol</th><th>Call</th><th>Confidence</th><th>Upside</th><th>Price</th><th>Target</th><th>Stop</th><th>Timeframe</th><th></th></tr></thead>
+      <tbody id="eqCalls"><tr><td colspan="9" class="eq-empty">Loading Equity Research calls...</td></tr></tbody>
+    </table>
+  </div>
+  <button class="eq-btn eq-more" id="eqMore" style="display:none">Load more</button>
+  <div class="dim" style="font-size:10px;margin:4px 0 0">Poori Equity Research screen (top 300 stocks, actionable pehle). Buy sirf Strong Buy / Buy par milta hai; Accumulate tabhi jab "Also enter Accumulate calls" ON ho. Watch / Avoid rows sirf reference ke liye hain. Buy shared margin aur max-position limit ke under chalta hai, aur ek symbol par already open position ho to dobara buy block hai.</div>
+  <h3 class="eq-h">Open positions</h3>
+  <div class="eq-table-wrap">
+    <table class="eq-t">
+      <thead><tr><th>Symbol</th><th>Call</th><th>Entry</th><th>LTP</th><th>Qty</th><th>Invested</th><th>Target</th><th>Stop</th><th>Trail SL</th><th>Net P&amp;L</th><th>P&amp;L</th><th>P&amp;L %</th><th>Days</th><th></th></tr></thead>
+      <tbody id="eqOpen"><tr><td colspan="14" class="eq-empty">No open positions.</td></tr></tbody>
+    </table>
+  </div>
+  <h3 class="eq-h">Closed trades</h3>
+  <div class="eq-table-wrap">
+    <table class="eq-t">
+      <thead><tr><th>Symbol</th><th>Status</th><th>Entry</th><th>Exit</th><th>Qty</th><th>P&amp;L</th><th>P&amp;L %</th><th>Days</th><th>Exit date</th><th>Reason</th></tr></thead>
+      <tbody id="eqClosed"><tr><td colspan="10" class="eq-empty">No closed trades yet.</td></tr></tbody>
+    </table>
+  </div>
+  <h3 class="eq-h">Activity log</h3>
+  <div class="eq-log" id="eqLog"><div class="dim">Waiting for the engine...</div></div>
+</div>
+<script type="module">
+  import { bootEqEngine } from "./eqengine.js?v=15";
+  bootEqEngine();
+</script>
+</body>
+</html>

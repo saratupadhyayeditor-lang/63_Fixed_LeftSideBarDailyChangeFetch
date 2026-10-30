@@ -1,0 +1,67 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Equity Trade Stats</title>
+<link rel="stylesheet" href="./eqengine.css?v=2">
+<style>
+  .eq-t td.sym { min-width: 120px; }
+  .eq-table-wrap { max-height: 300px; }
+</style>
+</head>
+<body>
+<div class="eq-wrap">
+  <div class="eq-head">
+    <div>
+      <div class="eq-title">Equity Trade Stats</div>
+      <div class="eq-sub">Paper vs Realtime equity engines - realized and open P&amp;L from Equity Research Buy calls.</div>
+    </div>
+    <div class="eq-spacer"></div>
+    <span class="eq-broker" id="stBroker">Dhan: checking</span>
+    <button class="eq-btn" id="stRefresh">Refresh</button>
+  </div>
+  <div class="eq-cols">
+    <div class="eq-panel">
+      <h2>Paper engine</h2>
+      <div class="eq-mini" id="stPaperCards"></div>
+      <h3 class="eq-h">Open</h3>
+      <div class="eq-table-wrap"><table class="eq-t">
+        <thead><tr><th>Symbol</th><th>Entry</th><th>LTP</th><th>Qty</th><th>P&amp;L</th><th>%</th><th>Days</th></tr></thead>
+        <tbody id="stPaperOpen"><tr><td colspan="7" class="eq-empty">No open positions.</td></tr></tbody>
+      </table></div>
+      <h3 class="eq-h">Closed</h3>
+      <div class="eq-table-wrap"><table class="eq-t">
+        <thead><tr><th>Symbol</th><th>Entry</th><th>Exit</th><th>P&amp;L</th><th>%</th><th>Days</th><th>Reason</th></tr></thead>
+        <tbody id="stPaperClosed"><tr><td colspan="7" class="eq-empty">No closed trades.</td></tr></tbody>
+      </table></div>
+    </div>
+    <div class="eq-panel">
+      <h2>Realtime engine</h2>
+      <div class="eq-mini" id="stLiveCards"></div>
+      <h3 class="eq-h">Open</h3>
+      <div class="eq-table-wrap"><table class="eq-t">
+        <thead><tr><th>Symbol</th><th>Entry</th><th>LTP</th><th>Qty</th><th>P&amp;L</th><th>%</th><th>Days</th></tr></thead>
+        <tbody id="stLiveOpen"><tr><td colspan="7" class="eq-empty">No open positions.</td></tr></tbody>
+      </table></div>
+      <h3 class="eq-h">Closed</h3>
+      <div class="eq-table-wrap"><table class="eq-t">
+        <thead><tr><th>Symbol</th><th>Entry</th><th>Exit</th><th>P&amp;L</th><th>%</th><th>Days</th><th>Reason</th></tr></thead>
+        <tbody id="stLiveClosed"><tr><td colspan="7" class="eq-empty">No closed trades.</td></tr></tbody>
+      </table></div>
+    </div>
+  </div>
+  <h3 class="eq-h">Comparison</h3>
+  <div class="eq-table-wrap"><table class="eq-t">
+    <thead><tr><th>Metric</th><th>Paper</th><th>Realtime</th></tr></thead>
+    <tbody id="stCompare"></tbody>
+  </table></div>
+  <h3 class="eq-h">Status</h3>
+  <div class="eq-error" id="stError"></div>
+</div>
+<script type="module">
+  import { bootEqStats } from "./eqstats.js?v=2";
+  bootEqStats();
+</script>
+</body>
+</html>

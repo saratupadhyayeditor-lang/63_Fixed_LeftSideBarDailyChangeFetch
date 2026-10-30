@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Realtime Trading Engine 2 Stats - Dhan Algo</title>
+<link rel="stylesheet" href="./app.css?v=18">
+<style>
+  body { display: flex; flex-direction: column; height: 100%; }
+  .paper-banner {
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+    padding: 6px 10px; background: #102030; border-bottom: 1px solid #2d5a7e;
+    font-size: 11px; color: #a9d0ff;
+  }
+  .paper-banner b { color: #d9ecff; letter-spacing: .3px; }
+  .paper-banner span { color: #86a8c8; }
+  .tab-content { flex: 1 1 auto; height: auto; min-height: 0; display: block; }
+  #tab-rtstats { overflow-y: auto; }
+</style>
+</head>
+<body data-tab="rtstats2">
+<div class="paper-banner">
+  <b>Realtime Trading Engine 2 &middot; Trade Stats</b>
+  <span>Executed-trades report for the Realtime Trading Engine 2 LIVE book: every entry/exit here is a real Dhan order book entry - independent from every other engine.</span>
+</div>
+<div class="tab-content" id="tab-rtstats"></div>
+
+<script src="./vendor/chart.umd.min.js"></script>
+<script>
+  // Realtime Trading Engine 2 stats host: route every /api/rt call made by the
+  // shared stats UI to the independent RT2 engine and tag the report/CSV with
+  // its own name.
+  window.__PAPER__ = false;
+  window.__STATS_BASE__ = "/api/realtime2";
+  window.__STATS_ENGINE__ = "realtime2";
+  (function () {
+    const orig = window.fetch.bind(window);
+    window.fetch = function (u, o) {
+      if (typeof u === "string" && u.indexOf("/api/rt") === 0) {
+        u = "/api/realtime2" + u.slice("/api/rt".length);
+      }
+      return orig(u, o);
+    };
+  })();
+  // Poll only while this pane is actually visible in the parent tab switcher.
+  (function () {
+    const root = document.getElementById("tab-rtstats");
+    const visible = function () {
+      const fe = window.frameElement;
+      if (!fe) return true;
+      return !!(fe.offsetParent && fe.clientHeight > 0);
+    };
+    const sync = function () { root.classList.toggle("active", visible()); };
+    setInterval(sync, 500);
+    sync();
+  })();
+</script>
+<script type="module">
+  import { bootRtStats } from "./rtstats.js?v=11";
+  import { bootTheme } from "./theme.js?v=4";
+  import { bootTextSize } from "./textsize.js?v=3";
+  bootRtStats();
+  bootTheme();
+  bootTextSize();
+  const head = document.querySelector("#tab-rtstats .rs-toolbar h3");
+  if (head) head.textContent = "Realtime Trading Engine 2 Executed Trades Report";
+  const desc = document.querySelector("#tab-rtstats .rs-toolbar span");
+  if (desc) desc.textContent = "Aggregates every executed LIVE trade from Realtime Trading Engine 2 (real Dhan orders). Net basis when charges are banked.";
+</script>
+</body>
+</html>
