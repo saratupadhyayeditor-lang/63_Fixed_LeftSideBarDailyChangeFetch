@@ -70,6 +70,18 @@ fn jarr(v: &Value, k: &str) -> Vec<Value> {
     v.get(k).and_then(|x| x.as_array()).cloned().unwrap_or_default()
 }
 
+/// Drop every row whose underlying the Liquid F&O list already shows, so a
+/// common stock is ranked by the Liquid F&O scanner only and never appears in
+/// the Top Movers gainers / losers readout at the same time.
+fn exclude_liquid_owned(rows: Vec<Value>, liquid_owned: &std::collections::HashSet<i64>) -> Vec<Value> {
+    if liquid_owned.is_empty() {
+        return rows;
+    }
+    rows.into_iter()
+        .filter(|r| !liquid_owned.contains(&ji(r, "securityId")))
+        .collect()
+}
+
 fn now_ms() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
@@ -140,6 +152,46 @@ mod corr_tests {
         uniq.sort();
         uniq.dedup();
         assert_eq!(uniq.len(), ids.len(), "correlation ids must be unique");
+    }
+
+    fn held(pairs: &[(&str, i64)]) -> std::collections::BTreeMap<String, i64> {
+        pairs.iter().map(|(b, q)| (b.to_string(), *q)).collect()
+    }
+
+    #[test]
+    fn a_partial_exit_only_flattens_its_share_at_each_broker() {
+        let h = held(&[("dhan", 5), ("zerodha", 5)]);
+        let route = vec!["dhan".to_string(), "zerodha".to_string()];
+        // 3 of 10 lots leaves each broker holding 3 or 4, never a full close.
+        let alloc = crate::realtime::RealtimeState::apportion(3, &h, &route);
+        assert_eq!(alloc.values().sum::<i64>(), 3);
+        assert!(alloc.get("dhan").copied().unwrap_or(0) <= 5);
+        assert!(alloc.get("zerodha").copied().unwrap_or(0) <= 5);
+    }
+
+    #[test]
+    fn apportion_sums_exactly_and_skips_brokers_without_stock() {
+        let h = held(&[("dhan", 4), ("zerodha", 3), ("fyers", 3)]);
+        let route = vec!["dhan".to_string(), "zerodha".to_string(), "fyers".to_string()];
+        let alloc = crate::realtime::RealtimeState::apportion(9, &h, &route);
+        assert_eq!(alloc.values().sum::<i64>(), 9);
+        // A broker holding nothing must never receive a partial exit order.
+        let h2 = held(&[("dhan", 4)]);
+        let route2 = vec!["dhan".to_string(), "fyers".to_string()];
+        let alloc2 = crate::realtime::RealtimeState::apportion(2, &h2, &route2);
+        assert_eq!(alloc2.values().sum::<i64>(), 2);
+        assert!(!alloc2.contains_key("fyers"));
+    }
+
+    #[test]
+    fn a_full_partial_never_exceeds_what_a_broker_holds() {
+        let h = held(&[("dhan", 7), ("fyers", 3)]);
+        let route = vec!["dhan".to_string(), "fyers".to_string()];
+        // Asking for more than is open is clamped to the total held.
+        let alloc = crate::realtime::RealtimeState::apportion(100, &h, &route);
+        assert_eq!(alloc.values().sum::<i64>(), 10);
+        assert_eq!(alloc.get("dhan").copied().unwrap_or(0), 7);
+        assert_eq!(alloc.get("fyers").copied().unwrap_or(0), 3);
     }
 }
 
@@ -1295,6 +1347,11 @@ pub struct RtDoc {
     pub settings: Settings,
     pub method: String,
     pub order_cfg: HashMap<String, Value>,
+    /// Per-engine broker routing: broker id -> send this engine's orders to it.
+    /// Only brokers that are switched ON and fully configured in the shared
+    /// Broker Settings tab can actually receive an order; an EMPTY map keeps the
+    /// legacy behaviour (Dhan only), so an untouched install is unaffected.
+    pub brokers: BTreeMap<String, bool>,
     pub strategies: Vec<Strategy>,
     pub positions: Vec<Value>,
     pub closed: Vec<Value>,
@@ -1333,6 +1390,7 @@ impl Default for RtDoc {
             settings: Settings::default(),
             method: "super".into(),
             order_cfg: HashMap::new(),
+            brokers: BTreeMap::new(),
             strategies: Vec::new(),
             positions: Vec::new(),
             closed: Vec::new(),
@@ -2636,6 +2694,40 @@ impl RealtimeState {
         !self.indices_commodities_only()
     }
 
+    /// Every underlying the Liquid F&O list is currently showing: the scanner's
+    /// own top gainers / top losers / hand-added names, plus the operator's
+    /// explicit gainer / loser dropdown picks and saved adds. Top Movers must
+    /// never re-list one of these stocks - the Liquid F&O list is the single
+    /// owner of a shared stock, so the same common name can never sit in both
+    /// readouts at once.
+    fn liquid_owned_ids(&self, settings: &Settings) -> std::collections::HashSet<i64> {
+        let mut owned = std::collections::HashSet::new();
+        if !settings.liquid_on || !self.allows_liquid_stocks() {
+            return owned;
+        }
+        let payload = self.liquid_cache.lock().map(|g| g.1.clone()).unwrap_or(Value::Null);
+        for key in ["gainers", "losers", "added"] {
+            for r in jarr(&payload, key) {
+                let sid = ji(&r, "securityId");
+                if sid > 0 {
+                    owned.insert(sid);
+                }
+            }
+        }
+        for sid in &settings.liquid_list {
+            if *sid > 0 {
+                owned.insert(*sid);
+            }
+        }
+        if settings.liquid_gainer > 0 {
+            owned.insert(settings.liquid_gainer);
+        }
+        if settings.liquid_loser > 0 {
+            owned.insert(settings.liquid_loser);
+        }
+        owned
+    }
+
     /// Apply this engine's hard constraints to a settings blob that came from a
     /// save / import / template. The indices + commodities engines strip the
     /// stock / NIFTY-trend / BB%b features; every other engine is pinned to the
@@ -2717,11 +2809,14 @@ impl RealtimeState {
                 doc.settings.filter_mode = true;
             }
         }
-        // The "Pts = % (auto)" derived jump is now a real app-side stop, so no
-        // position may be marked broker-only any more (saved files from the old
-        // rule are corrected here).
+        // A stored `pointTrailBrokerOnly` from the old rule is cleared ONLY when
+        // the position carries no broker-owned trail. A position routed to a
+        // native-trail broker (`trailOwner == "broker"`) must keep that marker,
+        // otherwise a restart would restart a competing app-side trail.
         for p in doc.positions.iter_mut() {
-            p["pointTrailBrokerOnly"] = json!(false);
+            if !js(p, "trailOwner").eq_ignore_ascii_case("broker") {
+                p["pointTrailBrokerOnly"] = json!(false);
+            }
         }
         let st = Self {
             dhan,
@@ -4649,6 +4744,16 @@ impl RealtimeState {
         if now - self.last_liquid.load(Ordering::Relaxed) < 250 {
             return;
         }
+        // The Liquid F&O scanner belongs to the full engines (Realtime Trading
+        // Engine and Paper Trade 1) only. Indices-only / commodities-only books
+        // never expose it, so they neither scan the basket nor publish picks.
+        if !self.allows_liquid_stocks() {
+            self.update_picked("Liquid F&O", Vec::new());
+            if let Ok(mut c) = self.liquid_cache.lock() {
+                *c = (now, json!({ "ok": true, "on": false, "gainers": [], "losers": [], "added": [], "bias": 0 }));
+            }
+            return;
+        }
         let (on, gain_n, lose_n, manual) = self
             .doc()
             .map(|d| {
@@ -4858,14 +4963,22 @@ impl RealtimeState {
         // round-trip on every 100ms pass. The first pass still REST-seeds.
         self.dhan.watch_options_now(&univ);
         let rows: Vec<Value> = self.quote_rows(&univ).await;
-        let mut sorted = rows.clone();
+        // A stock that the Liquid F&O scanner owns (whole liquid basket while it
+        // is armed, plus its manual adds and explicit gainer/loser picks) must
+        // appear ONLY in the Liquid F&O list. Drop those ids from the Top Movers
+        // ranking so the same common stock never shows in both readouts; the top
+        // N is then taken from the remaining names, not from a shortened list.
+        let settings_for_scope = self.doc().map(|d| d.settings.clone()).unwrap_or_default();
+        let liquid_owned = self.liquid_owned_ids(&settings_for_scope);
+        let rank_rows = exclude_liquid_owned(rows.clone(), &liquid_owned);
+        let mut sorted = rank_rows.clone();
         sorted.sort_by(|a, b| jf(b, "changePct").partial_cmp(&jf(a, "changePct")).unwrap_or(std::cmp::Ordering::Equal));
         let gainers: Vec<Value> = sorted.into_iter().take(gain_n.max(0) as usize).collect();
-        let mut sorted_l = rows.clone();
+        let mut sorted_l = rank_rows.clone();
         sorted_l.sort_by(|a, b| jf(a, "changePct").partial_cmp(&jf(b, "changePct")).unwrap_or(std::cmp::Ordering::Equal));
         let losers: Vec<Value> = sorted_l.into_iter().take(lose_n.max(0) as usize).collect();
-        let up = rows.iter().filter(|r| jf(r, "changePct") > 0.0).count() as i64;
-        let down = rows.iter().filter(|r| jf(r, "changePct") < 0.0).count() as i64;
+        let up = rank_rows.iter().filter(|r| jf(r, "changePct") > 0.0).count() as i64;
+        let down = rank_rows.iter().filter(|r| jf(r, "changePct") < 0.0).count() as i64;
         // Auto CE/PE side (old AST `autoRunInSide` parity): classify the ACTUAL
         // traded universe - the operator's selected top gainers / top losers -
         // not whole-market breadth. Gainers are bullish (CE), losers bearish
@@ -7919,6 +8032,7 @@ impl RealtimeState {
                 brain_regime_now,
                 entry_filters,
                 filter_flip_on,
+                broker_trail_owned,
             ) = {
                 let Some(d) = self.doc() else { return };
                 let Some(p) = d.positions.iter().find(|p| js(p, "id") == id) else { continue };
@@ -7967,6 +8081,10 @@ impl RealtimeState {
                         .filter_map(|v| v.as_str().map(|x| x.to_string()))
                         .collect::<Vec<String>>(),
                     d.settings.exit_suite_on && d.settings.auto_trade_on && d.settings.exit_on_filter_flip,
+                    // A position whose routed broker runs a native trail keeps
+                    // the trail broker-side only; the engine must not ratchet a
+                    // second stop for the same trade.
+                    broker_owns_position_trail(p),
                 )
             };
             if ltp <= 0.0 {
@@ -8214,8 +8332,16 @@ impl RealtimeState {
             } else {
                 point_trail
             };
-            let (sl, trail_source) =
-                active_trail_stop(is_buy, entry, peak_profit, trail, points_live, overall_sl);
+            // Native-trail positions are ratcheted by the broker's own OMS, so
+            // the engine never computes a second app-side stop for them (one
+            // position, one trail). `broker_trail_owned` freezes that decision at
+            // entry from the routed brokers + method, so a later settings edit
+            // cannot start a competing engine trail on a running trade.
+            let (sl, trail_source) = if broker_trail_owned {
+                (overall_sl, "")
+            } else {
+                active_trail_stop(is_buy, entry, peak_profit, trail, points_live, overall_sl)
+            };
             let sl_trailed = !trail_source.is_empty();
             if let Some(mut d) = self.doc() {
                 if let Some(p) = d.positions.iter_mut().find(|p| js(p, "id") == id) {
@@ -8915,6 +9041,10 @@ impl RealtimeState {
                 "trail": round2(trail),
                 "pointTrail": round2(point_trail),
                 "pointTrailBrokerOnly": false,
+                // An adopted broker position carries no known broker trail, so the
+                // engine owns the single stop for it.
+                "trailOwner": "engine",
+                "brokers": [],
             "peakProfit": 0.0,
             "netPeak": 0.0,
                 "best": round2(avg),
@@ -10578,25 +10708,74 @@ impl RealtimeState {
     /// removed by the origin id - otherwise the ENTRY TIMING DIAGNOSTICS row is
     /// never produced. `None` (manual orders) falls back to the leg's own id.
     async fn open_entry(&self, strat: &Strategy, guard_duplicates: bool, origin_id: Option<&str>) -> Result<(), String> {
-        let (settings, method, auto_lots, cfg) = {
+        let (settings, method, auto_lots, cfg, route_map) = {
             let Some(d) = self.doc() else { return Err("state lock".into()) };
             (
                 d.settings.clone(),
                 d.method.clone(),
                 d.auto_lots,
                 d.order_cfg.clone(),
+                d.brokers.clone(),
             )
         };
-        // Real orders need the broker REST client; paper trades only need a live
-        // quote (from the shared feed) and never touch Dhan's order APIs, so a
-        // dropped broker session must not block a simulated entry.
-        let (client, client_id) = if self.paper {
-            (None, String::new())
+        // Real Dhan orders need the Dhan REST client; other brokers have their
+        // own adapter and must not require a Dhan login. Paper trades only need a
+        // live quote (from the shared feed) and never touch an order API.
+        // Resolved after the route is known, below.
+        let mut client: Option<dhan_hq::DhanClient> = None;
+        let mut client_id = String::new();
+        // Multi-broker routing: which brokers THIS engine may send the entry to.
+        // Paper books never place a real order, so the route stays empty there.
+        // A ticked broker that is switched OFF / still missing keys in Broker
+        // Settings is dropped by `resolve_route` and reported once here instead
+        // of silently swallowing the entry; every surviving broker has a real
+        // order adapter, so the route IS the delivery list.
+        let route: Vec<String> = if self.paper {
+            Vec::new()
         } else {
-            (
-                Some(self.dhan.session_client().await.ok_or("not connected to Dhan")?),
-                self.dhan.session_client_id().await.ok_or("no client id")?,
-            )
+            let usable = crate::brokers::enabled_configured();
+            let resolved = crate::brokers::resolve_route(
+                &route_map,
+                &usable,
+                crate::brokers::any_configured(),
+            );
+            for id in &resolved {
+                if !crate::brokers::adapter_ready(id) {
+                    self.log_throttled(
+                        &format!("broker-adapter-{id}"),
+                        60_000,
+                        "warn",
+                        &format!("broker {id}: no order adapter in this build - entry skipped for it"),
+                    );
+                }
+            }
+            let live: Vec<String> = resolved
+                .iter()
+                .filter(|id| crate::brokers::adapter_ready(id))
+                .cloned()
+                .collect();
+            if live.is_empty() {
+                // No deliverable broker: every tick is off / none is fully
+                // configured. Refuse instead of quietly falling back to Dhan -
+                // "no broker selected" must never mean "send it to Dhan anyway".
+                return Err(
+                    if resolved.is_empty() {
+                        "no order route: Broker Settings me koi broker ON + fully configured nahi hai, ya Order Placement Method me sab untick hain"
+                    } else {
+                        "no order route: every ticked broker lacks an order adapter in this build"
+                    }
+                    .to_string(),
+                );
+            }
+            // The Dhan dispatch path below needs the Dhan session; every other
+            // broker authenticates from its own stored credentials.
+            if live.iter().any(|id| id.eq_ignore_ascii_case("dhan")) {
+                client = Some(self.dhan.session_client().await.ok_or(
+                    "not connected to Dhan: header Connect karo ya Dhan ka tick hatao",
+                )?);
+                client_id = self.dhan.session_client_id().await.ok_or("no client id")?;
+            }
+            live
         };
 
         let mut strat = strat.clone();
@@ -10893,6 +11072,19 @@ impl RealtimeState {
         };
         let (sl, tp, trail, point_trail) =
             levels_for(&settings, &cfg, side, ltp, ai_sl, ai_tp, ai_trail);
+        // One position never carries two trails: when the routed brokers own the
+        // trail natively (Dhan Super Order `trailingJump`) AND a jump is actually
+        // configured, the engine keeps only the fixed entry stop/target and never
+        // ratchets a second stop. With no jump configured the broker would trail
+        // nothing, so the engine keeps its own trail instead of leaving the
+        // position unprotected.
+        let broker_trail = crate::brokers::broker_owns_trail(&route, &method, point_trail);
+        let trail_owner = if broker_trail { "broker" } else { "engine" };
+        let (trail, point_trail_engine) = if broker_trail {
+            (0.0, 0.0)
+        } else {
+            (trail, point_trail)
+        };
 
         let mut order_ids: Vec<String> = Vec::new();
         let mut super_orders: Vec<String> = Vec::new();
@@ -10950,179 +11142,166 @@ impl RealtimeState {
             0.0
         };
         let exec_price = if self.paper { paper_fill } else { ltp };
+        // --- Dispatch -------------------------------------------------------
+        //
+        // One entry can be routed to several brokers. Two rules keep this safe:
+        //
+        //   * the operator's lot count is DIVIDED across the routed brokers (a
+        //     10-lot entry over 5 ticked brokers sends 2 lots to each), so total
+        //     exposure stays exactly what was configured - never N x the size;
+        //   * if any broker rejects, the whole entry fails BEFORE a position is
+        //     booked, so the book never claims a fill that only partly happened.
+        //     Orders already accepted at earlier brokers are cancelled first.
+        //
+        // Dhan's `super` / `forever` methods are Dhan-specific order shapes, so
+        // they only run when Dhan is the sole route; with a mixed route every
+        // broker receives the plain (non-bracket) entry and the engine owns the
+        // trail, which is exactly what `brokers::native_trail` encodes.
+        let dhan_only = route.iter().all(|b| b.eq_ignore_ascii_case("dhan"));
+        let mut qty_sent: i64 = 0;
+        // Per-broker quantity actually sent, stored on the position so the exit
+        // can flatten exactly the same split. Paper never fills it.
+        let mut broker_qty: BTreeMap<String, i64> = BTreeMap::new();
         if !self.paper {
-        let client = client.as_ref().ok_or("not connected to Dhan")?;
-        match method.as_str() {
-            "super" => {
-                // Operator toggles are authoritative at the broker too. Dhan
-                // requires a positive target/stop leg, so a disabled target is
-                // parked far away instead of being invented from the method
-                // config (the "target keeps firing after I disabled it" bug).
-                // The Take-Profit target now comes only from RR / AI TP;
-                // the manual "Take Profit %" card is gone.
-                let target = tp;
-                let target = if target > 0.0 { target } else { price_off(ltp, side, 2.0) };
-                // Stop leg: the resolved overall/AI SL first, then an explicitly
-                // configured manual stop. With no SL configured a far protective
-                // price is used so the leg never acts as a surprise tight stop.
-                let stop = if sl > 0.0 {
-                    sl
-                } else if settings.manual_sl && cfg_f(&cfg, "stopLossPrice", 0.0) > 0.0 {
-                    cfg_f(&cfg, "stopLossPrice", 0.0)
-                } else if settings.manual_sl && cfg_f(&cfg, "slPct", 0.0) > 0.0 {
-                    price_off(ltp, side, -cfg_f(&cfg, "slPct", 0.0) / 100.0)
-                } else {
-                    price_off(ltp, side, -0.5)
-                };
+            // Dhan orders by security id and never needed the scrip master, so a
+            // cold master only blocks the brokers that must translate the
+            // contract into their own token.
+            let contract = scrip::get().and_then(|s| s.contract(strat.security_id).cloned());
+            if contract.is_none() && !dhan_only {
+                return Err(format!(
+                    "no contract row for security id {} - scrip master is warming or the strike is unknown",
+                    strat.security_id
+                ));
+            }
+            let plan = crate::adapters::split_qty(qty, lot, &route);
+            if plan.is_empty() {
+                return Err("entry qty is smaller than one lot for any routed broker".into());
+            }
+            // Broker entry orders placed so far, so a later broker's failure can
+            // undo them instead of leaving half the position open.
+            let mut placed: Vec<(String, String)> = Vec::new();
+            let mut failure: Option<String> = None;
 
-                // Child-order sizing: the engine-level "Auto Order Slicing" plan
-                // wins; otherwise fall back to the method's own auto-slice /
-                // exchange-freeze chunking. Each child super order keeps its own
-                // native target + stop leg.
-                let method_chunk = {
-                    let auto_slice = cfg.get("autoSlice").and_then(|v| v.as_bool()).unwrap_or(false)
-                        || cfg_f(&cfg, "autoSlice", 0.0) > 0.0;
-                    let slice_ov = cfg_f(&cfg, "sliceQty", 0.0) as i64;
-                    if auto_slice && slice_ov > 0 {
-                        slice_ov
-                    } else if auto_slice && freeze > 0.0 {
-                        freeze as i64
-                    } else {
-                        0
-                    }
-                };
-                let pieces = order_pieces(qty, &slice_plan, method_chunk);
-                let sliced = pieces.len() > 1;
-                let super_px = {
-                    let p = cfg_f(&cfg, "price", 0.0);
-                    if p > 0.0 { p } else { round2(ltp) }
-                };
-                for (i, piece) in pieces.into_iter().enumerate() {
-                    let child_corr = if sliced { format!("{corr}-s{}", i + 1) } else { corr.clone() };
-                    let body = json!({
-                        "dhanClientId": client_id,
-                        "transactionType": side,
-                        "exchangeSegment": exch,
-                        "productType": product_from(cfg_str(&cfg, "product", "INTRADAY")),
-                        "orderType": order_type_from(cfg_str(&cfg, "orderType", "MARKET")),
-                        "securityId": strat.security_id.to_string(),
-                        "quantity": piece,
-                        "price": super_px,
-                        "targetPrice": round2(target.max(0.05)),
-                        "stopLossPrice": round2(stop.max(0.05)),
-                        "trailingJump": point_trail,
-                        "correlationId": child_corr,
-                    });
-                    self.dhan.dhan_order_throttle().await;
-                    let resp = client.place_super_order(&body).await.map_err(|e| e.to_string())?;
-                    let oid = resp.get("orderId").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    if !oid.is_empty() {
-                        super_orders.push(oid.clone());
-                    }
-                    if sliced {
-                        slice_legs.push(json!({
-                            "qty": piece,
-                            "lots": if lot > 0.0 { round2(piece as f64 / lot) } else { 0.0 },
-                            "orderId": oid,
-                        }));
-                    }
-                }
-                broker = true;
-                filled = qty;
-            }
-            "forever" => {
-                let otype = cfg_str(&cfg, "orderType", "LIMIT");
-                let px = cfg_f(&cfg, "price", 0.0);
-                let px = if px > 0.0 { px } else { cfg_f(&cfg, "limitPrice", round2(ltp)) };
-                let pieces = order_pieces(qty, &slice_plan, 0);
-                let sliced = pieces.len() > 1;
-                for (i, piece) in pieces.into_iter().enumerate() {
-                    let child_corr = if sliced { format!("{corr}-s{}", i + 1) } else { corr.clone() };
-                    let body = json!({
-                        "dhanClientId": client_id,
-                        "transactionType": side,
-                        "exchangeSegment": exch,
-                        "productType": product_from(cfg_str(&cfg, "product", "CNC")),
-                        "orderType": otype,
-                        "securityId": strat.security_id.to_string(),
-                        "quantity": piece,
-                        "price": px,
-                        "triggerPrice": cfg_f(&cfg, "triggerPrice", 0.0),
-                        "validity": cfg_str(&cfg, "validity", "DAY"),
-                        "correlationId": child_corr,
-                    });
-                    self.dhan.dhan_order_throttle().await;
-                    let resp = client.place_forever(&body).await.map_err(|e| e.to_string())?;
-                    let oid = resp.get("orderId").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                    if !oid.is_empty() {
-                        order_ids.push(oid.clone());
-                    }
-                    if sliced {
-                        slice_legs.push(json!({
-                            "qty": piece,
-                            "lots": if lot > 0.0 { round2(piece as f64 / lot) } else { 0.0 },
-                            "orderId": oid,
-                        }));
-                    }
-                }
-            }
-            _ => {
-                let otype = cfg_str(&cfg, "orderType", "MARKET");
-                let mut px = cfg_opt_f(&cfg, "price").or_else(|| cfg_opt_f(&cfg, "limitPrice"));
-                let mut trig = cfg_opt_f(&cfg, "triggerPrice").or_else(|| cfg_opt_f(&cfg, "limitPrice"));
-                if otype.eq_ignore_ascii_case("MARKET") {
-                    px = None;
-                }
-                if otype.eq_ignore_ascii_case("LIMIT") && px.is_none() {
-                    px = Some(round2(ltp));
-                }
-                if otype.eq_ignore_ascii_case("SL") || otype.eq_ignore_ascii_case("SL-M") {
-                    if trig.is_none() {
-                        trig = px;
-                    }
-                }
-                let disclosed = cfg_opt_f(&cfg, "disclosedQty").map(|v| v as i64).filter(|v| *v > 0);
-                let pieces = order_pieces(qty, &slice_plan, 0);
-                let sliced = pieces.len() > 1;
-                for (i, piece) in pieces.into_iter().enumerate() {
-                    let child_corr = if sliced { format!("{corr}-s{}", i + 1) } else { corr.clone() };
-                    let req = OrderRequest {
-                        dhan_client_id: client_id.clone(),
-                        correlation_id: Some(child_corr),
-                        transaction_type: txn(side),
-                        exchange_segment: seg_from(&exch),
-                        product_type: product_from(cfg_str(&cfg, "product", "INTRADAY")),
-                        order_type: order_type_from(otype.clone()),
-                        validity: validity_from(cfg_str(&cfg, "validity", "DAY")),
-                        security_id: strat.security_id.to_string(),
-                        quantity: piece,
-                        disclosed_quantity: disclosed,
-                        price: px,
-                        trigger_price: trig,
-                        after_market_order: None,
-                        amo_time: None,
-                        bo_profit_value: None,
-                        bo_stop_loss_value: None,
+            for (broker, part_qty) in plan.iter() {
+                let result = if dhan_only {
+                    // Dhan keeps its native order shapes (Super Order target/stop
+                    // legs, Forever/GTT) because they are Dhan-only products.
+                    self.dhan_entry(
+                        broker,
+                        client.as_ref(),
+                        &client_id,
+                        &strat,
+                        &cfg,
+                        &method,
+                        &side,
+                        &exch,
+                        ltp,
+                        sl,
+                        tp,
+                        point_trail,
+                        broker_trail,
+                        freeze,
+                        &slice_plan,
+                        *part_qty,
+                        lot,
+                        &corr,
+                        &mut order_ids,
+                        &mut super_orders,
+                        &mut slice_legs,
+                    )
+                    .await
+                } else {
+                    let order_type = cfg_str(&cfg, "orderType", "MARKET");
+                    let price = cfg_f(&cfg, "price", 0.0).max(cfg_f(&cfg, "limitPrice", 0.0));
+                    let Some(contract) = contract.clone() else {
+                        failure = Some(format!(
+                            "{broker}: no contract row for security id {sec_id_placeholder}, cannot place",
+                            sec_id_placeholder = strat.security_id
+                        ));
+                        break;
                     };
-                    self.dhan.dhan_order_throttle().await;
-                    if method == "slice" || (freeze > 0.0 && piece as f64 > freeze) {
-                        let resps = client.slice_order(&req).await.map_err(|e| e.to_string())?;
-                        for r in resps {
-                            order_ids.push(r.order_id.clone());
+                    let req = crate::adapters::OrderReq {
+                        contract,
+                        side: side.to_string(),
+                        qty: *part_qty,
+                        order_type: if order_type.is_empty() { "MARKET".into() } else { order_type },
+                        price,
+                        product: cfg_str(&cfg, "product", "INTRADAY"),
+                        ltp,
+                        correlation: corr_id(&format!("{}{}", corr, broker)),
+                    };
+                    match crate::adapters::place(broker, &req).await {
+                        Ok(p) => {
+                            if p.order_id.is_empty() {
+                                order_ids.push(format!("{broker}"));
+                            } else {
+                                order_ids.push(format!("{broker}:{}", p.order_id));
+                            }
+                            Ok(())
                         }
-                    } else {
-                        let r = client.place_order(&req).await.map_err(|e| e.to_string())?;
-                        order_ids.push(r.order_id.clone());
+                        Err(e) => Err(e),
                     }
-                    if sliced {
-                        slice_legs.push(json!({
-                            "qty": piece,
-                            "lots": if lot > 0.0 { round2(piece as f64 / lot) } else { 0.0 },
-                        }));
+                };
+                match result {
+                    Ok(()) => {
+                        qty_sent += *part_qty;
+                        broker_qty.insert(broker.to_ascii_lowercase(), *part_qty);
+                        placed.push((broker.clone(), part_qty.to_string()));
+                    }
+                    Err(e) => {
+                        failure = Some(format!("{broker} rejected the entry: {e}"));
+                        break;
                     }
                 }
             }
-        }
+            if let Some(msg) = failure {
+                // Undo whatever already landed so the account is not left with a
+                // partial position the book does not know about.
+                for (broker, _) in &placed {
+                    if broker.eq_ignore_ascii_case("dhan") {
+                        // Dhan native entries carry bare order ids and a Super
+                        // Order is closed through its dedicated endpoint, not the
+                        // plain cancel API.
+                        if let Some(client) = self.dhan.session_client().await {
+                            for oid in super_orders.iter() {
+                                self.dhan.dhan_order_throttle().await;
+                                if let Err(e) = client.cancel_super_order(oid).await {
+                                    self.log(
+                                        "warn",
+                                        &format!("rollback cancel super {oid} failed: {e}"),
+                                    );
+                                }
+                            }
+                            for oid in order_ids.iter() {
+                                self.dhan.dhan_order_throttle().await;
+                                let _ = client.cancel_order(oid).await;
+                            }
+                        }
+                        continue;
+                    }
+                    let prefix = format!("{broker}:");
+                    let ids: Vec<String> = order_ids
+                        .iter()
+                        .filter(|id| id.starts_with(&prefix))
+                        .filter_map(|id| id.strip_prefix(&prefix).map(|s| s.to_string()))
+                        .collect();
+                    for id in ids {
+                        if let Err(e) = crate::adapters::cancel(broker, &id).await {
+                            self.log(
+                                "warn",
+                                &format!("rollback cancel {broker} {id} failed: {e}"),
+                            );
+                        }
+                    }
+                }
+                order_ids.clear();
+                super_orders.clear();
+                slice_legs.clear();
+                self.log("warn", &msg);
+                return Err(msg);
+            }
+            broker = true;
+            filled = qty_sent.max(0);
         }
 
         self.dhan
@@ -11164,8 +11343,11 @@ impl RealtimeState {
             "overallSl": round2(sl),
             "tp": round2(tp),
             "trail": round2(trail),
-            "pointTrail": round2(point_trail),
-            "pointTrailBrokerOnly": false,
+            "pointTrail": round2(if broker_trail { point_trail } else { point_trail_engine }),
+            "pointTrailBrokerOnly": broker_trail,
+            "trailOwner": trail_owner,
+            "brokers": route,
+            "brokerQty": broker_qty,
             "peakProfit": 0.0,
                 "netPeak": 0.0,
             "best": round2(exec_price),
@@ -11285,6 +11467,257 @@ impl RealtimeState {
         Ok(())
     }
 
+    /// Dhan-only entry dispatch, kept byte-for-byte in behaviour with the
+    /// original inline block so Super Order target/stop legs, Forever/GTT and
+    /// iceberg slicing behave exactly as before. `part_qty` is the quantity
+    /// routed to Dhan (the whole entry when Dhan is the only route).
+    #[allow(clippy::too_many_arguments)]
+    async fn dhan_entry(
+        &self,
+        broker: &str,
+        client: Option<&dhan_hq::DhanClient>,
+        client_id: &str,
+        strat: &Strategy,
+        cfg: &Value,
+        method: &str,
+        side: &str,
+        exch: &str,
+        ltp: f64,
+        sl: f64,
+        tp: f64,
+        point_trail: f64,
+        broker_trail: bool,
+        freeze: f64,
+        slice_plan: &[i64],
+        part_qty: i64,
+        lot: f64,
+        corr: &str,
+        order_ids: &mut Vec<String>,
+        super_orders: &mut Vec<String>,
+        slice_legs: &mut Vec<Value>,
+    ) -> Result<(), String> {
+        let _ = broker;
+        let Some(client) = client else {
+            return Err("Dhan is not connected: header Connect karo".into());
+        };
+        let mut filled = 0i64;
+            match method {
+                "super" => {
+                    // Operator toggles are authoritative at the broker too. Dhan
+                    // requires a positive target/stop leg, so a disabled target is
+                    // parked far away instead of being invented from the method
+                    // config (the "target keeps firing after I disabled it" bug).
+                    // The Take-Profit target now comes only from RR / AI TP;
+                    // the manual "Take Profit %" card is gone.
+                    let target = tp;
+                    let target = if target > 0.0 { target } else { price_off(ltp, side, 2.0) };
+                    // Stop leg: the resolved overall/AI SL first, then an explicitly
+                    // configured manual stop. With no SL configured a far protective
+                    // price is used so the leg never acts as a surprise tight stop.
+                    let stop = if sl > 0.0 {
+                        sl
+                    } else if self.doc().map(|d| d.settings.manual_sl).unwrap_or(false) && cfg_f(&cfg, "stopLossPrice", 0.0) > 0.0 {
+                        cfg_f(&cfg, "stopLossPrice", 0.0)
+                    } else if self.doc().map(|d| d.settings.manual_sl).unwrap_or(false) && cfg_f(&cfg, "slPct", 0.0) > 0.0 {
+                        price_off(ltp, side, -cfg_f(&cfg, "slPct", 0.0) / 100.0)
+                    } else {
+                        price_off(ltp, side, -0.5)
+                    };
+
+                    // Child-order sizing: the engine-level "Auto Order Slicing" plan
+                    // wins; otherwise fall back to the method's own auto-slice /
+                    // exchange-freeze chunking. Each child super order keeps its own
+                    // native target + stop leg.
+                    let method_chunk = {
+                        let auto_slice = cfg.get("autoSlice").and_then(|v| v.as_bool()).unwrap_or(false)
+                            || cfg_f(&cfg, "autoSlice", 0.0) > 0.0;
+                        let slice_ov = cfg_f(&cfg, "sliceQty", 0.0) as i64;
+                        if auto_slice && slice_ov > 0 {
+                            slice_ov
+                        } else if auto_slice && freeze > 0.0 {
+                            freeze as i64
+                        } else {
+                            0
+                        }
+                    };
+                    let pieces = order_pieces(part_qty, &slice_plan, method_chunk);
+                    let sliced = pieces.len() > 1;
+                    let super_px = {
+                        let p = cfg_f(&cfg, "price", 0.0);
+                        if p > 0.0 { p } else { round2(ltp) }
+                    };
+                    for (i, piece) in pieces.into_iter().enumerate() {
+                        let child_corr = if sliced { format!("{corr}-s{}", i + 1) } else { corr.to_string() };
+                        let body = json!({
+                            "dhanClientId": client_id,
+                            "transactionType": side,
+                            "exchangeSegment": exch,
+                            "productType": product_from(cfg_str(&cfg, "product", "INTRADAY")),
+                            "orderType": order_type_from(cfg_str(&cfg, "orderType", "MARKET")),
+                            "securityId": strat.security_id.to_string(),
+                            "quantity": piece,
+                            "price": super_px,
+                            "targetPrice": round2(target.max(0.05)),
+                            "stopLossPrice": round2(stop.max(0.05)),
+                            "trailingJump": if broker_trail { point_trail } else { 0.0 },
+                            "correlationId": child_corr,
+                        });
+                        self.dhan.dhan_order_throttle().await;
+                        let resp = client.place_super_order(&body).await.map_err(|e| e.to_string())?;
+                        let oid = resp.get("orderId").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        if !oid.is_empty() {
+                            super_orders.push(oid.clone());
+                        }
+                        if sliced {
+                            slice_legs.push(json!({
+                                "qty": piece,
+                                "lots": if lot > 0.0 { round2(piece as f64 / lot) } else { 0.0 },
+                                "orderId": oid,
+                            }));
+                        }
+                    }
+                    let _ = filled;
+                }
+                "forever" => {
+                    let otype = cfg_str(&cfg, "orderType", "LIMIT");
+                    let px = cfg_f(&cfg, "price", 0.0);
+                    let px = if px > 0.0 { px } else { cfg_f(&cfg, "limitPrice", round2(ltp)) };
+                    let pieces = order_pieces(part_qty, &slice_plan, 0);
+                    let sliced = pieces.len() > 1;
+                    for (i, piece) in pieces.into_iter().enumerate() {
+                        let child_corr = if sliced { format!("{corr}-s{}", i + 1) } else { corr.to_string() };
+                        let body = json!({
+                            "dhanClientId": client_id,
+                            "transactionType": side,
+                            "exchangeSegment": exch,
+                            "productType": product_from(cfg_str(&cfg, "product", "CNC")),
+                            "orderType": otype,
+                            "securityId": strat.security_id.to_string(),
+                            "quantity": piece,
+                            "price": px,
+                            "triggerPrice": cfg_f(&cfg, "triggerPrice", 0.0),
+                            "validity": cfg_str(&cfg, "validity", "DAY"),
+                            "correlationId": child_corr,
+                        });
+                        self.dhan.dhan_order_throttle().await;
+                        let resp = client.place_forever(&body).await.map_err(|e| e.to_string())?;
+                        let oid = resp.get("orderId").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        if !oid.is_empty() {
+                            order_ids.push(oid.clone());
+                        }
+                        if sliced {
+                            slice_legs.push(json!({
+                                "qty": piece,
+                                "lots": if lot > 0.0 { round2(piece as f64 / lot) } else { 0.0 },
+                                "orderId": oid,
+                            }));
+                        }
+                    }
+                }
+                _ => {
+                    let otype = cfg_str(&cfg, "orderType", "MARKET");
+                    let mut px = cfg_opt_f(&cfg, "price").or_else(|| cfg_opt_f(&cfg, "limitPrice"));
+                    let mut trig = cfg_opt_f(&cfg, "triggerPrice").or_else(|| cfg_opt_f(&cfg, "limitPrice"));
+                    if otype.eq_ignore_ascii_case("MARKET") {
+                        px = None;
+                    }
+                    if otype.eq_ignore_ascii_case("LIMIT") && px.is_none() {
+                        px = Some(round2(ltp));
+                    }
+                    if otype.eq_ignore_ascii_case("SL") || otype.eq_ignore_ascii_case("SL-M") {
+                        if trig.is_none() {
+                            trig = px;
+                        }
+                    }
+                    let disclosed = cfg_opt_f(&cfg, "disclosedQty").map(|v| v as i64).filter(|v| *v > 0);
+                    let pieces = order_pieces(part_qty, &slice_plan, 0);
+                    let sliced = pieces.len() > 1;
+                    for (i, piece) in pieces.into_iter().enumerate() {
+                        let child_corr = if sliced { format!("{corr}-s{}", i + 1) } else { corr.to_string() };
+                        let req = OrderRequest {
+                            dhan_client_id: client_id.to_string(),
+                            correlation_id: Some(child_corr),
+                            transaction_type: txn(side),
+                            exchange_segment: seg_from(&exch),
+                            product_type: product_from(cfg_str(&cfg, "product", "INTRADAY")),
+                            order_type: order_type_from(otype.clone()),
+                            validity: validity_from(cfg_str(&cfg, "validity", "DAY")),
+                            security_id: strat.security_id.to_string(),
+                            quantity: piece,
+                            disclosed_quantity: disclosed,
+                            price: px,
+                            trigger_price: trig,
+                            after_market_order: None,
+                            amo_time: None,
+                            bo_profit_value: None,
+                            bo_stop_loss_value: None,
+                        };
+                        self.dhan.dhan_order_throttle().await;
+                        if method == "slice" || (freeze > 0.0 && piece as f64 > freeze) {
+                            let resps = client.slice_order(&req).await.map_err(|e| e.to_string())?;
+                            for r in resps {
+                                order_ids.push(r.order_id.clone());
+                            }
+                        } else {
+                            let r = client.place_order(&req).await.map_err(|e| e.to_string())?;
+                            order_ids.push(r.order_id.clone());
+                        }
+                        if sliced {
+                            slice_legs.push(json!({
+                                "qty": piece,
+                                "lots": if lot > 0.0 { round2(piece as f64 / lot) } else { 0.0 },
+                            }));
+                        }
+                    }
+                }
+            }
+
+        Ok(())
+    }
+
+
+/// Split `total` units across `route` in proportion to each broker's open
+/// quantity, using largest-remainder so the parts always sum to exactly `total`
+/// and no broker is asked for more than it holds.
+fn apportion(total: i64, held: &BTreeMap<String, i64>, route: &[String]) -> BTreeMap<String, i64> {
+    let mut out: BTreeMap<String, i64> = BTreeMap::new();
+    let held_sum: i64 = route
+        .iter()
+        .filter_map(|b| held.get(&b.to_ascii_lowercase()).copied())
+        .filter(|q| *q > 0)
+        .sum();
+    if total <= 0 || held_sum <= 0 {
+        return out;
+    }
+    let total = total.min(held_sum);
+    let mut used = 0i64;
+    let mut remainders: Vec<(i64, String)> = Vec::new();
+    for b in route {
+        let key = b.to_ascii_lowercase();
+        let h = held.get(&key).copied().filter(|q| *q > 0).unwrap_or(0);
+        if h == 0 {
+            continue;
+        }
+        let exact = total as i128 * h as i128;
+        let part = (exact / held_sum as i128) as i64;
+        let rem = (exact % held_sum as i128) as i64;
+        out.insert(key.clone(), part);
+        used += part;
+        remainders.push((rem, key));
+    }
+    remainders.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    let mut left = total - used;
+    for (_, key) in remainders {
+        if left <= 0 {
+            break;
+        }
+        *out.entry(key).or_insert(0) += 1;
+        left -= 1;
+    }
+    out.retain(|_, q| *q > 0);
+    out
+}
+
     async fn close_position(&self, id: &str, reason: &str, exit_price: f64) -> Result<(), String> {
         self.close_position_ex(id, reason, exit_price, None, None).await
     }
@@ -11377,6 +11810,9 @@ impl RealtimeState {
         };
         let pnl = if is_buy { (exit_price - entry) * qty as f64 } else { (entry - exit_price) * qty as f64 };
 
+        // Per-broker slice of a partial exit; filled below only when a partial
+        // is booked against a position that knows its broker split.
+        let mut partial_alloc: BTreeMap<String, i64> = BTreeMap::new();
         // Send the exit order. Square-off by the operator is always allowed,
         // even if the engine was disarmed after the entry. Paper mode books the
         // exit locally at `exit_price` and never touches the broker.
@@ -11386,52 +11822,137 @@ impl RealtimeState {
         // or it was closed manually), so we book it as-is and send nothing - a
         // new order here would flip the account into the opposite position.
         let mut exit_order_ids: Vec<String> = Vec::new();
+        let mut exit_errors: Vec<String> = Vec::new();
         if let Some(recovered) = recovered {
             exit_order_ids = recovered;
         } else if !self.paper {
-        if let Some(client) = self.dhan.session_client().await {
-            let client_id = self.dhan.session_client_id().await.unwrap_or_default();
-            if broker {
-                // Cancel both protective legs, then flatten any residual entry.
-                for so in jarr(&pos, "superOrders") {
-                    if let Some(oid) = so.as_str() {
-                        self.dhan.dhan_order_throttle().await;
-                        let _ = client.cancel_super_order(oid).await;
-                    }
-                }
-            }
+            let route: Vec<String> = pos
+                .get("brokers")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str())
+                        .filter(|id| !id.is_empty())
+                        .map(|id| id.to_ascii_lowercase())
+                        .collect()
+                })
+                .unwrap_or_default();
+            // A position booked before routing existed carries no `brokers`
+            // list; it was Dhan-only by definition.
+            let route = if route.is_empty() { vec!["dhan".to_string()] } else { route };
             let exit_side = if is_buy { "SELL" } else { "BUY" };
-            let req = OrderRequest {
-                dhan_client_id: client_id,
-                correlation_id: Some(corr_id(&format!("exit{id}"))),
-                transaction_type: txn(exit_side),
-                exchange_segment: seg_from(&exch),
-                product_type: product_from(cfg_str(&cfg, "product", "INTRADAY")),
-                order_type: OrderType::Market,
-                validity: Validity::Day,
-                security_id: sec_id.to_string(),
-                quantity: qty,
-                disclosed_quantity: None,
-                price: None,
-                trigger_price: None,
-                after_market_order: None,
-                amo_time: None,
-                bo_profit_value: None,
-                bo_stop_loss_value: None,
-            };
-            self.dhan.dhan_order_throttle().await;
-            let underlying = js(&pos, "underlying");
-            let freeze = scrip::freeze_qty(sec_id, &underlying);
-            if freeze > 0.0 && qty as f64 > freeze {
-                if let Ok(rs) = client.slice_order(&req).await {
-                    for r in rs {
+            let contract = scrip::get().and_then(|s| s.contract(sec_id).cloned());
+            // Mirror the entry split: each broker is flattened for exactly the
+            // quantity it received. Positions booked before per-broker tracking
+            // (or a single-broker Dhan entry) fall back to the whole qty.
+            let per_broker: BTreeMap<String, i64> = pos
+                .get("brokerQty")
+                .and_then(|v| v.as_object())
+                .map(|m| {
+                    m.iter()
+                        .filter_map(|(k, v)| v.as_i64().map(|q| (k.to_ascii_lowercase(), q)))
+                        .collect()
+                })
+                .unwrap_or_default();
+            // A partial booking must only flatten its share on each broker: if
+            // 3 of 10 lots are booked, each broker that holds 5 gives back 1 or 2,
+            // never its full 5.
+            if partial.is_some() && !per_broker.is_empty() {
+                partial_alloc = Self::apportion(qty, &per_broker, &route);
+            }
+            for target in &route {
+                let key = target.to_ascii_lowercase();
+                let tqty = if partial.is_some() && !per_broker.is_empty() {
+                    partial_alloc.get(&key).copied().unwrap_or(0)
+                } else {
+                    per_broker.get(&key).copied().filter(|q| *q > 0).unwrap_or(qty)
+                };
+                if tqty <= 0 {
+                    continue;
+                }
+                if target.eq_ignore_ascii_case("dhan") {
+                    let Some(client) = self.dhan.session_client().await else {
+                        exit_errors.push("dhan: not connected".to_string());
+                        continue;
+                    };
+                    let client_id = self.dhan.session_client_id().await.unwrap_or_default();
+                    if broker {
+                        // Cancel both protective legs, then flatten any residual entry.
+                        for so in jarr(&pos, "superOrders") {
+                            if let Some(oid) = so.as_str() {
+                                self.dhan.dhan_order_throttle().await;
+                                let _ = client.cancel_super_order(oid).await;
+                            }
+                        }
+                    }
+                    let req = OrderRequest {
+                        dhan_client_id: client_id,
+                        correlation_id: Some(corr_id(&format!("exit{id}"))),
+                        transaction_type: txn(exit_side),
+                        exchange_segment: seg_from(&exch),
+                        product_type: product_from(cfg_str(&cfg, "product", "INTRADAY")),
+                        order_type: OrderType::Market,
+                        validity: Validity::Day,
+                        security_id: sec_id.to_string(),
+                        quantity: tqty,
+                        disclosed_quantity: None,
+                        price: None,
+                        trigger_price: None,
+                        after_market_order: None,
+                        amo_time: None,
+                        bo_profit_value: None,
+                        bo_stop_loss_value: None,
+                    };
+                    self.dhan.dhan_order_throttle().await;
+                    let underlying = js(&pos, "underlying");
+                    let freeze = scrip::freeze_qty(sec_id, &underlying);
+                    if freeze > 0.0 && tqty as f64 > freeze {
+                        if let Ok(rs) = client.slice_order(&req).await {
+                            for r in rs {
+                                exit_order_ids.push(r.order_id);
+                            }
+                        }
+                    } else if let Ok(r) = client.place_order(&req).await {
                         exit_order_ids.push(r.order_id);
+                    } else {
+                        exit_errors.push("dhan: exit order rejected".to_string());
+                    }
+                } else {
+                    let Some(contract) = contract.clone() else {
+                        exit_errors.push(format!(
+                            "{target}: no contract row for security id {sec_id}, cannot exit"
+                        ));
+                        continue;
+                    };
+                    let req = crate::adapters::OrderReq {
+                        contract,
+                        side: exit_side.to_string(),
+                        qty: tqty,
+                        order_type: "MARKET".to_string(),
+                        price: 0.0,
+                        product: cfg_str(&cfg, "product", "INTRADAY"),
+                        ltp: exit_price,
+                        correlation: corr_id(&format!("exit{id}{target}")),
+                    };
+                    match crate::adapters::place(target, &req).await {
+                        Ok(p) => {
+                            if !p.order_id.is_empty() {
+                                exit_order_ids.push(format!("{target}:{}", p.order_id));
+                            }
+                        }
+                        Err(e) => exit_errors.push(format!("{target}: {e}")),
                     }
                 }
-            } else if let Ok(r) = client.place_order(&req).await {
-                exit_order_ids.push(r.order_id);
             }
-        }
+            if !exit_errors.is_empty() {
+                self.log(
+                    "error",
+                    &format!(
+                        "exit {id} could not be delivered to every broker: {}",
+                        exit_errors.join("; ")
+                    ),
+                );
+            }
         }
 
         // Paper trades book an estimated round-trip charge so the wallet and the
@@ -11517,6 +12038,10 @@ impl RealtimeState {
         // the closed record so the Closed Trades list keeps showing that the entry
         // was placed as an F&O limit order.
         closed["orderType"] = pos.get("orderType").cloned().unwrap_or(json!("MARKET"));
+        // Which brokers this trade was routed to, and who owned its trail, so the
+        // ledger proves the routing decision instead of inferring it.
+        closed["brokers"] = pos.get("brokers").cloned().unwrap_or(json!([]));
+        closed["trailOwner"] = pos.get("trailOwner").cloned().unwrap_or(json!("engine"));
         closed["limitPrice"] = pos.get("limitPrice").cloned().unwrap_or(json!(0.0));
         // Carry the stop-loss / trail levels onto the closed record so the Closed
         // Trades table can show the SL that was applied in BOTH points and percent
@@ -11568,6 +12093,20 @@ impl RealtimeState {
                     p["filledQty"] = json!(remain);
                     let lot = jf(p, "lotSize");
                     p["lots"] = if lot > 0.0 { json!((remain as f64 / lot).round()) } else { json!(0.0) };
+                    // Keep the per-broker ledger in step with the reduced qty so
+                    // the next exit (or a later full close) flattens only what is
+                    // still open at each broker.
+                    if !partial_alloc.is_empty() {
+                        if let Some(m) = p.get_mut("brokerQty").and_then(|v| v.as_object_mut()) {
+                            for (broker, closed_qty) in &partial_alloc {
+                                if let Some(cur) = m.get_mut(broker).and_then(|v| v.as_i64()) {
+                                    let left = (cur - closed_qty).max(0);
+                                    m.insert(broker.clone(), json!(left));
+                                }
+                            }
+                            m.retain(|_, v| v.as_i64().unwrap_or(0) > 0);
+                        }
+                    }
                     p["partialDone"] = json!(true);
                     p["status"] = json!("running");
                 }
@@ -15686,6 +16225,13 @@ fn trade_mode_of(_strat: &Strategy, _s: &Settings) -> String {
     "premium".into()
 }
 
+/// True when the broker's own OMS owns the trailing stop for this position, so
+/// `manage_positions` must never ratchet a competing app-side stop. Frozen at
+/// entry (`trailOwner`) and mirrored by `pointTrailBrokerOnly` for older rows.
+fn broker_owns_position_trail(p: &Value) -> bool {
+    js(p, "trailOwner").eq_ignore_ascii_case("broker") || jb(p, "pointTrailBrokerOnly")
+}
+
 /// Parse the strike and option type out of a resolved option contract symbol
 /// such as `POLICYBZR-Sep2026-1900-PE` (the last two `-` separated fields).
 /// Returns `None` for anything that is not a CE/PE option leg.
@@ -17291,6 +17837,26 @@ fn snap_of(rt: &RealtimeState) -> Value {
     // Live AI-trader picks (old AST activeStrategies) so the Running view can
     // mirror the engine's exact run set.
     let ai_picks: Vec<String> = if d.settings.ai_pick { ai_pick_ids(&d) } else { Vec::new() };
+    // Per-engine broker routing readout for the Order Placement Method block:
+    // the saved ticks, plus which brokers are deliverable right now (ON + fully
+    // configured in Broker Settings) so the UI can grey out the rest.
+    let route_view = {
+        let usable = crate::brokers::enabled_configured();
+        let settings_touched = crate::brokers::any_configured();
+        // Paper books never send a real order, so they report no route.
+        let resolved = if rt.paper {
+            Vec::new()
+        } else {
+            crate::brokers::resolve_route(&d.brokers, &usable, settings_touched)
+        };
+        json!({
+            "map": d.brokers,
+            "resolved": resolved,
+            "usable": usable,
+            "settingsTouched": settings_touched,
+            "catalog": crate::brokers::catalog_json(),
+        })
+    };
     // Live scanner (Top Movers) auto side has been removed.
     let auto_side: Option<String> = None;
     let margin_available = if rt.paper {
@@ -17306,6 +17872,7 @@ fn snap_of(rt: &RealtimeState) -> Value {
         "settings": d.settings,
         "method": d.method,
         "orderCfg": d.order_cfg,
+        "brokers": route_view,
         "strategies": strategies_view,
         "positions": positions,
         "closed": closed,
@@ -17570,12 +18137,92 @@ pub async fn arm_post(State(rt): State<RealtimeState>, Json(v): Json<Value>) -> 
     Json(json!({ "ok": true, "engineOn": engine_on, "armed": armed }))
 }
 
+/// Per-engine broker routing readout: the saved ticks, the brokers that are
+/// actually deliverable right now, and the full shared catalogue so one poll
+/// feeds both the engine's broker row and the Broker Settings tab.
+pub async fn brokers_get(State(rt): State<RealtimeState>) -> impl IntoResponse {
+    let map = rt
+        .doc()
+        .map(|d| d.brokers.clone())
+        .unwrap_or_default();
+    let usable = crate::brokers::enabled_configured();
+    let resolved = if rt.paper {
+        Vec::new()
+    } else {
+        crate::brokers::resolve_route(&map, &usable, crate::brokers::any_configured())
+    };
+    Json(json!({
+        "ok": true,
+        "brokers": map,
+        "resolved": resolved,
+        "usable": usable,
+        "catalog": crate::brokers::catalog_json(),
+    }))
+}
+
 pub async fn auto_lots_post(State(rt): State<RealtimeState>, Json(v): Json<Value>) -> impl IntoResponse {
     if let Some(mut d) = rt.doc() {
         d.auto_lots = jb(&v, "autoLots");
     }
     rt.save();
     Json(json!({ "ok": true }))
+}
+
+/// Per-engine broker routing: which of the operator's enabled brokers this
+/// engine sends orders to. Only brokers that are ON + fully configured in the
+/// shared Broker Settings tab end up in the saved route, so a tick can never
+/// point at a half-filled account.
+pub async fn brokers_post(State(rt): State<RealtimeState>, Json(v): Json<Value>) -> impl IntoResponse {
+    let usable = crate::brokers::enabled_configured();
+    let mut rejected: Vec<String> = Vec::new();
+    if let Some(mut d) = rt.doc() {
+        if let Some(map) = v.get("brokers").and_then(|x| x.as_object()) {
+            let mut next: BTreeMap<String, bool> = BTreeMap::new();
+            for (id, on) in map {
+                let id = id.to_ascii_lowercase();
+                let on = on.as_bool().unwrap_or(false);
+                if crate::brokers::spec(&id).is_none() {
+                    rejected.push(id);
+                    continue;
+                }
+                if on && !usable.iter().any(|u| u.eq_ignore_ascii_case(&id)) {
+                    rejected.push(id.clone());
+                }
+                next.insert(id, on);
+            }
+            d.brokers = next;
+        }
+        if let Some(on) = v.get("enabled").and_then(|x| x.as_bool()) {
+            let id = js(&v, "id").to_ascii_lowercase();
+            if crate::brokers::spec(&id).is_some() {
+                if on && !usable.iter().any(|u| u.eq_ignore_ascii_case(&id)) {
+                    rejected.push(id.clone());
+                }
+                d.brokers.insert(id, on);
+            }
+        }
+    }
+    rt.save();
+    let (route, resolved) = {
+        let d = match rt.doc() {
+            Some(d) => d,
+            None => return Json(json!({ "ok": false, "error": "state lock" })),
+        };
+        let usable = crate::brokers::enabled_configured();
+        let resolved = crate::brokers::resolve_route(
+            &d.brokers,
+            &usable,
+            crate::brokers::any_configured(),
+        );
+        (d.brokers.clone(), resolved)
+    };
+    Json(json!({
+        "ok": true,
+        "brokers": route,
+        "resolved": resolved,
+        "rejected": rejected,
+        "usable": usable,
+    }))
 }
 
 pub async fn entry_post(State(rt): State<RealtimeState>, Json(v): Json<Value>) -> impl IntoResponse {
@@ -18774,6 +19421,7 @@ macro_rules! rt_routes {
             .route(concat!($p, "/tick"), post(tick_post))
             .route(concat!($p, "/arm"), post(arm_post))
             .route(concat!($p, "/autolots"), post(auto_lots_post))
+            .route(concat!($p, "/brokers"), get(brokers_get).post(brokers_post))
             .route(concat!($p, "/entry"), post(entry_post))
             .route(concat!($p, "/close"), post(close_post))
             .route(concat!($p, "/square_off"), post(square_off_post))
@@ -19068,6 +19716,60 @@ mod gate_tests {
         assert!(rt3.commodities_only());
         let live3 = RealtimeState::new_realtime3(crate::broker::DhanState::new(crate::market::MarketState::new()));
         assert!(live3.indices_commodities_only(), "realtime 3 is an indices + commodity book");
+    }
+
+    #[tokio::test]
+    async fn liquid_scanner_belongs_only_to_the_full_engines() {
+        // Liquid F&O scanner + its lot policy live on Realtime Trading Engine and
+        // Paper Trade 1 only. The indices-only / commodities-only books (PT2,
+        // PT3, RT2, RT3) strip it on save/import and never scan the basket.
+        let full = [
+            RealtimeState::new(crate::broker::DhanState::new(crate::market::MarketState::new())),
+            RealtimeState::new_paper(crate::broker::DhanState::new(crate::market::MarketState::new())),
+        ];
+        for rt in &full {
+            assert!(rt.allows_liquid_stocks(), "{} keeps the Liquid F&O scanner", rt.state_file);
+            let mut s = Settings::default();
+            s.liquid_on = true;
+            s.liquid_gainers = 3;
+            s.liquid_list = vec![2885];
+            s.liquid_auto_lot_on = true;
+            s.liquid_slice_on = true;
+            rt.enforce_constraints(&mut s);
+            assert!(s.liquid_on, "{} keeps the liquid master", rt.state_file);
+            assert_eq!(s.liquid_gainers, 3);
+            assert_eq!(s.liquid_list, vec![2885]);
+            assert!(s.liquid_auto_lot_on, "{} keeps the liquid lot policy", rt.state_file);
+            assert!(s.liquid_slice_on);
+        }
+
+        let stripped = [
+            RealtimeState::new_paper2(crate::broker::DhanState::new(crate::market::MarketState::new())),
+            RealtimeState::new_paper3(crate::broker::DhanState::new(crate::market::MarketState::new())),
+            RealtimeState::new_realtime2(crate::broker::DhanState::new(crate::market::MarketState::new())),
+            RealtimeState::new_realtime3(crate::broker::DhanState::new(crate::market::MarketState::new())),
+        ];
+        for rt in &stripped {
+            assert!(!rt.allows_liquid_stocks(), "{} has no Liquid F&O scanner", rt.state_file);
+            let mut s = Settings::default();
+            s.liquid_on = true;
+            s.liquid_gainers = 3;
+            s.liquid_losers = 2;
+            s.liquid_gainer = 2885;
+            s.liquid_loser = 2885;
+            s.liquid_list = vec![2885];
+            s.liquid_auto_lot_on = true;
+            s.liquid_slice_on = true;
+            rt.enforce_constraints(&mut s);
+            assert!(!s.liquid_on, "{} must drop the liquid master", rt.state_file);
+            assert_eq!(s.liquid_gainers, 0);
+            assert_eq!(s.liquid_losers, 0);
+            assert_eq!(s.liquid_gainer, 0);
+            assert_eq!(s.liquid_loser, 0);
+            assert!(s.liquid_list.is_empty(), "{} drops the liquid adds", rt.state_file);
+            assert!(!s.liquid_auto_lot_on, "{} drops the liquid lot policy", rt.state_file);
+            assert!(!s.liquid_slice_on);
+        }
     }
 
     #[tokio::test]
@@ -19404,6 +20106,72 @@ mod gate_tests {
         rt.clear_signal_edge(id);
         let left = rt.et_pending.lock().ok().map(|m| m.contains_key(id)).unwrap_or(true);
         assert!(!left, "a signal reset clears the stale entry-timing stamp");
+    }
+
+    #[test]
+    fn broker_owned_trail_is_read_from_the_booked_position() {
+        // A position routed to a native-trail broker must never be ratcheted by
+        // the engine; an ordinary engine-trail position still is.
+        let engine_owned = json!({ "trailOwner": "engine", "pointTrailBrokerOnly": false });
+        assert!(!broker_owns_position_trail(&engine_owned));
+        let broker = json!({ "trailOwner": "broker", "pointTrailBrokerOnly": true });
+        assert!(broker_owns_position_trail(&broker));
+        // A legacy row (no trailOwner) still honours the broker-only marker.
+        let legacy = json!({ "pointTrailBrokerOnly": true });
+        assert!(broker_owns_position_trail(&legacy));
+    }
+
+    #[tokio::test]
+    async fn a_paper_entry_books_the_engine_as_trail_owner_and_no_route() {
+        // Paper books are simulated: they must never claim a broker route nor a
+        // broker-side trail, even when the operator has routed brokers for the
+        // LIVE engines.
+        let market = crate::market::MarketState::new();
+        let dhan = crate::broker::DhanState::new(market);
+        let rt = RealtimeState::new_paper3(dhan);
+        let _allot_guard = crate::shared_margin::TEST_ALLOT_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::shared_margin::set_total_for_test("paper", 5_000_000.0);
+        crate::shared_margin::set_allot_for_test("paper3", true, "rs", 0.0, 5_000_000.0);
+        if let Ok(mut q) = rt.dhan.market.quotes.lock() {
+            q.insert(
+                crate::market::quote_key(999_002, "NSE_EQ"),
+                json!({ "ltp": 100.0, "change": 1.0, "prev_ltp": 99.0 }),
+            );
+        }
+        let strat = Strategy {
+            id: "pick:999002:CE".into(),
+            name: "TESTLEG2".into(),
+            category: "BULLISH".into(),
+            timeframe: "5m".into(),
+            security_id: 999_002,
+            exchange_segment: "NSE_EQ".into(),
+            instrument: "EQUITY".into(),
+            trading_symbol: "TESTLEG2".into(),
+            side: "BUY".into(),
+            synthetic: false,
+            lot: 1.0,
+            ..Default::default()
+        };
+        if let Some(mut d) = rt.doc() {
+            d.positions.clear();
+            d.entry_timing.clear();
+            d.settings.paper_reject_pct = 0.0;
+            d.settings.spot_candle_gate = false;
+            // Route the live engines to Dhan so the paper path is proven to
+            // ignore the route entirely.
+            d.brokers.insert("dhan".to_string(), true);
+        }
+        let res = rt.open_entry(&strat, true, None).await;
+        assert!(res.is_ok(), "paper entry should book: {res:?}");
+        let d = rt.doc().unwrap();
+        let p = d.positions[0].clone();
+        assert_eq!(p["trailOwner"], "engine", "paper always trails app-side");
+        assert_eq!(p["brokers"], json!([]), "paper never claims a broker route");
+        assert_eq!(p["pointTrailBrokerOnly"], false);
+        drop(d);
+        assert!(!broker_owns_position_trail(&p));
     }
 
     #[tokio::test]
@@ -23012,6 +23780,65 @@ mod gate_tests {
         s.liquid_on = false;
         let out = rt.scanner_targets(&s);
         assert!(out.iter().all(|x| !x.liquid_leg), "no liquid legs once the scanner is off");
+    }
+
+    #[tokio::test]
+    async fn liquid_owned_stocks_are_excluded_from_the_top_movers_list() {
+        // A stock that the Liquid F&O list is showing (its scanner gainers /
+        // losers / hand-added names or the operator's explicit pick) must not be
+        // re-listed in the Top Movers gainers / losers readout. The liquid list
+        // owns it; the movers ranking skips it and takes its top N from the rest.
+        let market = crate::market::MarketState::new();
+        let dhan = crate::broker::DhanState::new(market);
+        let rt = RealtimeState::new_paper(dhan);
+        let liquid_id = 2885; // RELIANCE (liquid basket member)
+        if let Ok(mut g) = rt.liquid_cache.lock() {
+            *g = (
+                now_ms(),
+                json!({
+                    "on": true,
+                    "gainers": [{"securityId": liquid_id, "last": 100.0}],
+                    "losers": [],
+                    "added": []
+                }),
+            );
+        }
+        let mut s = Settings::default();
+
+        // Scanner OFF: nothing is owned, so the stock stays rankable.
+        s.liquid_on = false;
+        assert!(rt.liquid_owned_ids(&s).is_empty());
+
+        // Scanner ON: the shown stock is owned and dropped from movers rows.
+        s.liquid_on = true;
+        let owned = rt.liquid_owned_ids(&s);
+        assert!(owned.contains(&liquid_id), "the liquid gainer is owned by the liquid list");
+        let rows = vec![
+            json!({"securityId": liquid_id, "changePct": 5.0}),
+            json!({"securityId": 13061, "changePct": 3.0}),
+        ];
+        let ranked = exclude_liquid_owned(rows, &owned);
+        assert_eq!(ranked.len(), 1, "only the non-liquid stock stays in the movers ranking");
+        assert_eq!(ranked[0]["securityId"], json!(13061));
+
+        // Operator's explicit gainer / loser picks and saved adds are owned too.
+        if let Ok(mut g) = rt.liquid_cache.lock() {
+            *g = (now_ms(), json!({ "on": true, "gainers": [], "losers": [], "added": [] }));
+        }
+        s.liquid_list = vec![11536];
+        s.liquid_gainer = 21614;
+        s.liquid_loser = 13061;
+        let owned = rt.liquid_owned_ids(&s);
+        assert!(owned.contains(&11536), "hand-added stock is owned");
+        assert!(owned.contains(&21614), "explicit gainer pick is owned");
+        assert!(owned.contains(&13061), "explicit loser pick is owned");
+
+        // A stocks-only engine never owns liquid names (no liquid scanner there).
+        let p2 = RealtimeState::new_paper2(crate::broker::DhanState::new(crate::market::MarketState::new()));
+        let mut s2 = Settings::default();
+        s2.liquid_on = true;
+        s2.liquid_list = vec![11536];
+        assert!(p2.liquid_owned_ids(&s2).is_empty());
     }
 
     #[test]

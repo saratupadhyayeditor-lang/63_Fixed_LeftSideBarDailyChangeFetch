@@ -108,10 +108,41 @@ fn mcx_lot_override(trading_symbol: &str) -> f64 {
     }
 }
 
+/// One resolved contract, independent of any broker's own symbol scheme.
+///
+/// The engines speak Dhan `security_id`; every non-Dhan adapter has to translate
+/// that identity into its own instrument key/token. Keeping the full row here
+/// (underlying, expiry, strike, option type, exchange, lot) means an adapter can
+/// look up its own master by contract fields instead of guessing from a
+/// broker-specific trading symbol.
+#[derive(Clone, Debug)]
+pub struct Contract {
+    /// Dhan security id (the engine's identity for this contract).
+    pub security_id: i64,
+    /// `NSE` / `BSE` / `MCX` (scrip-master exchange id).
+    pub exchange: String,
+    /// Raw scrip-master instrument name: `EQUITY`, `OPTIDX`, `OPTSTK`, `OPTFUT`,
+    /// `FUTIDX`, `FUTSTK`, `FUTCOM`.
+    pub instrument: String,
+    /// F&O underlying prefix (e.g. `NIFTY`) or the cash symbol for equities.
+    pub underlying: String,
+    /// `YYYY-MM-DD` expiry (empty for cash equity).
+    pub expiry: String,
+    pub strike: f64,
+    /// `CE` / `PE` / empty for futures + equity.
+    pub option_type: String,
+    pub lot: f64,
+    /// Dhan trading symbol (kept for logging / fallback matching).
+    pub trading_symbol: String,
+}
+
 /// Parsed scrip master. Only OPT*/FUT* rows plus the NSE cash-equity id map are
 /// retained (the rest is never looked up), which keeps the footprint small.
 #[derive(Default)]
 pub struct Scrip {
+    /// Every resolved contract keyed by Dhan security id, used by the non-Dhan
+    /// order adapters to translate a position's contract into their own token.
+    contracts: HashMap<i64, Contract>,
     /// `(exchange, prefix, expiry_date)` -> `strike_cents` -> legs.
     oc: HashMap<(String, String, String), BTreeMap<i64, StrikeEntry>>,
     /// `(exchange, prefix)` -> sorted expiries that carry option strikes.
@@ -233,6 +264,18 @@ impl Scrip {
     /// NSE cash-equity Dhan security id for a symbol (series EQ only).
     pub fn equity_sid(&self, symbol: &str) -> Option<i64> {
         self.eq_sid.get(&symbol.trim().to_uppercase()).copied()
+    }
+
+    /// Full contract row for a Dhan security id. This is what the non-Dhan order
+    /// adapters read: the engines only know the Dhan id, so every other broker's
+    /// instrument key is resolved from these contract fields.
+    pub fn contract(&self, sid: i64) -> Option<&Contract> {
+        self.contracts.get(&sid)
+    }
+
+    /// Every security id that has a resolved contract row.
+    pub fn contract_ids(&self) -> Vec<i64> {
+        self.contracts.keys().copied().collect()
     }
 
     /// True when any option strikes exist for this prefix on this exchange.
@@ -944,7 +987,22 @@ fn parse_file(path: &Path) -> Option<Scrip> {
             if exch == "NSE" && series == "EQ" {
                 if let Ok(sid) = f[2].trim().parse::<i64>() {
                     if sid > 0 {
-                        sc.eq_sid.insert(f[5].trim().to_uppercase(), sid);
+                        let symbol = f[5].trim().to_uppercase();
+                        sc.eq_sid.insert(symbol.clone(), sid);
+                        sc.contracts.insert(
+                            sid,
+                            Contract {
+                                security_id: sid,
+                                exchange: exch,
+                                instrument: inst.to_string(),
+                                underlying: symbol,
+                                expiry: String::new(),
+                                strike: 0.0,
+                                option_type: String::new(),
+                                lot: f.get(6).and_then(|v| v.trim().parse::<f64>().ok()).unwrap_or(1.0).max(1.0),
+                                trading_symbol: f[5].trim().to_string(),
+                            },
+                        );
                     }
                 }
             }
@@ -969,16 +1027,31 @@ fn parse_file(path: &Path) -> Option<Scrip> {
         if is_fut {
             fo_sets.entry((prefix.clone(), inst.to_string())).or_default().push(expiry.clone());
             if let Ok(sid) = f[2].trim().parse::<i64>() {
+                let lot = f[6].trim().parse::<f64>().unwrap_or(0.0);
                 sc.fo
                     .entry((prefix.clone(), inst.to_string()))
                     .or_default()
                     .push(FutRow {
                         exchange: exch.clone(),
-                        expiry,
+                        expiry: expiry.clone(),
                         security_id: sid,
-                        lot: f[6].trim().parse::<f64>().unwrap_or(0.0),
+                        lot,
                         trading_symbol: symbol.to_string(),
                     });
+                sc.contracts.insert(
+                    sid,
+                    Contract {
+                        security_id: sid,
+                        exchange: exch.clone(),
+                        instrument: inst.to_string(),
+                        underlying: prefix.clone(),
+                        expiry,
+                        strike: 0.0,
+                        option_type: String::new(),
+                        lot: lot.max(1.0),
+                        trading_symbol: symbol.to_string(),
+                    },
+                );
             }
             continue;
         }
@@ -1004,6 +1077,20 @@ fn parse_file(path: &Path) -> Option<Scrip> {
         } else {
             entry.pe = Some((sid, symbol.to_string()));
         }
+        sc.contracts.insert(
+            sid,
+            Contract {
+                security_id: sid,
+                exchange: exch.clone(),
+                instrument: inst.to_string(),
+                underlying: prefix.clone(),
+                expiry: expiry.clone(),
+                strike,
+                option_type: otype.to_string(),
+                lot: lot.max(1.0),
+                trading_symbol: symbol.to_string(),
+            },
+        );
         if inst == "OPTSTK" {
             stock_sets
                 .entry((exch.clone(), prefix.clone()))

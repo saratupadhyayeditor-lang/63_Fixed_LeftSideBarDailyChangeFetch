@@ -18,11 +18,14 @@ use tower_http::set_header::SetResponseHeaderLayer;
 
 use algo_core::model::TIMEFRAMES;
 
+mod adapters;
 mod backup;
 mod brain;
 mod broker;
+mod brokers;
 mod equity;
 mod equity_engine;
+mod instruments;
 mod market;
 mod marketanalysis;
 mod optionchain;
@@ -248,6 +251,8 @@ async fn main() {
         .route("/api/instruments", get(market::instruments))
         .route("/api/lot_sizes", get(optionchain::lot_sizes))
         .route("/ws", get(market::ws_handler))
+        .route("/api/brokers", get(brokers::catalog_get).post(brokers::account_post))
+        .route("/api/brokers/test", post(brokers::test_post))
         .route("/api/connect", post(broker::connect))
         .route("/api/status", get(broker::status))
         .route("/api/feed/status", get(broker::feed_status))

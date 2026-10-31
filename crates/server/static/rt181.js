@@ -42,6 +42,8 @@ const API = {
   engine: (v) => post("/api/rt/engine", v),
   tick: () => post("/api/rt/tick", {}),
   autoLots: (v) => post("/api/rt/autolots", v),
+  brokers: () => get("/api/rt/brokers"),
+  brokersSet: (v) => post("/api/rt/brokers", v),
   entry: (v) => post("/api/rt/entry", v),
   close: (v) => post("/api/rt/close", v),
   squareOff: () => post("/api/rt/square_off", {}),
@@ -1188,6 +1190,11 @@ function shell() {
           <span style="font-size:12px;color:#bbb;margin-left:auto">Dhan margin available: <b id="rtomMarginAvail" style="color:#ffd700">--</b></span>
         </div>
         <div id="rtomRow" style="display:flex;gap:10px;flex-wrap:wrap;margin-top:8px"></div>
+        <div id="rtBrokerRow" style="display:flex;gap:10px;flex-wrap:wrap;align-items:center;margin-top:8px;border-top:1px dashed #4a4a80;padding-top:8px">
+          <span id="rtBrokerLabel" style="font-size:12px;color:#c4a9ff;font-weight:700;white-space:nowrap">Send orders to:</span>
+          <span id="rtBrokerChips" style="display:flex;gap:8px;flex-wrap:wrap;align-items:center"></span>
+          <span id="rtBrokerNote" style="font-size:10px;color:#888"></span>
+        </div>
         <div id="rtEngineExtra" style="display:flex;flex-wrap:wrap;align-items:center;gap:10px;margin-top:8px;border-top:1px dashed #4a4a80;padding-top:8px;font-size:12px">
           <span style="color:#c4a9ff;font-weight:700;font-size:12px;white-space:nowrap">Engine controls:</span>
           <span class="rtom-f" title="Live available balance (paper me virtual wallet, real me Dhan funds). Ye read-only hai.">Available balance <b id="rtEngAvailBal" style="color:#00d4aa">--</b></span>
@@ -1761,10 +1768,13 @@ function shell() {
     const show = (el) => { if (el) el.style.display = ""; };
     // F&O-stock expiry-day guard belongs to the Realtime + Paper Trade 1 tabs only.
     hide(rt.querySelector("#rtFnoExpiryRow"));
-    // Liquid F&O lot policy (Auto-Lot + iceberg) exists only where the Liquid
-    // F&O scanner does: Realtime Trading Engine 1 and Paper Trade 1. Realtime 2/3
-    // and Paper Trade 2/3 strip the whole liquid scanner, so its lot policy is
-    // hidden here too (the backend also refuses to arm it on those engines).
+    // Liquid F&O scanner (and its lot policy) exists only where the stock
+    // scanner does: Realtime Trading Engine 1 and Paper Trade 1. Realtime 2/3
+    // and Paper Trade 2/3 have no Liquid F&O universe at all, so the whole row,
+    // its readout and the lot policy are hidden here (the backend also refuses
+    // to arm the scanner or its lot policy on those engines).
+    hide(rt.querySelector("#rtLiquidRow"));
+    hide(rt.querySelector("#rtLiquidList"));
     hide(rt.querySelector("#rtLiquidLotWrap"));
     const hideRowOf = (id) => {
       const el = rt.querySelector("#" + id);
@@ -1960,6 +1970,107 @@ function buildMethodCards() {
   applyChartPrice();
   syncEngineRisk();
   syncInterlocks();
+  // The trail owner depends on the active method, so re-state it on every change.
+  renderBrokerRow();
+}
+
+// Per-broker routing for THIS engine. The catalogue + which brokers are ON and
+// fully configured come from the shared Broker Settings tab; the tick here is
+// the engine's own "send orders to this broker" switch. Paper books never send a
+// real order, so the row is hidden there.
+//
+// Trail ownership is stated up front: when every ticked broker runs a native
+// trailing stop for the active method, the broker owns the trail and the engine
+// holds only the fixed stop/target. A mixed selection falls back to the engine
+// trail so one position never carries two ratchets.
+function renderBrokerRow() {
+  const row = document.getElementById("rtBrokerRow");
+  if (!row) return;
+  const chipsEl = document.getElementById("rtBrokerChips");
+  const noteEl = document.getElementById("rtBrokerNote");
+  const labelEl = document.getElementById("rtBrokerLabel");
+  if (PAPER) {
+    row.style.display = "none";
+    return;
+  }
+  row.style.display = "flex";
+  const b = (STATE && STATE.brokers) || {};
+  const catalog = (b.catalog && b.catalog.brokers) || [];
+  if (!catalog.length) {
+    chipsEl.innerHTML = `<span style="font-size:11px;color:#888">Broker list load ho rahi hai...</span>`;
+    noteEl.textContent = "";
+    return;
+  }
+  const usable = new Set((b.usable || []).map((x) => String(x).toLowerCase()));
+  const map = b.map || {};
+  const touched = !!b.settingsTouched;
+  chipsEl.innerHTML = catalog.map((br) => {
+    const acct = br.account || {};
+    const on = usable.has(br.id);
+    // An untouched settings store means Dhan keeps its legacy route even though
+    // the shared store has not been filled in yet.
+    const legacyDhan = !touched && br.id === "dhan";
+    const ticked = map[br.id] != null ? !!map[br.id] : legacyDhan;
+    const configured = !!acct.configured;
+    const enabled = !!acct.enabled;
+    const ready = !!br.adapterReady;
+    let why = "";
+    if (!configured) why = "Broker Settings me API keys bharo";
+    else if (!enabled) why = "Broker Settings me switch ON karo";
+    else if (!ready) why = "Order adapter is build me pending hai";
+    else if (!on) why = "Broker Settings me ON + configured nahi";
+    const disabled = !on && !legacyDhan;
+    const style = disabled
+      ? "opacity:.45;filter:grayscale(.5)"
+      : (ticked ? "border-color:#4a2d7e;background:#161028" : "");
+    return `<label class="rtom-chip${ticked && !disabled ? " sel" : ""}" data-broker="${esc(br.id)}"
+      title="${esc(why || br.note || "")}${br.nativeTrail ? " · native trail" : " · engine trail"}"
+      style="display:flex;align-items:center;gap:7px;font-size:12px;font-weight:700;cursor:${disabled ? "not-allowed" : "pointer"};
+      border-radius:5px;padding:5px 10px;${style}">
+      <input type="checkbox" class="rtom-broker" data-broker="${esc(br.id)}"${ticked ? " checked" : ""}${disabled ? " disabled" : ""}
+        style="accent-color:#66ccff;width:15px;height:15px"> ${esc(br.name)}
+      <span style="font-size:9px;color:${br.nativeTrail ? "#00d4aa" : "#ffb74d"};font-weight:400">
+        ${br.nativeTrail ? "native trail" : "engine trail"}</span>
+    </label>`;
+  }).join("");
+  chipsEl.querySelectorAll(".rtom-broker").forEach((cb) => {
+    cb.addEventListener("change", async () => {
+      const id = cb.getAttribute("data-broker");
+      if (!id) return;
+      await API.brokersSet({ id, enabled: !!cb.checked });
+      refresh();
+    });
+  });
+  // State the trail owner for the CURRENT method so the operator can see which
+  // side will ratchet the stop.
+  const resolved = (b.resolved || []).map((x) => String(x).toLowerCase());
+  const methodNative = (METHODS.find((m) => m.key === activeMethod) || {});
+  // Mirrors `crates/server/src/brokers.rs`: only the Super Order method carries
+  // a native broker-side trail. Forever/GTT has no trailing leg, so the engine
+  // keeps the trail there.
+  const nativeMethods = new Set(["super"]);
+  // The broker can only own the trail when a jump is actually configured; with
+  // no jump it would trail nothing, so the engine keeps its own trail (this
+  // mirrors `brokers::broker_owns_trail` on the server).
+  const u = (STATE && STATE.settings) || {};
+  const jumpOn =
+    (!!u.trailPointsFromPct && !!u.manualTrailSl && num(u.manualTrailSlPct) > 0) ||
+    (!!u.manualPointTrailSl && num(u.manualPointTrailSlPoints) > 0);
+  const brokerOwns = jumpOn && resolved.length > 0 && nativeMethods.has(activeMethod)
+    && resolved.every((id) => {
+      const br = catalog.find((c) => c.id === id);
+      return br && br.nativeTrail;
+    });
+  if (labelEl) labelEl.textContent = "Send orders to:";
+  if (!resolved.length) {
+    noteEl.innerHTML = touched || map && Object.keys(map).length
+      ? `<span style="color:#ffb0b0">Koi broker deliverable nahi - upar tick karo ya Broker Settings me keys bharo.</span>`
+      : `<span style="color:#888">Dhan (default route)</span>`;
+  } else {
+    noteEl.innerHTML = brokerOwns
+      ? `<span style="color:#00d4aa">Trail: broker-side (${esc(methodNative.name || activeMethod)})</span>`
+      : `<span style="color:#ffb74d">Trail: engine-side (${esc(methodNative.name || activeMethod)})</span>`;
+  }
 }
 
 // Render the active method's own options (order type, GTT leg, slice qty ...)
@@ -3978,6 +4089,8 @@ function renderSnapshot(s) {
 
   // apply settings to the engine-control checkboxes/inputs
   applySettingsToDom(s.settings);
+  // Per-engine broker routing row (hidden on the paper books).
+  renderBrokerRow();
 
   // Smart P&L summary: the engine panes show the LAST TRADING DAY (the newest IST
   // day that has a closed trade) - the full history lives in the Trade Stats tabs.
@@ -4097,13 +4210,16 @@ async function loadScanners() {
 
     // Liquid F&O scanner readout + its dropdown universe. Fetched every poll so
     // turning the master ON shows rows immediately; the server throttles the
-    // scan itself.
-    await loadLiquidUniverse();
-    try {
-      const lq = await API.liquid();
-      renderLiquidReadout(lq);
-    } catch (_e) { /* best-effort */ }
-    syncLiquidSelects(cfg);
+    // scan itself. Only the full engines (Realtime 1 / Paper 1) carry the
+    // scanner, so the others skip the fetch and its universe load entirely.
+    if (!PAPER2) {
+      await loadLiquidUniverse();
+      try {
+        const lq = await API.liquid();
+        renderLiquidReadout(lq);
+      } catch (_e) { /* best-effort */ }
+      syncLiquidSelects(cfg);
+    }
 
     const t = await API.trend();
     if (tl && cfg.niftyTrendOn && !cfg.manualStrikesEnabled) {
@@ -5868,6 +5984,7 @@ function syncAstToggles(s) {
     manualOn
   );
   const liquidOn = !!s.liquidOn;
+  // Liquid F&O master exists only on the full engines (Realtime 1 / Paper 1).
   set(
     "rtLiquidToggle",
     liquidOn,

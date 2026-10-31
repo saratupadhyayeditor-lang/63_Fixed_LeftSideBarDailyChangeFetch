@@ -2000,6 +2000,20 @@ pub async fn connect(
             } else {
                 profile.dhan_client_id.clone()
             };
+            // Mirror the header login into the shared Broker Settings store.
+            // The multi-broker router and the Dhan order adapter read Dhan
+            // credentials from there, so without this a Dhan entry routed
+            // through the adapter would fail even though the header shows
+            // "connected". The Broker Settings card for Dhan is display-only
+            // (its inputs live in the header), so this is the only writer.
+            {
+                let mut fields = serde_json::Map::new();
+                fields.insert("clientId".to_string(), json!(id.clone()));
+                fields.insert("accessToken".to_string(), json!(access_token));
+                if let Err(e) = crate::brokers::update_account("dhan", None, Some(&fields)) {
+                    tracing::warn!("could not mirror the Dhan header login into Broker Settings: {e}");
+                }
+            }
             *st.session.write().await = Some(Session {
                 client: client.clone(),
                 client_id: id.clone(),
