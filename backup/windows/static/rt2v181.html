@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Realtime Trading Engine 2 - Dhan Algo</title>
+<link rel="stylesheet" href="./app.css?v=17">
+<style>
+  body { display: flex; flex-direction: column; height: 100%; }
+  .rt2-banner {
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+    padding: 6px 10px; background: #2a1414; border-bottom: 1px solid #7e2d2d;
+    font-size: 11px; color: #ffb0b0;
+  }
+  .rt2-banner b { color: #ffd9d9; letter-spacing: .3px; }
+  .rt2-banner span { color: #d18a8a; }
+  .tab-content { flex: 1 1 auto; height: auto; min-height: 0; display: block; }
+  #tab-realtime { overflow-y: auto; }
+</style>
+</head>
+<body data-tab="realtime2">
+<div class="rt2-banner">
+  <b>Realtime Trading Engine 2 (LIVE)</b>
+  <span>Independent LIVE engine: real Dhan orders. Iska apna settings, strategies, positions aur P&amp;L book hai - Realtime Trading Engine (tab 1) se koi data share nahi hota. Indices + option-chain Commodities only (Top Movers stocks, NIFTY Trend Following aur BB%b pane nahi).</span>
+</div>
+<div class="tab-content" id="tab-realtime"></div>
+
+<script>
+  // This is a LIVE engine: real Dhan orders. Keep __PAPER__ false so the shared
+  // module's operator-facing wording (engine toggle, square-off, status pill)
+  // says "LIVE Dhan orders" and never "simulated".
+  window.__PAPER__ = false;
+  // Realtime Trading Engine 2 trades INDICES + option-chain COMMODITIES only.
+  // This flag makes the shared module drop the Top Movers stock system, the
+  // NIFTY Trend Following section, the F&O-stock routing selects and the NIFTY
+  // BB%b (Pane).
+  window.__PAPER2__ = true;
+  // This is the SECOND, fully independent engine: chart-overlay / on-demand
+  // helper calls that read the engine base use this path.
+  window.__RT_BASE__ = "/api/realtime2";
+  // Route every /api/rt call made by the shared realtime UI to THIS engine
+  // (`/api/realtime2/*`), so the exact same pane logic drives this live book.
+  (function () {
+    const orig = window.fetch.bind(window);
+    window.fetch = function (u, o) {
+      if (typeof u === "string" && u.indexOf("/api/rt") === 0) {
+        u = "/api/realtime2" + u.slice("/api/rt".length);
+      }
+      return orig(u, o);
+    };
+  })();
+  // Poll only while this pane is actually visible in the parent tab switcher.
+  // The shared realtime UI refreshes at 1s only while `#tab-realtime.active` is
+  // present, so we toggle it from the iframe's real layout visibility instead of
+  // polling forever in a hidden tab. Standalone use (no parent) stays active.
+  (function () {
+    const root = document.getElementById("tab-realtime");
+    const visible = function () {
+      const fe = window.frameElement;
+      if (!fe) return true;
+      return !!(fe.offsetParent && fe.clientHeight > 0);
+    };
+    const sync = function () { root.classList.toggle("active", visible()); };
+    setInterval(sync, 500);
+    sync();
+  })();
+  // Bridge the main window's chart selection so "Use chart symbol" works inside
+  // this frame (same origin). Read on demand and re-dispatch when the parent
+  // announces a new chart selection so the order card re-prices live.
+  (function () {
+    try {
+      Object.defineProperty(window, "__chartSelection", {
+        configurable: true,
+        get: function () {
+          try { return window.parent && window.parent.__chartSelection; } catch (e) { return null; }
+        },
+      });
+    } catch (e) { /* non-fatal: falls back to the catalog */ }
+    window.addEventListener("message", function (ev) {
+      if (ev.data && ev.data.type === "chartselection") {
+        window.dispatchEvent(new CustomEvent("chartselection"));
+      }
+    });
+  })();
+</script>
+<script type="module">
+  import { bootRealtime } from "./rt181.js?v=37";
+  import { bootTextSize } from "./textsize.js?v=3";
+  bootRealtime();
+  bootTextSize();
+  const title = document.querySelector("#tab-realtime .rt-strip .rt-title");
+  if (title) title.textContent = "Realtime Trading Engine 2 (LIVE)";
+</script>
+</body>
+</html>

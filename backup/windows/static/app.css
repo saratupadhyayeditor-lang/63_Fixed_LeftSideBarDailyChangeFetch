@@ -1,0 +1,917 @@
+  :root {
+    --bg: #0b0b1a;
+    --panel: #0f0f23;
+    --panel2: #12122a;
+    --border: #1e1e40;
+    --border2: #2d2d50;
+    --fg: #d0d0d0;
+    --muted: #888;
+    --green: #00d4aa;
+    --red: #ff5252;
+  }
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    background: var(--bg); color: var(--fg);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+    font-size: 12px;
+  }
+  .app { display: flex; flex-direction: column; height: 100vh; }
+  .topbar {
+    display: flex; align-items: center; gap: 6px; flex-wrap: wrap; row-gap: 4px;
+    padding: 6px 10px; background: var(--panel);
+    border-bottom: 1px solid var(--border);
+  }
+  .topbar .brand { color: var(--green); font-weight: 700; letter-spacing: .3px; }
+  .tabs {
+    order: 10; display: flex; gap: 4px; margin-left: 0;
+    flex: 1 1 100%; width: 100%; min-width: 0;
+    flex-wrap: nowrap; overflow-x: auto; scrollbar-width: thin;
+  }
+  .tabs::-webkit-scrollbar { height: 6px; }
+  .tabs::-webkit-scrollbar-thumb { background: #4a4a80; border-radius: 3px; }
+  .tab-btn {
+    background: #16163a; color: #a9a9c8; border: 1px solid var(--border2);
+    border-radius: 4px; padding: 4px 10px; font-size: 11px; cursor: pointer;
+    flex: 0 0 auto; white-space: nowrap;
+  }
+  .tab-btn.active { background: #2d2d5e; color: #fff; border-color: #3d3d7e; }
+  .tab-btn.disabled { opacity: .4; cursor: not-allowed; }
+
+  .conn-sep { width: 1px; height: 18px; background: var(--border2); margin: 0 3px; }
+  .conn-label { font-size: 10px; color: var(--muted); white-space: nowrap; }
+  .conn-input {
+    background: #0b0b1a; border: 1px solid var(--border2); color: var(--fg);
+    border-radius: 3px; padding: 3px 6px; font-size: 11px;
+  }
+  .btn-connect {
+    background: #0d3b2e; color: #00d4aa; border: 1px solid #1f6b52;
+    border-radius: 3px; padding: 3px 12px; font-size: 11px; font-weight: 700; cursor: pointer;
+  }
+  .btn-connect:disabled { opacity: .6; cursor: default; }
+  .btn-reset {
+    background: #5e2d2d; color: #ffd0d0; border: 1px solid #7e3d3d;
+    border-radius: 3px; padding: 3px 10px; font-size: 11px; cursor: pointer;
+  }
+  #feedStatus { font-size: 10px; color: var(--muted); white-space: nowrap; }
+  #status { font-size: 11px; font-weight: 700; }
+  #status.ok { color: var(--green); }
+  #status.warn { color: #ff9800; }
+  #status.error { color: var(--red); }
+  #indicesChangeStatus { font-size: 10px; font-weight: 700; color: var(--green); white-space: nowrap; }
+  #indicesChangeStatus.stopped { color: var(--red); }
+  .textsize-ctl {
+    display: inline-flex; align-items: center; gap: 3px; margin-left: auto;
+    font-size: 10px; color: var(--muted); white-space: nowrap;
+  }
+  .textsize-ctl input {
+    width: 52px; background: #0b0b1a; border: 1px solid var(--border2);
+    color: var(--fg); border-radius: 3px; padding: 2px 4px; font-size: 11px;
+    text-align: center; cursor: ns-resize;
+  }
+  .conn-check {
+    font-size: 10px; color: var(--muted); white-space: nowrap; cursor: pointer;
+    display: inline-flex; align-items: center; gap: 3px;
+  }
+
+  .content { flex: 1; overflow: hidden; }
+  .tab-content { display: none; height: 100%; flex-direction: column; }
+  .tab-content.active { display: flex; }
+  /* Backup & Restore tab scrolls as a whole page. */
+  #tab-backup.active { display: block; overflow-y: auto; }
+  #tab-backup .account-table { width: 100%; border-collapse: collapse; font-size: 11px; }
+  #tab-backup .account-table th {
+    text-align: left; color: #8888b8; font-weight: 500; padding: 5px 6px;
+    border-bottom: 1px solid #2a2a4a; position: sticky; top: 0; background: #111127;
+  }
+  #tab-backup .account-table td { padding: 5px 6px; border-bottom: 1px solid #1c1c38; white-space: nowrap; }
+  /* Standalone Account tab - ported from the old Flask app's Account tab:
+     four balance cards + Open Positions + Holdings tables. */
+  .account-toolbar {
+    display: flex; align-items: center; gap: 8px;
+    padding: 6px 10px; border-bottom: 1px solid var(--border);
+    background: var(--panel);
+  }
+  .account-status { font-size: 11px; color: var(--muted); }
+  .account-cards { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; padding: 8px; }
+  .acard { background: #12122a; border: 1px solid var(--border); border-radius: 4px; padding: 10px 12px; text-align: center; }
+  .acard .label { font-size: 10px; color: #888; text-transform: uppercase; letter-spacing: .5px; }
+  .acard .value { font-size: 18px; font-weight: 700; margin-top: 3px; }
+  .acard .value.green { color: var(--green); }
+  .acard .value.red { color: var(--red); }
+  .acard .value.white { color: #fff; }
+  .account-section { flex: 1; overflow-y: auto; padding: 8px; }
+  .account-section h3 { font-size: 12px; color: #888; text-transform: uppercase; letter-spacing: 1px; margin: 10px 0 6px; }
+  #tab-account .account-table { width: 100%; border-collapse: collapse; font-size: 10px; margin-bottom: 8px; }
+  #tab-account .account-table th {
+    background: #12122a; color: #888; padding: 5px 8px; text-align: left;
+    border-bottom: 1px solid var(--border); font-weight: 600;
+  }
+  #tab-account .account-table td { padding: 4px 8px; text-align: left; border-bottom: 1px solid #111130; white-space: nowrap; }
+  #tab-account .account-table tr:hover td { background: #1a1a35; }
+  #tab-account .account-table .green { color: var(--green); }
+  #tab-account .account-table .red { color: var(--red); }
+  .account-empty { color: #888; text-align: center; }
+  #tab-backup .backup-tf-card { transition: opacity .15s, border-color .15s; }
+  /* Paper Trade tab hosts the standalone paper page in an isolated frame so the
+     real and paper engines each own a clean DOM + JS scope. */
+  .paper-frame { flex: 1 1 auto; width: 100%; min-height: 0; border: 0; display: block; background: var(--bg); }
+
+  .chart-toolbar {
+    display: flex; align-items: center; gap: 8px;
+    padding: 5px 8px; border-bottom: 1px solid var(--border);
+    background: var(--panel); flex-wrap: wrap;
+  }
+  .tf-grid { display: flex; gap: 3px; flex-wrap: wrap; }
+  .tf-btn {
+    background: #16163a; color: #a9a9c8; border: 1px solid var(--border2);
+    border-radius: 3px; padding: 2px 7px; font-size: 10px; cursor: pointer;
+  }
+  .tf-btn.active { background: #2d2d5e; color: #fff; border-color: #3d3d7e; }
+  .pos-tools { display: flex; gap: 3px; align-items: center; }
+  .pos-btn {
+    background: var(--panel); color: var(--fg); border: 1px solid var(--border2);
+    border-radius: 3px; padding: 3px 9px; font-size: 10px; cursor: pointer; white-space: nowrap;
+  }
+  .pos-btn:hover { filter: brightness(1.2); }
+  .pos-btn.active { background: #0f5132; color: #7dffd4; border-color: #00d4aa; box-shadow: 0 0 8px -2px #00d4aa; }
+  .pos-btn.clear { background: #3a1f1f; color: #ffb3b3; border-color: #7e3d3d; }
+  .pos-btn.clear.dim { opacity: .45; cursor: default; }
+  .pos-btn.clear.dim:hover { filter: none; }
+  .btn-action {
+    background: #2d2d5e; color: #e0e0e0; border: 1px solid #3d3d7e;
+    border-radius: 3px; padding: 3px 12px; font-size: 10px; cursor: pointer;
+  }
+  .btn-action.warn { background: #5e2d2d; border-color: #7e3d3d; }
+  .btn-action:hover { filter: brightness(1.15); }
+
+  .menu-wrap { position: relative; z-index: 100; }
+  .ind-menu {
+    position: absolute; top: 26px; left: 0; width: 300px; max-height: 420px;
+    overflow-y: auto; background: #12122a; border: 1px solid var(--border2);
+    border-radius: 5px; padding: 8px; box-shadow: 0 8px 30px rgba(0,0,0,.6);
+  }
+  .ind-menu.hidden { display: none; }
+  .ind-menu input[type=text] {
+    width: 100%; background: #0b0b1a; border: 1px solid var(--border2);
+    color: var(--fg); border-radius: 3px; padding: 5px 8px; font-size: 11px;
+    margin-bottom: 6px;
+  }
+  .ind-item {
+    padding: 4px 6px; border-radius: 3px; cursor: pointer; font-size: 11px;
+    color: #c8c8e0;
+  }
+  .ind-item:hover { background: #2d2d5e; color: #fff; }
+  .ct-opt {
+    padding: 6px 8px; border-radius: 3px; cursor: pointer; font-size: 11px;
+    color: #c8c8e0;
+  }
+  .ct-opt:hover { background: #2d2d5e; color: #fff; }
+  .ct-row {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 8px; margin: 6px 0;
+  }
+  .ct-row > label { color: #bbb; }
+  .ct-row select, .ct-row input[type=number] {
+    background: #0b0b1a; border: 1px solid var(--border2); color: var(--fg);
+    border-radius: 3px; padding: 3px 5px; font-size: 11px;
+  }
+  .ind-group { display: flex; flex-direction: column; }
+  .ind-cat {
+    font-size: 10px; font-weight: 700; letter-spacing: .4px; text-transform: uppercase;
+    color: var(--tab-accent, #8ab4ff); margin: 7px 2px 3px; padding-top: 6px;
+    border-top: 1px solid var(--border);
+  }
+  .ind-cat:first-child { margin-top: 0; padding-top: 0; border-top: none; }
+
+  .chart-wrap { flex: 1; min-height: 0; position: relative; }
+  .chart-container { width: 100%; height: 100%; min-height: 260px; }
+  #indLegend {
+    position: absolute; top: 6px; left: 8px; display: flex; gap: 14px;
+    flex-wrap: wrap; pointer-events: auto;
+  }
+  #indLegend.hidden { display: none; }
+  .leg-item { font-size: 11px; color: #cfcfe6; display: inline-flex; align-items: center; gap: 5px; }
+  .leg-item i { display: inline-block; width: 9px; height: 9px; border-radius: 2px; }
+  .leg-item:hover { color: #fff; }
+  .leg-name { color: #d0d0d0; font-weight: 600; cursor: pointer; }
+  .leg-name:hover { color: #00d4aa; }
+  .leg-val { color: #aaa; font-variant-numeric: tabular-nums; }
+  .leg-btn { background: none; border: none; color: #777; cursor: pointer; padding: 0 2px; display: inline-flex; align-items: center; }
+  .leg-btn:hover { color: #00d4aa; }
+  .leg-btn.x:hover { color: #ff5252; }
+
+  .ind-section { border-top: 1px solid var(--border); background: var(--panel); max-height: 42%; overflow-y: auto; }
+  .ind-section-head {
+    display: flex; align-items: center; gap: 8px; padding: 6px 10px;
+    border-bottom: 1px solid var(--border);
+  }
+  .ind-section-title { font-size: 11px; color: #cfcfe6; font-weight: 600; }
+  #indSectionCount { font-size: 10px; color: var(--green); }
+  .ind-section-hint { font-size: 10px; color: #666; }
+  .ind-empty { padding: 10px; color: #666; font-size: 11px; }
+  .pane-box { background: #0e0e24; border: 1px solid #1e1e40; border-radius: 4px; overflow: hidden; margin-bottom: 6px; }
+  .pane-head { display: flex; align-items: center; gap: 6px; padding: 4px 8px; background: #12122a; border-bottom: 1px solid #1e1e40; font-size: 10px; color: #bbb; }
+  .pane-head .pane-name { font-weight: 600; color: #e0e0e0; cursor: pointer; }
+  .pane-head .pane-read { margin-left: auto; font-size: 10px; font-weight: 700; color: #bbb; font-variant-numeric: tabular-nums; padding: 0 6px; }
+  .pane-head .pane-gear, .pane-head .pane-close { color: #888; cursor: pointer; display: inline-flex; align-items: center; }
+  .pane-head .pane-plus { color: #00d4aa; cursor: pointer; font-weight: 700; line-height: 1; display: inline-flex; align-items: center; }
+  .pane-head .pane-gear:hover { color: #00d4aa; }
+  .pane-head .pane-close:hover { color: #ff5252; }
+  .pane-head .pane-plus:hover { color: #7ad7ff; }
+  .pane-chart { height: 130px; position: relative; }
+  .pane-alertbox { background: #12122a; border-top: 1px solid #1e1e40; padding: 6px 8px; font-size: 10px; color: #ccc; }
+  .pane-alertbox.hidden { display: none; }
+  .pane-alertbox-title { font-size: 9px; color: #ffb300; text-transform: uppercase; margin-bottom: 4px; }
+  .pane-alertbox-list { display: flex; flex-direction: column; gap: 3px; margin-bottom: 6px; }
+  .pane-alertbox-row { display: flex; align-items: center; gap: 6px; }
+  .pane-alertbox-row .pane-alertbox-rm { background: none; border: none; color: #888; cursor: pointer; padding: 0 2px; display: inline-flex; align-items: center; }
+  .pane-alertbox-row .pane-alertbox-rm:hover { color: #ff5252; }
+  .pane-alertbox-add { display: flex; gap: 4px; }
+  .pane-alertbox-add input { flex: 1; min-width: 0; background: #1a1a35; border: 1px solid #2d2d50; color: #d0d0d0; border-radius: 3px; padding: 2px 4px; font-size: 10px; }
+  .pane-alertbox-add button { background: #00d4aa; color: #0b0b1a; border: none; border-radius: 3px; padding: 2px 8px; font-size: 10px; font-weight: 700; cursor: pointer; }
+  .pane-alertbox-add button:hover { background: #7ad7ff; }
+  #btnBestCombo { background: #1f6f4a; color: #eafff4; border: 1px solid #2f9f6a; }
+
+  .ind-settings {
+    position: absolute; top: 34px; right: 10px; width: 280px; max-height: 70vh;
+    overflow-y: auto; background: #12122a; border: 1px solid var(--border2);
+    border-radius: 6px; padding: 10px; z-index: 200; box-shadow: 0 8px 30px rgba(0,0,0,.7);
+  }
+  .ind-settings.hidden { display: none; }
+  .set-head { display: flex; justify-content: space-between; align-items: center; font-size: 12px; color: #fff; margin-bottom: 8px; }
+  .set-x { background: #5e2d2d; color: #fff; border: 1px solid #7e3d3d; border-radius: 3px; cursor: pointer; }
+  .set-body { display: flex; flex-direction: column; gap: 6px; }
+  .set-row { display: flex; justify-content: space-between; align-items: center; gap: 8px; font-size: 11px; color: #bdbde0; }
+  .set-row input[type=number], .set-row select {
+    background: #0b0b1a; border: 1px solid var(--border2); color: var(--fg);
+    border-radius: 3px; padding: 3px 5px; font-size: 11px; width: 110px;
+  }
+  .set-row input[type=color] { background: none; border: 1px solid var(--border2); width: 110px; height: 24px; }
+  .set-foot { display: flex; align-items: center; gap: 8px; padding-top: 8px; margin-top: 8px; border-top: 1px solid var(--border); }
+  .set-btn { background: #2a2a50; color: #d0d0d0; border: 1px solid var(--border2); border-radius: 3px; padding: 4px 10px; font-size: 11px; cursor: pointer; }
+  .set-btn:hover { background: #3a3a6a; color: #fff; }
+  .set-btn.warn { color: #ffd700; border-color: #6b5b2a; }
+  .set-btn.muted { background: #22223f; color: #999; }
+  .legend-note { font-size: 10px; color: #666; padding: 3px 8px; }
+  #barCountdown {
+    font-size: 11px; font-weight: 700; font-variant-numeric: tabular-nums;
+    color: #00d4aa; background: #0d3b2e; border: 1px solid #0f4a38;
+    border-radius: 3px; padding: 2px 8px;
+  }
+  #barCountdown.closed { color: #ff4d6a; background: #3d1a1a; border-color: #7a2c2c; }
+
+  .body-row { flex: 1; display: flex; min-height: 0; overflow: hidden; }
+  #sidebar {
+    width: 280px; flex: 0 0 280px; background: #0e0e24; border-right: 1px solid var(--border);
+    display: flex; flex-direction: column; overflow-y: auto; padding: 10px;
+  }
+  #sidebar h3 {
+    font-size: 12px; color: #888; text-transform: uppercase; letter-spacing: 1px;
+    margin: 8px 0 5px 0;
+  }
+  #sidebar select, #sidebar input[type="text"] {
+    width: 100%; padding: 6px 8px; background: #1a1a35; border: 1px solid var(--border2);
+    color: #d0d0d0; border-radius: 3px; font-size: 11px; margin-bottom: 6px; outline: none;
+    box-sizing: border-box;
+  }
+  #sidebar select:focus, #sidebar input:focus { border-color: var(--green); }
+  #symbolSelect { height: 190px; }
+  /* Keep the sidebar's own children at their intended size. Without this the
+     column's default `flex-shrink: 1` let the tall watch lists squeeze the
+     Instrument <select> (and the headers) down to a sliver, hiding the
+     Indices / F&O / Commodities groups. The sidebar scrolls instead. */
+  #sidebar > * { flex: 0 0 auto; }
+  #sidebar::-webkit-scrollbar { width: 10px; }
+  #sidebar::-webkit-scrollbar-track { background: #0e0e24; }
+  #sidebar::-webkit-scrollbar-thumb { background: #4a4a80; border-radius: 5px; border: 2px solid #0e0e24; }
+
+  .mw-cat { border: 1px solid var(--border); border-radius: 4px; margin-bottom: 5px; background: #0e0e24; overflow: hidden; }
+  .mw-head {
+    display: flex; align-items: center; gap: 6px; padding: 6px 8px; background: #12122a;
+    cursor: pointer; font-size: 10px; font-weight: 700; color: #d0d0d0;
+    text-transform: uppercase; letter-spacing: .5px; user-select: none;
+  }
+  .mw-head:hover { color: var(--green); }
+  .mw-caret { color: var(--green); font-size: 8px; transition: transform .15s; }
+  .mw-cat.open .mw-caret { transform: rotate(90deg); }
+  .mw-count { background: #1a1a35; color: var(--green); font-size: 9px; font-weight: 700; padding: 1px 6px; border-radius: 8px; margin-left: auto; }
+  .mw-body { max-height: 170px; overflow-y: auto; display: none; }
+  .mw-cat.open .mw-body { display: block; }
+  .mw-row { display: flex; align-items: center; gap: 6px; padding: 4px 8px; cursor: pointer; font-size: 10px; border-bottom: 1px solid #111130; }
+  .mw-row:hover { background: #1a1a35; }
+  .mw-row.sel { background: #0d3b2e; }
+  .mw-name { color: #e0e0e0; font-weight: 600; flex: 0 0 92px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .mw-ltp { color: #fff; font-variant-numeric: tabular-nums; margin-left: auto; }
+  .mw-chg { font-weight: 700; font-variant-numeric: tabular-nums; font-size: 9px; min-width: 96px; text-align: right; white-space: nowrap; }
+  .mw-chg.up { color: #2ecc71; }
+  .mw-chg.down { color: #ff5252; }
+  .mw-sub { margin-bottom: 6px; }
+  .mw-subhead {
+    display: flex; align-items: center; gap: 6px; padding: 3px 8px; font-size: 9px; font-weight: 700;
+    text-transform: uppercase; letter-spacing: .5px; color: #aaa; background: #12122a;
+    border-top: 1px solid #111130; border-bottom: 1px solid #111130;
+  }
+  .mw-subhead.up { color: #2ecc71; }
+  .mw-subhead.down { color: #ff5252; }
+  .mw-subhead:first-child { border-top: none; }
+  .mw-bull .mw-row { border-left: 2px solid #2ecc71; }
+  .mw-bear .mw-row { border-left: 2px solid #ff5252; }
+  .mw-load .mw-row { opacity: .55; }
+  .mw-subcount { background: #1a1a35; color: #d0d0d0; font-size: 8px; font-weight: 700; padding: 0 5px; border-radius: 8px; margin-left: auto; }
+  .mw-mini-btn {
+    background: #1a1a35; color: var(--green); border: 1px solid var(--border2); border-radius: 3px;
+    padding: 2px 8px; font-size: 9px; font-weight: 700; cursor: pointer;
+  }
+  .mw-mini-btn.warn { color: #ffd700; border-color: #6b5b2a; }
+
+  /* ---- Option Chain tab ---- */
+  .hidden { display: none !important; }
+  .oc-toolbar {
+    display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+    padding: 6px 10px; background: var(--panel); border-bottom: 1px solid var(--border);
+  }
+  .oc-toolbar select {
+    background: #0b0b1a; border: 1px solid var(--border2); color: var(--fg);
+    border-radius: 3px; padding: 3px 6px; font-size: 11px; min-width: 130px; max-width: 190px;
+  }
+  .oc-name { color: #5b9bd5; font-size: 12px; }
+  .oc-ts { color: #aaa; }
+  .oc-lot { color: #ffd700; }
+  #ocInstrumentInfo { font-size: 11px; color: #bbb; }
+  #oc-chart-container { padding: 6px 10px 0; background: var(--panel); }
+  #ocChart { width: 100%; height: 260px; display: block; }
+  #oc-table-container, #oc-all-container { flex: 1; overflow: auto; padding: 4px 8px 12px; }
+  .oc-empty { padding: 16px; color: #666; font-size: 12px; }
+  .oc-empty.err { color: #ff5252; }
+  .oc-status { font-size: 10px; color: #8a8ab0; margin-left: auto; }
+  .oc-upd { color: #8a8ab0; font-size: 10px; }
+  .btn-action.loading { opacity: .55; }
+  .tick-up, .tick-up2 { animation: ocTickUp .6s ease-out; }
+  .tick-down, .tick-down2 { animation: ocTickDown .6s ease-out; }
+  @keyframes ocTickUp { 0% { background: rgba(0,212,170,.55); } 100% { background: transparent; } }
+  @keyframes ocTickDown { 0% { background: rgba(255,82,82,.55); } 100% { background: transparent; } }
+  table.oc-table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+  table.oc-table thead th {
+    position: sticky; top: 0; z-index: 2;
+    background: #12122a; color: #9a9ac0; font-size: 10px; font-weight: 700;
+    padding: 5px 4px; border-bottom: 1px solid var(--border2); text-align: center;
+    white-space: nowrap;
+  }
+  table.oc-table td {
+    padding: 3px 4px; font-size: 11px; text-align: right;
+    border-bottom: 1px solid #14142e; white-space: nowrap;
+  }
+  table.oc-table td.strike {
+    text-align: center; font-weight: 700; color: #d8d8f0; background: #101026;
+  }
+  table.oc-table td.ce { color: #00d4aa; }
+  table.oc-table td.pe { color: #ff5252; }
+  table.oc-table td.chg.up { color: #2ecc71; font-weight: 700; }
+  table.oc-table td.chg.down { color: #ff5252; font-weight: 700; }
+  table.oc-table td.chg .chg-pct { font-size: 9px; font-weight: 400; opacity: .85; margin-left: 3px; }
+  table.oc-table tr:hover { background: #1a1a35; }
+  table.oc-table tr.atm { background: #0d3b2e; }
+  table.oc-table tr.atm td.strike { color: #ffd700; }
+  table.oc-table tr.atm td { border-top: 1px solid #1f6b52; border-bottom: 1px solid #1f6b52; }
+  table.oc-table tr.atm:hover { background: #12492f; }
+  tr.flash-atm { background: #1f6b52 !important; transition: background .3s; }
+  .oc-chart-btn {
+    color: #5b9bd5; opacity: .5; cursor: pointer; font-size: 9px; margin-right: 3px;
+  }
+  .oc-chart-btn:hover { opacity: 1; color: #ffd700; }
+  .oc-all-block { margin-bottom: 16px; border: 1px solid var(--border); border-radius: 4px; overflow: hidden; }
+  .oc-all-head {
+    position: sticky; top: 0; z-index: 3; background: #12122a; color: #cfcfe6;
+    font-size: 11px; padding: 5px 8px; border-bottom: 1px solid var(--border2);
+  }
+  .oc-all-tbl thead th { top: 26px; }
+  #goAtmBtn {
+    background: #5e4d2d; color: #ffd700; border: 1px solid #7e6a3d;
+    border-radius: 3px; padding: 3px 10px; font-size: 10px; cursor: pointer; font-weight: 700;
+  }
+  #goAtmBtn:disabled { opacity: .5; cursor: default; }
+
+  /* --------------------------------------------------------------------- */
+  /* Dhan link monitor: connect/disconnect popups + stale-data marking.     */
+  /* --------------------------------------------------------------------- */
+  #linkToasts {
+    position: fixed; top: 12px; left: 50%; transform: translateX(-50%);
+    z-index: 9999; display: flex; flex-direction: column; gap: 8px;
+    align-items: center; pointer-events: none;
+  }
+  .link-toast {
+    min-width: 280px; max-width: 92vw; padding: 10px 16px; border-radius: 6px;
+    font-size: 12px; font-weight: 700; text-align: center; color: #fff;
+    box-shadow: 0 6px 22px rgba(0,0,0,.55); opacity: 1;
+    transition: opacity .3s ease; border: 1px solid transparent;
+  }
+  .link-toast.ok  { background: #0d5c3f; border-color: #1fbf7a; }
+  .link-toast.err { background: #6b1d1d; border-color: #ff5252; }
+  #linkBanner {
+    display: none; padding: 5px 12px; font-size: 11px; font-weight: 700;
+    text-align: center; letter-spacing: .3px; border-bottom: 1px solid transparent;
+  }
+  #linkBanner.show { display: block; }
+  #linkBanner.err  { background: #6b1d1d; color: #ffd7d7; border-color: #ff5252; }
+  #linkBanner.warn { background: #5e4d2d; color: #ffe9b8; border-color: #b8860b; }
+  /* Alarm state: dim the RT order card + running book and veil the chart so a
+     stale price can never be mistaken for a live one. */
+  body.link-alarm #rtEngMethodOpts,
+  body.link-alarm #rtOrderCard,
+  body.link-alarm #tab-realtime .rt-cards,
+  body.link-alarm #tab-realtime table {
+    opacity: .45; filter: grayscale(.6); transition: opacity .2s;
+  }
+  #rtLinkVeil {
+    position: absolute; inset: 0; z-index: 40; display: none;
+    flex-direction: column; align-items: center; justify-content: center; gap: 6px;
+    background: rgba(8,8,20,.72); color: #ff6b6b; font-size: 18px; font-weight: 800;
+    letter-spacing: 1px; text-align: center; padding: 16px;
+  }
+  #rtLinkVeil.show { display: flex; }
+
+  /* =================================================================== */
+  /* Colorful theme: every tab and its sections get their own accent      */
+  /* =================================================================== */
+  :root {
+    --tab-accent: #a78bfa;
+    --c-sky: #38bdf8;
+    --c-teal: #2dd4bf;
+    --c-emerald: #34d399;
+    --c-violet: #a78bfa;
+    --c-fuchsia: #e879f9;
+    --c-pink: #f472b6;
+    --c-rose: #fb7185;
+    --c-amber: #fbbf24;
+    --c-orange: #fb923c;
+    --c-cyan: #22d3ee;
+    --c-lime: #a3e635;
+  }
+
+  /* --- One colour per tab button --- */
+  .tabs { gap: 6px; }
+  .tab-btn {
+    background: #101024; color: var(--tc, #a9a9c8);
+    border-color: #24244a; border-left: 3px solid var(--tc, #2d2d50);
+    transition: background .15s, color .15s, box-shadow .15s, transform .06s;
+  }
+  .tab-btn:hover { background: #1a1a38; color: #fff; box-shadow: 0 0 10px -3px var(--tc); }
+  .tab-btn:active { transform: translateY(1px); }
+  .tab-btn.active {
+    background: var(--tc, #2d2d5e); color: #0a0a18; font-weight: 700;
+    border-color: var(--tc, #3d3d7e); border-left-color: var(--tc, #3d3d7e);
+    box-shadow: 0 0 14px -2px var(--tc);
+  }
+  .tab-btn[data-tab="chart"]       { --tc: var(--c-sky); }
+  .tab-btn[data-tab="optionchain"] { --tc: var(--c-teal); }
+  .tab-btn[data-tab="account"]     { --tc: var(--c-amber); }
+  .tab-btn[data-tab="realtime"]    { --tc: var(--c-violet); }
+  .tab-btn[data-tab="papertrade"]  { --tc: var(--c-fuchsia); }
+  .tab-btn[data-tab="rtstats"]     { --tc: var(--c-rose); }
+  .tab-btn[data-tab="paperstats"]  { --tc: var(--c-cyan); }
+  .tab-btn[data-tab="backup"]      { --tc: var(--c-emerald); }
+  .tab-btn[data-tab="updater"]     { --tc: var(--c-orange); }
+
+  /* --- Active pane accent --- */
+  body[data-tab="chart"]       { --tab-accent: var(--c-sky); }
+  body[data-tab="optionchain"] { --tab-accent: var(--c-teal); }
+  body[data-tab="account"]     { --tab-accent: var(--c-amber); }
+  body[data-tab="realtime"]    { --tab-accent: var(--c-violet); }
+  body[data-tab="papertrade"]  { --tab-accent: var(--c-fuchsia); }
+  body[data-tab="rtstats"]     { --tab-accent: var(--c-rose); }
+  body[data-tab="paperstats"]  { --tab-accent: var(--c-cyan); }
+  body[data-tab="backup"]      { --tab-accent: var(--c-emerald); }
+  body[data-tab="updater"]     { --tab-accent: var(--c-orange); }
+
+  .tab-content.active { border-top: 2px solid var(--tab-accent); }
+
+  /* --- Section headings adopt the tab accent --- */
+  body #tab-realtime .rt-title,
+  body #tab-account .account-section h3,
+  body #tab-backup h3, body #tab-backup h4 { color: var(--tab-accent); }
+
+  /* --- Realtime engine rows: per-section ribbon + accent cap --- */
+  #tab-realtime div.rt-engine-row {
+    box-shadow: inset 3px 0 0 0 var(--sec-accent, #2d2d50);
+  }
+  #tab-realtime div.rt-engine-row b.rt-cap { color: var(--sec-accent, #ffd700); }
+  body #tab-realtime div.rt-strip { border-left: 3px solid var(--tab-accent); }
+
+  /* --- Account tab cards --- */
+  .account-cards .acard:nth-child(1) { border-top: 3px solid var(--c-sky); }
+  .account-cards .acard:nth-child(2) { border-top: 3px solid var(--c-amber); }
+  .account-cards .acard:nth-child(3) { border-top: 3px solid var(--c-violet); }
+  .account-cards .acard:nth-child(4) { border-top: 3px solid var(--c-emerald); }
+
+  /* --- Option chain header accent --- */
+  #tab-optionchain table thead th { border-bottom-color: var(--tab-accent); }
+
+  /* --- Buttons glow with the active tab accent --- */
+  .btn-action:hover { filter: brightness(1.15); box-shadow: 0 0 10px -3px var(--tab-accent); }
+
+  /* =================================================================== */
+  /* Refined theme: cohesive dark neutral base + one accent per tab, with  */
+  /* a subtle colour-tinted surface per section and high-contrast text.     */
+  /* theme.js assigns --sec-*; realtime.js paints each engine row.          */
+  /* =================================================================== */
+  :root {
+    --bg: #0a0d15; --panel: #111725; --panel2: #161d2e;
+    --border: #222b40; --border2: #33405c;
+    --fg: #e6eaf5; --muted: #94a0bd; --green: #34d399; --red: #f26b6b;
+    --tab-accent: #60a5fa; --tab-bg: #141d31; --tab-edge: #293a5a; --tab-text: #e6eaf5;
+  }
+  body[data-tab="chart"]       { --tab-accent:#38bdf8; --tab-bg:#0f2433; --tab-edge:#1f4a63; --tab-text:#e6eaf5; }
+  body[data-tab="optionchain"] { --tab-accent:#2dd4bf; --tab-bg:#0e2a26; --tab-edge:#1f544b; --tab-text:#e6eaf5; }
+  body[data-tab="account"]     { --tab-accent:#fbbf24; --tab-bg:#2a2314; --tab-edge:#57491f; --tab-text:#e6eaf5; }
+  body[data-tab="realtime"]    { --tab-accent:#a78bfa; --tab-bg:#1b1830; --tab-edge:#3a3160; --tab-text:#e6eaf5; }
+  body[data-tab="papertrade"]  { --tab-accent:#e879f9; --tab-bg:#271733; --tab-edge:#502c66; --tab-text:#e6eaf5; }
+  body[data-tab="rtstats"]     { --tab-accent:#fb7185; --tab-bg:#2b1620; --tab-edge:#582936; --tab-text:#e6eaf5; }
+  body[data-tab="paperstats"]  { --tab-accent:#22d3ee; --tab-bg:#0e2530; --tab-edge:#1f4c5e; --tab-text:#e6eaf5; }
+  body[data-tab="backup"]      { --tab-accent:#34d399; --tab-bg:#0f2a20; --tab-edge:#215340; --tab-text:#e6eaf5; }
+  body[data-tab="updater"]     { --tab-accent:#fb923c; --tab-bg:#2b1d12; --tab-edge:#573a22; --tab-text:#e6eaf5; }
+
+  /* --- App shell + topbar --- */
+  html, body { background: var(--bg) !important; color: var(--fg) !important; }
+  .app { background: var(--bg) !important; }
+  .topbar { background: #0e1320 !important; border-bottom: 1px solid var(--tab-edge) !important; }
+  .topbar .brand { color: var(--tab-accent) !important; }
+
+  /* --- Surfaces: subtle colour-tinted dark + high-contrast text --- */
+  #sidebar, .ind-section, .account-section, .monitor-toolbar, #rtOrderMethods,
+  .chart-toolbar, .oc-toolbar, .account-toolbar, #oc-chart-container, .pane-box,
+  .oc-all-block, .mw-cat, .acard, .widget, .card, .pane-head, .mw-head, .mw-subhead,
+  .ind-section-head, .oc-all-head, .pane-alertbox, .rs-chart, .rt-strip, .paper-banner {
+    background: var(--sec-bg, var(--tab-bg)) !important;
+    color: var(--sec-text, var(--tab-text)) !important;
+    border-color: var(--sec-edge, var(--tab-edge)) !important;
+  }
+  .ind-menu, .ind-settings, #rtDialog, #rtSummary > div, #rtMarginBar {
+    background: var(--panel) !important; color: var(--fg) !important;
+    border-color: var(--border) !important;
+  }
+  .chart-toolbar, .oc-toolbar, .account-toolbar { border-bottom: 1px solid var(--sec-edge, var(--tab-edge)) !important; }
+
+  /* --- Titles: bright per-section accent colour --- */
+  h1, h2, h3, h4, h5, h6,
+  .rt-title, .oc-all-head, .pane-head .pane-name, .mw-head, .rs-chart-title,
+  .ind-section-title, #sidebar h3, .acard .label {
+    color: var(--sec-accent, var(--tab-accent)) !important;
+  }
+  /* --- Structural labels: high-contrast light text (never faded) --- */
+  .account-status, .oc-ts, #ocInstrumentInfo, .oc-status, .oc-upd, .oc-empty,
+  .ind-section-hint, .legend-note, .set-row, .rtom-f, .leg-item, .leg-val,
+  .leg-name, .mw-name, .mw-ltp, .ind-item, .rt-log, .rt-dialog-title, .rt-dialog-msg,
+  .conn-label, #feedStatus, .account-empty, .acard .value.white,
+  .paper-banner b, .paper-banner span {
+    color: var(--sec-text, var(--fg)) !important;
+  }
+
+  /* --- Lift dim inline greys to readable light text --- */
+  body [style*="color:#666"], body [style*="color:#888"], body [style*="color:#aaa"],
+  body [style*="color:#555"], body [style*="color:#777"], body [style*="color:#bbb"],
+  body [style*="color:#ccc"], body [style*="color:#d0d0d0"], body [style*="color:#e0e0e0"],
+  body [style*="color:#cfcfe6"], body [style*="color:#9a9ac0"], body [style*="color:#8888b8"],
+  body [style*="color:#c9c9e0"], body [style*="color:#8aa0c0"], body [style*="color:#8ab4ff"],
+  body [style*="color:#c4a9ff"], body [style*="color:#b39ddb"], body [style*="color:#66ccff"],
+  body [style*="color:#eaeaf5"], body [style*="color:#d3d3ee"], body [style*="color:#9aa3b2"],
+  body [style*="color:#c8a0ff"], body [style*="color:#b8b8c8"], body [style*="color:#bfbfd8"],
+  body [style*="color:#c0c0d8"], body [style*="color:#e6e6ff"] {
+    color: var(--sec-text, var(--fg)) !important;
+  }
+
+  /* --- Tables --- */
+  .account-table th, table.oc-table thead th, #tab-rtstats .rs-table th {
+    background: rgba(255,255,255,.05) !important;
+    color: var(--sec-accent, var(--tab-accent)) !important;
+    border-bottom: 1px solid var(--sec-edge, var(--tab-edge)) !important; }
+  .account-table td, table.oc-table td { border-bottom-color: rgba(255,255,255,.08) !important; color: inherit; }
+  .account-table tbody tr:nth-child(even), table.oc-table tbody tr:nth-child(even),
+  #tab-rtstats .rs-table tbody tr:nth-child(even) { background: rgba(255,255,255,.03) !important; }
+  .account-table tr:hover td, table.oc-table tr:hover td { background: rgba(255,255,255,.07) !important; }
+  table.oc-table tr.atm { background: rgba(255,255,255,.09) !important; }
+  table.oc-table td.strike { background: rgba(255,255,255,.06) !important; color: var(--sec-accent, var(--tab-accent)) !important; }
+  .mw-row:hover { background: rgba(255,255,255,.07) !important; }
+  .mw-row.sel { background: var(--sec-bg, var(--tab-bg)) !important; color: var(--sec-text, var(--fg)) !important; }
+
+  /* --- Inputs / selects / checkboxes --- */
+  input:not([type=checkbox]):not([type=color]):not([type=range]), select, textarea {
+    background: #0e1422 !important; border: 1px solid var(--border2) !important;
+    color: var(--fg) !important; border-radius: 6px; }
+  input:not([type=checkbox]):not([type=color]):not([type=range]):focus,
+  select:focus, textarea:focus {
+    outline: none !important; border-color: var(--sec-accent, var(--tab-accent)) !important;
+    box-shadow: 0 0 0 2px rgba(96,165,250,.20); }
+  input[type=checkbox], input[type=range] { accent-color: var(--sec-accent, var(--tab-accent)); }
+
+  /* --- Realtime engine rows: tinted surface + accent ribbon --- */
+  #tab-realtime div.rt-engine-row {
+    background: var(--sec-bg, var(--tab-bg)) !important;
+    color: var(--sec-text, var(--fg)) !important;
+    border-color: var(--sec-edge, var(--tab-edge)) !important;
+    box-shadow: inset 3px 0 0 0 var(--sec-accent, var(--tab-accent)); }
+  #tab-realtime div.rt-engine-row b.rt-cap { color: var(--sec-accent, var(--tab-accent)) !important; }
+  #tab-realtime .rt-scroll { border-color: var(--sec-edge, var(--tab-edge)) !important; }
+
+  /* --- Pills / chips / badges --- */
+  .rt-pill { background: rgba(255,255,255,.08) !important; border: 1px solid var(--border2) !important; color: var(--sec-text, var(--fg)) !important; }
+  .rt-pill.on { background: #14532d !important; border-color: #16a34a !important; color: #86efac !important; }
+  .rt-pill.off { background: #4c1111 !important; border-color: #b91c1c !important; color: #fca5a5 !important; }
+  .rt-pill.armed { background: #4a3410 !important; border-color: #d97706 !important; color: #fcd34d !important; }
+  .rt-badge { background: rgba(255,255,255,.08) !important; color: var(--sec-accent, var(--tab-accent)) !important; }
+  .mw-count, .mw-subcount { background: rgba(255,255,255,.08) !important; color: var(--sec-accent, var(--tab-accent)) !important; }
+  .oc-lot { color: #fcd34d !important; }
+
+  /* --- Controls: understated buttons, accent on hover --- */
+  .btn-action, .tf-btn, .mw-mini-btn, .set-btn, .oc-chart-btn, #goAtmBtn,
+  #btnBestCombo, .rs-chip, .set-btn.muted {
+    background: rgba(255,255,255,.06) !important; border: 1px solid var(--border2) !important;
+    color: var(--fg) !important; border-radius: 6px;
+    transition: background .15s, border-color .15s, color .15s; }
+  .btn-action:hover, .tf-btn:hover, .mw-mini-btn:hover, .set-btn:hover,
+  #goAtmBtn:hover, .rs-chip:hover {
+    background: rgba(255,255,255,.12) !important;
+    border-color: var(--sec-accent, var(--tab-accent)) !important;
+    color: var(--sec-accent, var(--tab-accent)) !important; }
+  .btn-action.warn { background: #4c1111 !important; border-color: #b91c1c !important; color: #fca5a5 !important; }
+  .tf-btn.active { background: var(--sec-accent, var(--tab-accent)) !important; color: #0a0d15 !important; border-color: var(--sec-accent, var(--tab-accent)) !important; }
+  .btn-connect { background: #14532d !important; color: #86efac !important; border-color: #16a34a !important; }
+  .btn-reset { background: #4c1111 !important; color: #fca5a5 !important; border-color: #b91c1c !important; }
+
+  /* --- Tab buttons: dark tinted, accent underline, accent active --- */
+  .tab-btn { background: var(--tab-bg) !important; color: var(--fg) !important; border-color: transparent !important; }
+  .tab-btn[data-tab] { border-left: 3px solid var(--tc, var(--tab-edge)) !important; }
+  .tab-btn:hover { background: var(--panel2) !important; color: var(--tc, var(--tab-accent)) !important; }
+  .tab-btn.active { background: var(--tc, var(--tab-accent)) !important; color: #0a0d15 !important; border-color: var(--tc, var(--tab-accent)) !important; }
+
+  /* --- Legend + small labels --- */
+  .leg-name:hover, .leg-btn:hover, .mw-head:hover { color: var(--tab-accent) !important; }
+
+  /* =================================================================== */
+  /* Solid multicolor buttons. Every control gets a solid fill from a     */
+  /* curated palette; toggle buttons show a distinct ON vs OFF colour.    */
+  /* =================================================================== */
+  :root {
+    --b-sky:#38bdf8; --b-teal:#2dd4bf; --b-emerald:#34d399; --b-violet:#a78bfa;
+    --b-fuchsia:#e879f9; --b-amber:#fbbf24; --b-orange:#fb923c; --b-rose:#fb7185;
+    --b-cyan:#22d3ee; --b-lime:#a3e635; --b-red:#ef4444; --b-green:#22c55e;
+    --b-on:#16a34a; --b-off:#dc2626; --b-armed:#d97706; --b-slate:#64748b;
+    --btn-ink:#0a1020;
+  }
+
+  /* --- Base solid fill --- */
+  .btn-action, .set-btn, .mw-mini-btn, .oc-chart-btn, #goAtmBtn, #btnBestCombo,
+  .rs-chip, .rtom-chip {
+    background: var(--btn-c, var(--b-sky)) !important;
+    color: var(--btn-ink) !important;
+    border: 1px solid rgba(0,0,0,.28) !important;
+    font-weight: 700 !important;
+    border-radius: 6px;
+    box-shadow: 0 1px 0 rgba(0,0,0,.35), inset 0 1px 0 rgba(255,255,255,.20);
+    transition: filter .12s, transform .06s, box-shadow .12s;
+  }
+  .btn-action:hover, .set-btn:hover, .mw-mini-btn:hover, .oc-chart-btn:hover,
+  #goAtmBtn:hover, #btnBestCombo:hover, .rs-chip:hover, .rtom-chip:hover {
+    filter: brightness(1.14) saturate(1.08);
+    box-shadow: 0 0 12px -2px var(--btn-c, var(--b-sky));
+  }
+  .btn-action:active, .set-btn:active, .mw-mini-btn:active, .oc-chart-btn:active,
+  #goAtmBtn:active, #btnBestCombo:active, .rs-chip:active, .rtom-chip:active {
+    transform: translateY(1px); filter: brightness(.94);
+  }
+  /* Dark ink for anything nested inside a solid button, so labels stay legible
+     on bright fills (the theme's "lift dim greys" rule would otherwise lighten
+     them). The stat chip keeps its coloured net value. */
+  body .btn-action, body .btn-action *, body .set-btn *, body .mw-mini-btn *,
+  body .oc-chart-btn *, body .rtom-chip *, body #goAtmBtn *, body #btnBestCombo * {
+    color: var(--btn-ink) !important;
+  }
+  body .rs-chip span[style*="color:#888"] { color: var(--btn-ink) !important; }
+
+  /* --- Per-class defaults --- */
+  .set-btn { --btn-c: var(--b-violet); }
+  .mw-mini-btn { --btn-c: var(--b-cyan); }
+  .oc-chart-btn { --btn-c: var(--b-amber); }
+  #goAtmBtn { --btn-c: var(--b-teal); }
+  #btnBestCombo { --btn-c: var(--b-emerald); }
+  .rs-chip { --btn-c: var(--b-fuchsia); }
+  .rtom-chip { --btn-c: var(--b-lime); }
+
+  /* --- btn-action rotates through the palette within each toolbar --- */
+  .btn-action:nth-of-type(10n+1) { --btn-c: var(--b-sky); }
+  .btn-action:nth-of-type(10n+2) { --btn-c: var(--b-violet); }
+  .btn-action:nth-of-type(10n+3) { --btn-c: var(--b-emerald); }
+  .btn-action:nth-of-type(10n+4) { --btn-c: var(--b-amber); }
+  .btn-action:nth-of-type(10n+5) { --btn-c: var(--b-fuchsia); }
+  .btn-action:nth-of-type(10n+6) { --btn-c: var(--b-teal); }
+  .btn-action:nth-of-type(10n+7) { --btn-c: var(--b-orange); }
+  .btn-action:nth-of-type(10n+8) { --btn-c: var(--b-rose); }
+  .btn-action:nth-of-type(10n+9) { --btn-c: var(--b-cyan); }
+  .btn-action:nth-of-type(10n+10){ --btn-c: var(--b-lime); }
+
+  /* --- Semantic colours win over the palette rotation --- */
+  .btn-action.warn, .set-btn.warn, .mw-mini-btn.warn, .btn-reset { --btn-c: var(--b-red); }
+  .set-btn.muted { --btn-c: var(--b-slate); color: #f1f5f9 !important; }
+  .btn-connect { --btn-c: var(--b-green); }
+  .btn-action.warn, .btn-reset { color: #fff5f5 !important; }
+
+  /* --- Toggle buttons: solid ON vs OFF --- */
+  .btn-action.on, .rtom-chip.sel {
+    --btn-c: var(--b-green) !important; color: #04130a !important;
+    box-shadow: 0 0 10px -2px var(--b-green);
+  }
+  .btn-action.off { --btn-c: var(--b-off) !important; color: #fff1f1 !important; }
+  .btn-action.blocked { --btn-c: var(--b-slate) !important; color: #e2e8f0 !important; }
+
+  /* --- Timeframe buttons: OFF slate, ON active-tab accent --- */
+  .tf-btn {
+    background: #334155 !important; color: #e2e8f0 !important;
+    border: 1px solid #475569 !important; font-weight: 700 !important; border-radius: 6px;
+  }
+  .tf-btn:hover { background: #41526b !important; color: #fff !important; }
+  .tf-btn.active {
+    background: var(--sec-accent, var(--b-teal)) !important; color: var(--btn-ink) !important;
+    border-color: transparent !important; box-shadow: 0 0 10px -2px var(--sec-accent, var(--b-teal));
+  }
+
+  /* --- Status pills: solid slate / green ON / red OFF / amber armed --- */
+  .rt-pill { background: #334155 !important; border: 1px solid #475569 !important; color: #e2e8f0 !important; font-weight: 700 !important; }
+  .rt-pill.on { background: var(--b-on) !important; border-color: var(--b-green) !important; color: #f0fdf4 !important; }
+  .rt-pill.off { background: var(--b-off) !important; border-color: var(--b-red) !important; color: #fef2f2 !important; }
+  .rt-pill.armed { background: var(--b-armed) !important; border-color: #f59e0b !important; color: #fffbeb !important; }
+
+  /* =================================================================== */
+  /* Responsive layout - phones & tablets (portrait and landscape).       */
+  /* The desktop shell (>1120px) is untouched: every rule below only      */
+  /* refines narrower viewports so the dense trading UI stays usable on   */
+  /* touch devices. Data tables scroll horizontally instead of spilling.  */
+  /* =================================================================== */
+
+  /* Viewport height: 100vh is clipped by mobile browser URL bars, so use
+     the dynamic viewport unit where supported. */
+  .app { height: 100vh; height: 100dvh; }
+  html { -webkit-text-size-adjust: 100%; }
+
+  /* Mobile drawer controls are hidden on desktop. */
+  .sidebar-toggle, .sidebar-backdrop { display: none; }
+
+  /* The chart canvas handles single-finger pan / position drags itself, so the
+     browser must not treat those gestures as a page scroll. */
+  #chartCanvas { touch-action: none; }
+
+  /* Wide, nowrap data tables: let their containers scroll sideways on touch
+     instead of stretching the whole page off-screen. */
+  .rt-scroll, #oc-table-container, #oc-all-container, #tab-backup.active { overflow-x: auto; }
+  .rt-scroll, .account-section, #oc-table-container, #oc-all-container,
+  #tab-backup, #tab-realtime, .paper-frame { -webkit-overflow-scrolling: touch; }
+
+  /* Dropdown popovers never grow wider than the screen. */
+  .ind-menu, #chartTypeMenu, .ind-settings { max-width: calc(100vw - 16px); }
+
+  /* Larger hit targets on touch-only devices (coarse pointer). */
+  @media (pointer: coarse) {
+    .tab-btn, .btn-action, .set-btn, .tf-btn, .mw-mini-btn, .pos-btn,
+    .oc-chart-btn, .rtom-chip, #goAtmBtn { min-height: 30px; }
+  }
+
+  /* =================================================================== */
+  /* Tablet / phone chrome (<= 1280px): compact topbar + swipeable tabs.  */
+  /* Applies to tablets in BOTH orientations so landscape stops falling   */
+  /* back to the cramped desktop layout. Toolbars keep wrapping (adding    */
+  /* overflow would clip the dropdown menus).                              */
+  /* =================================================================== */
+  @media (max-width: 1280px) {
+    .topbar { flex-wrap: wrap; row-gap: 4px; padding: 5px 8px; }
+    .tabs {
+      order: 10; flex-wrap: nowrap; overflow-x: auto; width: 100%;
+      margin: 3px 0 0; padding-bottom: 3px; scrollbar-width: thin;
+    }
+    .tabs::-webkit-scrollbar { height: 6px; }
+    .tabs::-webkit-scrollbar-thumb { background: #4a4a80; border-radius: 3px; }
+    .tab-btn { flex: 0 0 auto; white-space: nowrap; padding: 6px 12px; }
+
+    /* Compact but WRAPPING toolbars. Do NOT put overflow on these: the
+       Indicators / Chart-Type dropdowns are absolutely positioned children of
+       .menu-wrap inside the toolbar, and an overflow container both clips them
+       and makes floatmenu.js clamp them to the toolbar's own height, so they
+       become unusable scroll-wise. Wrapping keeps the popovers working. */
+    .chart-toolbar, .oc-toolbar, .account-toolbar { gap: 6px; padding: 4px 8px; }
+
+    .account-cards { grid-template-columns: repeat(2, 1fr); }
+
+    /* Never let a fixed-width field push the layout off-screen. */
+    select, input:not([type=checkbox]):not([type=range]), textarea,
+    .conn-input, .rtom-f > span:first-child { max-width: 100%; }
+    #tab-realtime select, #tab-realtime input:not([type=checkbox]) { max-width: 100%; }
+
+    /* Chart tab scrolls vertically as a fallback so the chart and the
+       indicator panes are never clipped away to nothing. */
+    #tab-chart { overflow-y: auto; }
+    .chart-wrap, .chart-container { min-height: 240px; }
+
+    /* Backup tab: inline min-width cards wrap instead of overflowing. */
+    #backupPanel [style*="min-width:300px"],
+    #backupPanel [style*="min-width:280px"] { min-width: 0 !important; }
+  }
+
+  /* Tablet: keep the sidebar column but slimmer. */
+  @media (min-width: 821px) and (max-width: 1280px) {
+    #sidebar { width: 212px; flex: 0 0 212px; padding: 8px; }
+    #symbolSelect { height: 140px; }
+  }
+
+  /* ---------------- Small tablet / large phone (<= 820px) ---------------- */
+  @media (max-width: 820px) {
+    .topbar { flex-wrap: wrap; row-gap: 4px; }
+    .sidebar-toggle {
+      display: inline-flex; align-items: center;
+      background: var(--tab-bg, #141d31); color: var(--fg);
+      border: 1px solid var(--border2); border-radius: 6px;
+      padding: 5px 12px; font-size: 12px; font-weight: 700; cursor: pointer;
+      min-height: 30px;
+    }
+    .sidebar-toggle:hover { border-color: var(--tab-accent); color: var(--tab-accent); }
+
+    /* Tabs become a single swipeable row pinned across the topbar width,
+       instead of wrapping into three or four stacked rows. */
+    .tabs {
+      order: 10; flex-wrap: nowrap; overflow-x: auto; width: 100%;
+      margin: 4px 0 0; padding-bottom: 3px; scrollbar-width: thin;
+    }
+    .tabs::-webkit-scrollbar { height: 6px; }
+    .tabs::-webkit-scrollbar-thumb { background: #4a4a80; border-radius: 3px; }
+    .tab-btn { flex: 0 0 auto; white-space: nowrap; }
+
+    /* Sidebar becomes an off-canvas drawer: the content keeps the whole
+       viewport height (stacking it left the chart no room to show or drag). */
+    .content { flex: 1 1 auto; min-height: 0; }
+    #sidebar {
+      position: fixed; top: 0; left: 0; bottom: 0; z-index: 1000;
+      width: min(86vw, 340px); height: 100dvh; max-height: none;
+      flex: none; border-right: 1px solid var(--border); border-bottom: none;
+      transform: translateX(-102%); transition: transform .22s ease;
+      box-shadow: 8px 0 30px rgba(0,0,0,.6); padding-bottom: 24px;
+    }
+    body.sidebar-open #sidebar { transform: translateX(0); }
+    .sidebar-backdrop {
+      display: block; position: fixed; inset: 0; z-index: 999;
+      background: rgba(0,0,0,.5); opacity: 0; pointer-events: none;
+      transition: opacity .2s;
+    }
+    body.sidebar-open .sidebar-backdrop { opacity: 1; pointer-events: auto; }
+    #symbolSelect { height: 150px; }
+
+    .account-cards { grid-template-columns: repeat(2, 1fr); }
+
+    /* Never let a fixed-width field push the layout off-screen. */
+    select, input:not([type=checkbox]):not([type=range]), textarea,
+    .conn-input, .rtom-f > span:first-child { max-width: 100%; }
+    #tab-realtime select, #tab-realtime input:not([type=checkbox]) { max-width: 100%; }
+
+    .chart-container { min-height: 200px; }
+    .pane-chart { height: 110px; }
+
+    /* Backup tab: inline min-width cards wrap instead of overflowing. */
+    #backupPanel [style*="min-width:300px"],
+    #backupPanel [style*="min-width:280px"] { min-width: 0 !important; }
+  }
+
+  /* ---------------- Phone (<= 560px) ---------------- */
+  @media (max-width: 560px) {
+    html, body { font-size: 11px; }
+    .brand { font-size: 12px; }
+    /* Trim the connection row (placeholder text keeps the fields self-explanatory). */
+    .conn-label, .conn-sep { display: none; }
+    #clientId { width: 92px !important; }
+    #accessToken { width: 132px !important; }
+    .account-cards { gap: 6px; }
+    .acard { padding: 8px; }
+    .acard .value { font-size: 15px; }
+    .oc-toolbar select { min-width: 110px; }
+    #ocChart { height: 200px; }
+    .paper-banner { font-size: 10px; }
+    #linkToasts { width: 96vw; }
+    .link-toast { min-width: 0; width: 96vw; }
+    .ind-section { max-height: 50%; }
+    #rtFilterSectionBull, #rtFilterSectionBear { min-width: 0 !important; width: 100%; max-width: 100% !important; margin-right: 0 !important; }
+  }
+
+  /* =================================================================== */
+  /* Short landscape (phones + tablets held sideways): trim vertical      */
+  /* chrome so the chart keeps a usable height.                           */
+  /* =================================================================== */
+  @media (orientation: landscape) and (max-height: 820px) and (max-width: 1280px) {
+    .topbar { padding: 3px 8px; row-gap: 2px; }
+    .conn-label, .conn-check { font-size: 9px; }
+    .tab-btn { padding: 4px 10px; font-size: 11px; }
+    #symbolSelect { height: 90px; }
+    .chart-wrap, .chart-container { min-height: 150px; }
+    .ind-section { max-height: 40%; }
+    .pane-chart { height: 92px; }
+    .account-cards { grid-template-columns: repeat(4, 1fr); }
+  }
+
+
+
+
+

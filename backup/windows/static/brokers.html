@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Broker Settings - Dhan Algo</title>
+<link rel="stylesheet" href="./app.css?v=19">
+<style>
+  body { display:block; overflow-y:auto; }
+  #brokerRoot { padding: 10px 12px 40px; }
+</style>
+</head>
+<body data-tab="brokers">
+<div id="brokerRoot"></div>
+<script type="module">
+  import { bootBrokers } from "./brokers.js?v=4";
+  bootBrokers();
+</script>
+</body>
+</html>

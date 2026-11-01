@@ -1,0 +1,37 @@
+/* tslint:disable */
+/* eslint-disable */
+export const memory: WebAssembly.Memory;
+export const chart_kind_json: () => [number, number];
+export const clear_dir_overlay: () => void;
+export const clear_oc_level_lines: () => void;
+export const clear_trade_lines: () => void;
+export const live_tick: () => void;
+export const open_option_chart_by_sid: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
+export const select_symbol: (a: number, b: number, c: number, d: number, e: number, f: number, g: number) => void;
+export const set_chart_kind: (a: number, b: number, c: number, d: number) => void;
+export const set_chart_timeframe: (a: number, b: number) => void;
+export const set_dir_markers: (a: number, b: number) => void;
+export const set_dir_series: (a: number, b: number, c: number, d: number, e: number) => void;
+export const set_formed_only: (a: number) => void;
+export const set_nifty_bbpct_pane: (a: number) => void;
+export const set_oc_level_lines: (a: number, b: number) => void;
+export const set_oi_trend_enabled: (a: number) => void;
+export const set_trade_lines: (a: number, b: number) => void;
+export const start: () => void;
+export const update_oc_quotes: (a: number, b: number) => void;
+export const wasm_bindgen_7005259d21a40caf___convert__closures_____invoke___js_sys_74bf28d486ca7ec2___Function_fn_wasm_bindgen_7005259d21a40caf___JsValue_____wasm_bindgen_7005259d21a40caf___sys__Undefined___js_sys_74bf28d486ca7ec2___Function_fn_wasm_bindgen_7005259d21a40caf___JsValue_____wasm_bindgen_7005259d21a40caf___sys__Undefined_______true_: (a: number, b: number, c: any, d: any) => void;
+export const wasm_bindgen_7005259d21a40caf___convert__closures_____invoke___wasm_bindgen_7005259d21a40caf___JsValue__core_608f92abc48d28da___result__Result_____wasm_bindgen_7005259d21a40caf___JsError___true_: (a: number, b: number, c: any) => [number, number];
+export const wasm_bindgen_7005259d21a40caf___convert__closures_____invoke___web_sys_f91a6cb96ff99210___features__gen_MouseEvent__MouseEvent______true_: (a: number, b: number, c: any) => void;
+export const wasm_bindgen_7005259d21a40caf___convert__closures_____invoke___web_sys_f91a6cb96ff99210___features__gen_MouseEvent__MouseEvent______true__21: (a: number, b: number, c: any) => void;
+export const wasm_bindgen_7005259d21a40caf___convert__closures_____invoke___web_sys_f91a6cb96ff99210___features__gen_MouseEvent__MouseEvent______true__22: (a: number, b: number, c: any) => void;
+export const wasm_bindgen_7005259d21a40caf___convert__closures_____invoke___web_sys_f91a6cb96ff99210___features__gen_MouseEvent__MouseEvent______true__23: (a: number, b: number, c: any) => void;
+export const wasm_bindgen_7005259d21a40caf___convert__closures_____invoke_______true_: (a: number, b: number) => void;
+export const __wbindgen_malloc: (a: number, b: number) => number;
+export const __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;
+export const __wbindgen_exn_store: (a: number) => void;
+export const __externref_table_alloc: () => number;
+export const __wbindgen_externrefs: WebAssembly.Table;
+export const __wbindgen_free: (a: number, b: number, c: number) => void;
+export const __wbindgen_destroy_closure: (a: number, b: number) => void;
+export const __externref_table_dealloc: (a: number) => void;
+export const __wbindgen_start: () => void;

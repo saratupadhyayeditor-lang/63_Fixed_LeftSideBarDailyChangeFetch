@@ -1,0 +1,707 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dhan Algo Trading System - Rust</title>
+    <link rel="stylesheet" href="./app.css?v=19">
+</head>
+<body>
+<div class="app">
+  <div class="topbar">
+    <button class="sidebar-toggle" id="sidebarToggle" type="button" title="Show / hide the instrument panel" aria-label="Toggle instrument panel">Menu</button>
+    <span class="brand">Dhan Algo :: Rust</span>
+    <span class="conn-sep"></span>
+    <label class="conn-label">Client ID:</label>
+    <input type="text" id="clientId" class="conn-input" placeholder="Enter Client ID" style="width:110px">
+    <label class="conn-label">Token:</label>
+    <input type="password" id="accessToken" class="conn-input" placeholder="Enter Access Token" style="width:180px">
+    <button class="btn-connect" id="connectBtn">Connect</button>
+    <button class="btn-reset" id="resetFeedBtn" style="display:none">Reset Feed</button>
+    <label class="conn-check" title="Automatically reset the feed when it stalls (no ticks for 45s)"><input type="checkbox" id="autoResetFeed"> Auto Reset</label>
+    <label class="conn-check" title="Automatically press Connect when the indices daily change stops for 3 seconds"><input type="checkbox" id="reconnectOnDisconnect" checked> Reconnect on Disconnection</label>
+    <label class="conn-check" title="Ek shared one-second budget jo teeno Paper Trade tabs (Paper 1 + 2 + 3) milakar use karte hain. Dhan ka documented maximum 10 order requests/sec hai; 6 safe default hai.">Paper 1+2+3 ops
+      <input type="number" id="sharedPaperOps" class="conn-input" min="1" max="10" step="1" value="6" style="width:52px;padding:2px 4px">
+    </label>
+    <label class="conn-check" title="Ek shared one-second budget jo teeno Realtime Trading Engine tabs (RT 1 + 2 + 3) milakar use karte hain. Yehi cap actual Dhan order requests par lagta hai; maximum 10.">Realtime 1+2+3 ops
+      <input type="number" id="sharedRealOps" class="conn-input" min="1" max="10" step="1" value="6" style="width:52px;padding:2px 4px">
+    </label>
+    <span id="sharedOpsStatus" class="conn-check" title="Trailing one-second window usage across the three paper / three live engines" style="color:#888"></span>
+    <span id="indicesChangeStatus">Indices daily change live</span>
+    <span id="feedStatus" title="Live feed diagnostics"></span>
+    <span id="status" class="error">Disconnected</span>
+    <label class="textsize-ctl" title="Text size: scroll the mouse wheel over the box, use the arrows, or type a value (60-200%). Scales the whole app.">
+      <span>Text</span>
+      <input type="number" id="textSizeInput" min="60" max="200" step="5" value="100" inputmode="numeric">
+      <span>%</span>
+    </label>
+    <div class="tabs">
+      <button class="tab-btn active" data-tab="chart">Candlestick Chart</button>
+      <button class="tab-btn" data-tab="optionchain">Option Chain</button>
+      <button class="tab-btn" data-tab="account" title="Broker account - available balance, used margin, collateral, day P&amp;L, open positions and holdings (live Dhan account)">Account</button>
+      <button class="tab-btn" data-tab="marketanalysis" title="Market Analysis - FII/DII cash flows, participant-wise F&amp;O open interest, global indices and live India indices (NIFTY, BANK NIFTY, INDIA VIX, GIFT NIFTY)">Market Analysis</button>
+      <button class="tab-btn" data-tab="targetlab" title="Target Lab - multi-factor trend target research for indices and MCX commodities (trend, support/resistance, candle patterns, OI, PCR, max pain, IV) with per-engine auto-cut at the underlying target">Target Lab</button>
+      <button class="tab-btn" data-tab="equityresearch" title="Equity Research - free-source multibagger screener: NSE bhavcopy, delivery, Yahoo fundamentals, shareholding and F&amp;O option metrics with a momentum backtest">Equity Research</button>
+      <button class="tab-btn" data-tab="equitypaper" title="Equity Paper Engine - simulated delivery trades from Equity Research Buy calls with live stats; no real orders">Equity Paper Engine</button>
+      <button class="tab-btn" data-tab="equitylive" title="Realtime Equity Engine - places REAL Dhan CNC delivery orders from Equity Research Buy calls, exit on target/stop/Avoid; live stats">Realtime Equity Engine</button>
+      <button class="tab-btn" data-tab="eqstats" title="Equity Trade Stats - paper vs realtime equity engine comparison: open positions, closed trades, win rate and P&amp;L">Equity Trade Stats</button>
+      <button class="tab-btn" data-tab="realtime" title="Realtime Trading Engine - executes REAL Dhan orders (no paper trades)">Realtime Trading Engine</button>
+      <button class="tab-btn" data-tab="rtstats" title="Realtime Market Trade Stats - executed-trades report for the Realtime Trading Engine (real orders)">Realtime Market Trade Stats</button>
+      <button class="tab-btn" data-tab="realtime2" title="Realtime Trading Engine 2 - second independent LIVE engine, executes REAL Dhan orders on an indices + option-chain commodities book; shares no data with Realtime Trading Engine">Realtime Trading Engine 2</button>
+      <button class="tab-btn" data-tab="rtstats2" title="Realtime Trading Engine 2 Stats - executed-trades report for Realtime Trading Engine 2 (real orders)">Realtime Engine 2 Stats</button>
+      <button class="tab-btn" data-tab="realtime3" title="Realtime Trading Engine 3 - third independent LIVE engine, executes REAL Dhan orders on an indices + option-chain commodities book; shares no data with Realtime Trading Engines 1 or 2">Realtime Trading Engine 3</button>
+      <button class="tab-btn" data-tab="rtstats3" title="Realtime Trading Engine 3 Stats - executed-trades report for Realtime Trading Engine 3 (real orders)">Realtime Engine 3 Stats</button>
+      <button class="tab-btn" data-tab="papertrade" title="Paper Trade - same AI Smart engine on live Dhan data, simulated execution (no real orders)">Paper Trade</button>
+      <button class="tab-btn" data-tab="paperstats" title="Trade Stats - executed-trades report across the paper engines (simulated fills)">Trade Stats</button>
+      <button class="tab-btn" data-tab="papertrade2" title="Paper Trade 2 - independent paper engine with its own strategies, settings and simulated book; shares no data with Paper Trade">Paper Trade 2</button>
+      <button class="tab-btn" data-tab="paperstats2" title="Paper Trade 2 Stats - executed-trades report for the Paper Trade 2 engine only (simulated fills)">Paper Trade 2 Stats</button>
+      <button class="tab-btn" data-tab="papertrade3" title="Paper Trade 3 - independent Paper Trade 2 clone (indices + option-chain commodities) with its own simulated book; shares no data with Paper Trade 1 or 2">Paper Trade 3</button>
+      <button class="tab-btn" data-tab="paperstats3" title="Paper Trade 3 Stats - executed-trades report for the Paper Trade 3 engine only (simulated fills)">Paper Trade 3 Stats</button>
+      <button class="tab-btn" data-tab="brokers" title="Broker Settings - sabhi supported brokers (Dhan, ICICI Breeze, Angel SmartAPI, Alice Blue, 5paisa, Fyers, Kotak Neo, Zerodha Kite, Upstox) ke API keys / tokens ek jagah, plus per-broker enable switch">Broker Settings</button>
+      <button class="tab-btn" data-tab="backup" title="Backup &amp; Restore - complete algo system backup (all tabs, engine settings, templates, strategies, P&amp;L records, monitor lists)">Backup &amp; Restore</button>
+      <button class="tab-btn" data-tab="updater" title="App Update - manual GitHub Releases updater with live log and history (desktop app only)">App Update</button>
+    </div>
+  </div>
+
+  <div class="body-row">
+    <div id="sidebar">
+      <h3>Instrument</h3>
+      <input type="text" id="symbolSearch" placeholder="Search symbol...">
+      <select id="symbolSelect" size="10"></select>
+
+      <h3 style="border-top:1px solid var(--border);padding-top:10px;display:flex;justify-content:space-between;align-items:center">
+        Commodities (MCX)
+        <button class="mw-mini-btn warn" id="cmdtyRefresh" title="Refresh commodity LTP">Refresh</button>
+      </h3>
+      <div id="commodityWatch" style="max-height:180px;overflow-y:auto;margin-bottom:6px">
+        <div class="mw-row" style="opacity:.55;cursor:default"><span class="mw-name">Loading commodities...</span><span class="mw-ltp">--</span><span class="mw-chg">--</span></div>
+      </div>
+
+      <h3 style="border-top:1px solid var(--border);padding-top:10px;display:flex;justify-content:space-between;align-items:center">
+        Market Watch
+        <span style="display:flex;gap:4px">
+          <button class="mw-mini-btn" id="mwToggleBtn">Expand All</button>
+          <button class="mw-mini-btn warn" id="mwRefresh" title="Refresh market watch quotes">Refresh</button>
+        </span>
+      </h3>
+      <div id="marketWatch"></div>
+    </div>
+    <div class="content">
+    <div class="tab-content active" id="tab-chart">
+      <div class="chart-toolbar">
+        <span style="font-size:11px;color:#888" id="chartSymbolLabel">NIFTY 50</span>
+        <span style="font-size:11px" id="chartPnL"></span>
+        <span style="font-size:11px" id="chartTradePnl"></span>
+        <div class="tf-grid chart-tf-grid" id="tfGrid"></div>
+        <span style="font-size:10px;color:#666" id="chartTfLabel">5m</span>
+        <div class="menu-wrap">
+          <button class="btn-action" id="chartTypeBtn" title="Chart type: Candles / Heikin Ashi / Renko (TradingView jaisa)">Chart: Candles</button>
+          <div id="chartTypeMenu" class="ind-menu hidden" style="min-width:250px;padding:10px">
+            <div class="ct-opt" data-kind="candles">Candles</div>
+            <div class="ct-opt" data-kind="line">Line</div>
+            <div class="ct-opt" data-kind="heikin_ashi">Heikin Ashi</div>
+            <div class="ct-opt" data-kind="renko">Renko</div>
+            <div id="renkoSettings" style="display:none;border-top:1px solid #2d2d50;margin-top:8px;padding-top:8px;font-size:10px;color:#bbb">
+              <div class="ct-row"><label>Brick size</label>
+                <select id="renkoMode" style="width:110px">
+                  <option value="traditional">Traditional</option>
+                  <option value="atr">ATR</option>
+                  <option value="percentage">Percentage</option>
+                </select>
+              </div>
+              <div class="ct-row" id="renkoBoxRow"><label>Box size</label><input type="number" id="renkoBox" min="0.01" step="0.05" value="10" style="width:80px"></div>
+              <div class="ct-row" id="renkoAtrRow" style="display:none"><label>ATR length</label><input type="number" id="renkoAtr" min="1" max="200" step="1" value="14" style="width:80px"></div>
+              <div class="ct-row" id="renkoPctRow" style="display:none"><label>Percentage %</label><input type="number" id="renkoPct" min="0.01" step="0.05" value="1" style="width:80px"></div>
+              <div class="ct-row"><label>Source</label>
+                <select id="renkoSource" style="width:110px">
+                  <option value="close">Close</option>
+                  <option value="highlow">High / Low</option>
+                </select>
+              </div>
+              <div class="ct-row"><label><input type="checkbox" id="renkoWicks"> Wicks</label></div>
+              <div class="ct-row"><label title="Non-repaint Renko: bricks sirf CLOSED candles se banenge (forming candle ignore ho jayegi), to har brick bar-close par commit hota hai aur kabhi mid-bar aakar gayab/repaint nahi hota. OFF = default (legacy Renko, forming candle bhi use hoti hai)."><input type="checkbox" id="renkoNonRepaint"> Non-repaint</label></div>
+              <div style="margin-top:6px;color:#888;font-size:9px">Renko settings turant apply hoti hain.</div>
+            </div>
+          </div>
+        </div>
+        <span class="pos-tools" id="posTools">
+          <button class="pos-btn" id="posLongBtn" title="Long Position: chart par entry se target tak drag karo, SL automatic mirror ho jata hai">Long Position</button>
+          <button class="pos-btn" id="posShortBtn" title="Short Position: chart par entry se target tak drag karo, SL automatic mirror ho jata hai">Short Position</button>
+          <button class="pos-btn clear dim" id="posClearBtn" title="Is chart ke saare Long/Short Position hatao">Clear</button>
+        </span>
+        <div class="menu-wrap">
+          <button class="btn-action" id="indMenuBtn">Indicators</button>
+          <div id="indMenu" class="ind-menu hidden">
+            <input type="text" id="indSearch" placeholder="Search indicators...">
+            <div id="indList"></div>
+          </div>
+        </div>
+        <span style="flex:1"></span>
+        <span id="barCountdown" title="Time to current bar close">--:--</span>
+        <label style="font-size:10px;color:#888;display:flex;align-items:center;gap:4px">
+          <input type="checkbox" id="rtToggle" checked> Realtime
+        </label>
+        <label style="font-size:10px;color:#c8a0ff;display:flex;align-items:center;gap:4px">
+          <input type="checkbox" id="oiTrendToggle"> OI Trend
+        </label>
+        <label style="font-size:10px;color:#4fc3f7;display:flex;align-items:center;gap:4px" title="Formed candle only: live FORMING candle chart par nahi dikhegi - sirf band ho chuki (closed) candles dikhengi. Ye har chart type (Candles / Heikin Ashi / Line / Renko) par lagu hota hai, aur chart ke indicators bhi formed candle par compute honge (repaint khatam). Engine me trade ke liye saath wala 'Closed Bar Compute' ON rakho taaki indicator filters bhi formed candle par chalein.">
+          <input type="checkbox" id="formedOnlyToggle"> Formed candle only
+        </label>
+        <button class="btn-action" id="btnBestCombo">Best Combo</button>
+        <button class="btn-action warn" id="btnRemoveAll">Remove Indicators</button>
+        <button class="btn-action" id="btnRefresh">Refresh Chart</button>
+      </div>
+      <div class="chart-wrap">
+        <div id="chart-container" class="chart-container"><div id="loading">Connect to load chart</div></div>
+        <div id="indLegend" class="hidden"></div>
+        <div id="indSettings" class="ind-settings hidden"></div>
+      </div>
+      <div class="ind-section">
+        <div class="ind-section-head">
+          <span class="ind-section-title">Indicator Panes</span>
+          <span id="indSectionCount">0</span>
+          <span class="ind-section-hint">Pane indicators render here, below the candlestick chart</span>
+        </div>
+        <div id="ind-panes"><div class="ind-empty">No pane indicators added. Use the Indicators menu to add one.</div></div>
+      </div>
+    </div>
+    <div class="tab-content" id="tab-optionchain">
+      <div class="oc-toolbar">
+        <label class="conn-label">Expiry:</label>
+        <select id="ocExpirySelect"></select>
+        <button class="btn-action" id="ocRefreshBtn">Refresh</button>
+        <button class="btn-action" id="ocAutoBtn">Auto</button>
+        <button class="btn-action" id="ocAllBtn">All Expiries</button>
+        <button id="goAtmBtn" disabled>Go to ATM</button>
+        <span id="ocInstrumentInfo"></span>
+        <span id="ocStatus" class="oc-status"></span>
+      </div>
+      <div id="oc-chart-container">
+        <canvas id="ocChart"></canvas>
+      </div>
+      <div id="oc-table-container">
+        <div class="oc-empty">Open the Option Chain tab to load the chain for the selected symbol.</div>
+      </div>
+      <div id="oc-all-container" class="hidden"></div>
+    </div>
+    <div class="tab-content" id="tab-realtime"></div>
+    <div class="tab-content" id="tab-realtime2">
+      <iframe class="paper-frame" data-src="./rt2v181.html" title="Realtime Trading Engine 2 (independent LIVE engine)"></iframe>
+    </div>
+    <div class="tab-content" id="tab-realtime3">
+      <iframe class="paper-frame" data-src="./rt3v181.html" title="Realtime Trading Engine 3 (independent LIVE engine)"></iframe>
+    </div>
+    <div class="tab-content" id="tab-targetlab"><div id="rtTargetLab"></div></div>
+    <div class="tab-content" id="tab-equityresearch"><div id="rtEquityResearch"></div></div>
+    <div class="tab-content" id="tab-equitypaper">
+      <iframe class="paper-frame" data-src="./eqengine.html?mode=paper&amp;v=9" title="Equity Paper Engine"></iframe>
+    </div>
+    <div class="tab-content" id="tab-equitylive">
+      <iframe class="paper-frame" data-src="./eqengine.html?mode=live&amp;v=9" title="Realtime Equity Engine (LIVE Dhan orders)"></iframe>
+    </div>
+    <div class="tab-content" id="tab-eqstats">
+      <iframe class="paper-frame" data-src="./eqstats.html" title="Equity Trade Stats"></iframe>
+    </div>
+    <div class="tab-content" id="tab-account">
+      <div class="account-toolbar">
+        <span id="accountStatus" class="account-status">Connect to Dhan to load your account.</span>
+        <button class="btn-action" id="accountRefreshBtn">Refresh</button>
+      </div>
+      <div class="account-cards" id="accountCards">
+        <div class="acard"><div class="label">Available Balance</div><div class="value white" id="acAvailable">--</div></div>
+        <div class="acard"><div class="label">Used Margin</div><div class="value white" id="acUsedMargin">--</div></div>
+        <div class="acard"><div class="label">Collateral</div><div class="value white" id="acCollateral">--</div></div>
+        <div class="acard"><div class="label">Day P&amp;L</div><div class="value white" id="acPnl">--</div></div>
+      </div>
+      <div class="account-section">
+        <h3>Open Positions</h3>
+        <table class="account-table" id="positionsTable">
+          <thead><tr><th>Symbol</th><th>Exchange</th><th>Type</th><th>Qty</th><th>Avg Buy</th><th>LTP</th><th>P&amp;L</th><th>P&amp;L %</th><th>Product</th></tr></thead>
+          <tbody id="accountPositionsBody"><tr><td colspan="9" class="account-empty">No open positions</td></tr></tbody>
+        </table>
+        <h3>Holdings</h3>
+        <table class="account-table" id="holdingsTable">
+          <thead><tr><th>Symbol</th><th>Exchange</th><th>Qty</th><th>Avg Buy</th><th>LTP</th><th>P&amp;L</th><th>P&amp;L %</th><th>ISIN</th></tr></thead>
+          <tbody id="accountHoldingsBody"><tr><td colspan="8" class="account-empty">No holdings</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+    <div class="tab-content" id="tab-marketanalysis"></div>
+    <div class="tab-content" id="tab-papertrade">
+      <iframe class="paper-frame" data-src="./paperv181.html?v=2" title="Paper Trade (simulated engine)"></iframe>
+    </div>
+    <div class="tab-content" id="tab-papertrade2">
+      <iframe class="paper-frame" data-src="./paper2v181.html?v=2" title="Paper Trade 2 (independent simulated engine)"></iframe>
+    </div>
+    <div class="tab-content" id="tab-papertrade3">
+      <iframe class="paper-frame" data-src="./paper3v181.html?v=2" title="Paper Trade 3 (independent simulated engine)"></iframe>
+    </div>
+    <div class="tab-content" id="tab-rtstats"></div>
+    <div class="tab-content" id="tab-rtstats2">
+      <iframe class="paper-frame" data-src="./rtstats2.html" title="Trade Stats (Realtime Trading Engine 2)"></iframe>
+    </div>
+    <div class="tab-content" id="tab-rtstats3">
+      <iframe class="paper-frame" data-src="./rtstats3.html" title="Trade Stats (Realtime Trading Engine 3)"></iframe>
+    </div>
+    <div class="tab-content" id="tab-paperstats">
+      <iframe class="paper-frame" data-src="./paperstats.html" title="Trade Stats (paper engines)"></iframe>
+    </div>
+    <div class="tab-content" id="tab-paperstats2">
+      <iframe class="paper-frame" data-src="./paperstats2.html" title="Trade Stats (Paper Trade 2)"></iframe>
+    </div>
+    <div class="tab-content" id="tab-paperstats3">
+      <iframe class="paper-frame" data-src="./paperstats3.html" title="Trade Stats (Paper Trade 3)"></iframe>
+    </div>
+    <div class="tab-content" id="tab-brokers">
+      <iframe class="paper-frame" data-src="./brokers.html?v=4" title="Broker Settings"></iframe>
+    </div>
+    <div class="tab-content" id="tab-backup">
+      <div id="backupPanel" style="padding:14px;max-width:1080px">
+        <h3 style="font-size:12px;color:#00d4aa;text-transform:uppercase;margin:0 0 4px;display:flex;align-items:center;gap:8px">
+          Backup &amp; Restore
+          <span id="backupAutoDot" style="display:inline-block;width:9px;height:9px;border-radius:50%;background:#666" title="Auto backup: green = enabled"></span>
+          <button class="btn-action" onclick="KickRefresh.backup()" style="width:auto;padding:3px 12px;font-size:10px;margin:0 0 0 auto" title="Unstick data - reload the backup server status &amp; history now. No settings are changed.">Refresh</button>
+        </h3>
+        <div style="font-size:10px;color:#888;margin-bottom:12px">Complete algo system backup — all tabs, all engine settings, saved templates, saved strategies, P&amp;L records, monitor lists. Everything is captured, so a crash or accident can always be rolled back.</div>
+        <div id="backupStatus" style="font-size:11px;color:#00d4aa;margin-bottom:10px">Loading backup server…</div>
+
+        <div style="display:flex;flex-wrap:wrap;gap:14px">
+          <div style="flex:1;min-width:300px;background:#0e0e24;border:1px solid #1e1e40;border-radius:4px;padding:12px">
+            <h4 style="font-size:11px;color:#d0d0d0;margin:0 0 8px">1 · Export</h4>
+            <label style="font-size:10px;color:#888;display:block;margin-bottom:3px">Save directly to your PC — pick a folder once, then export</label>
+            <div style="display:flex;gap:6px;margin-bottom:8px;flex-wrap:wrap;align-items:center">
+              <button id="backupChooseDirBtn" class="btn-action" style="padding:6px 10px;font-size:10px;width:auto;margin:0;white-space:nowrap">Choose Folder on PC…</button>
+              <span id="backupDirName" style="font-size:10px;color:#888">No folder chosen — exports will download instead.</span>
+            </div>
+            <div style="display:flex;gap:8px;flex-wrap:wrap">
+              <button id="backupExportBtn" class="btn-action" style="padding:7px 14px;font-size:11px;width:auto;margin:0">Export Now → Save to PC</button>
+              <button id="backupDownloadBtn" class="btn-action" style="padding:7px 14px;font-size:11px;width:auto;margin:0">Download Backup File</button>
+              <button id="backupImportBtn" class="btn-action warn" style="padding:7px 14px;font-size:11px;width:auto;margin:0">Import Backup File…</button>
+              <input id="backupFileInput" type="file" accept=".json,application/json" style="display:none">
+            </div>
+            <div style="font-size:10px;color:#666;margin-top:8px">"Export Now" writes the backup straight into the chosen PC folder. If no folder is chosen, it downloads the file instead — works on any browser, no server path needed.</div>
+          </div>
+
+          <div style="flex:1;min-width:300px;background:#0e0e24;border:1px solid #1e1e40;border-radius:4px;padding:12px">
+            <h4 style="font-size:11px;color:#d0d0d0;margin:0 0 8px">2 · Auto Incremental Backup</h4>
+            <label style="font-size:10px;color:#888;display:block;margin-bottom:3px">Save location — choose your PC folder; auto backups keep saving here incrementally</label>
+            <div style="display:flex;gap:6px;margin-bottom:8px;flex-wrap:wrap;align-items:center">
+              <button id="backupAutoSavePcBtn" class="btn-action" style="padding:6px 10px;font-size:10px;width:auto;margin:0;white-space:nowrap">Save to PC…</button>
+              <span id="backupAutoDirName" style="font-size:10px;color:#888">No PC folder chosen</span>
+            </div>
+            <label style="display:flex;align-items:center;gap:6px;font-size:11px;color:#d0d0d0;margin-bottom:8px">
+              <input id="backupEnabled" type="checkbox"> Enable auto incremental backup
+            </label>
+            <div style="font-size:10px;color:#888;margin-bottom:4px">Save interval (select one — the others go inactive)</div>
+            <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px">
+              <label id="tfMinute" class="backup-tf-card" style="flex:1;min-width:110px;background:#12122a;border:1px solid #00d4aa;border-radius:3px;padding:6px 8px;font-size:10px;color:#d0d0d0;cursor:pointer;opacity:1">
+                <input type="radio" name="backupTF" value="minute" checked> Minute
+                <div style="margin-top:4px;color:#888">Every <input id="backupMinInterval" type="number" min="1" max="60" value="5" style="width:52px;background:#1a1a3a;border:1px solid #2d2d50;color:#d0d0d0;border-radius:3px;font-size:11px;padding:3px 5px"> min</div>
+              </label>
+              <label id="tfHour" class="backup-tf-card" style="flex:1;min-width:110px;background:#12122a;border:1px solid #2d2d50;border-radius:3px;padding:6px 8px;font-size:10px;color:#d0d0d0;cursor:pointer;opacity:0.35">
+                <input type="radio" name="backupTF" value="hour"> Hour
+                <div style="margin-top:4px;color:#888">Every <input id="backupHourInterval" type="number" min="1" max="24" value="6" style="width:52px;background:#1a1a3a;border:1px solid #2d2d50;color:#d0d0d0;border-radius:3px;font-size:11px;padding:3px 5px"> hrs</div>
+              </label>
+              <label id="tfDay" class="backup-tf-card" style="flex:1;min-width:110px;background:#12122a;border:1px solid #2d2d50;border-radius:3px;padding:6px 8px;font-size:10px;color:#d0d0d0;cursor:pointer;opacity:0.35">
+                <input type="radio" name="backupTF" value="daily"> Day
+                <div style="margin-top:4px;color:#888">at <input id="backupTime" type="time" value="18:00" style="background:#1a1a3a;border:1px solid #2d2d50;color:#d0d0d0;border-radius:3px;font-size:11px;padding:3px 5px"></div>
+              </label>
+              <label id="tfWeek" class="backup-tf-card" style="flex:1;min-width:150px;background:#12122a;border:1px solid #2d2d50;border-radius:3px;padding:6px 8px;font-size:10px;color:#d0d0d0;cursor:pointer;opacity:0.35">
+                <input type="radio" name="backupTF" value="weekly"> Week
+                <div style="margin-top:4px;color:#888">
+                  <select id="backupWeekday" style="background:#1a1a3a;border:1px solid #2d2d50;color:#d0d0d0;border-radius:3px;font-size:10px;padding:2px 4px">
+                    <option value="0">Monday</option><option value="1">Tuesday</option><option value="2">Wednesday</option>
+                    <option value="3">Thursday</option><option value="4">Friday</option><option value="5">Saturday</option>
+                    <option value="6">Sunday</option>
+                  </select> at <input id="backupWeekTime" type="time" value="18:00" style="background:#1a1a3a;border:1px solid #2d2d50;color:#d0d0d0;border-radius:3px;font-size:11px;padding:3px 5px">
+                </div>
+              </label>
+            </div>
+            <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px;font-size:10px;color:#888">
+              <span>Keep last</span>
+              <input id="backupKeep" type="number" min="1" max="200" value="30" style="width:70px;background:#12122a;border:1px solid #2d2d50;color:#d0d0d0;border-radius:3px;font-size:11px;padding:4px 6px">
+              <span>auto snapshots (older ones are auto-deleted)</span>
+            </div>
+            <button id="backupSaveCfg" class="btn-action" style="padding:7px 14px;font-size:11px;width:auto;margin:0">Save Auto Backup Settings</button>
+            <div style="font-size:10px;color:#666;margin-top:8px">Auto backups save into the PC folder chosen above (incremental, newest kept). If no PC folder is chosen, they fall back to the server path. The scheduler runs while the dashboard tab is open and catches up after reload if a scheduled time was missed.</div>
+          </div>
+        </div>
+
+        <div style="background:#0e0e24;border:1px solid #1e1e40;border-radius:4px;padding:12px;margin-top:14px">
+          <h4 style="font-size:11px;color:#d0d0d0;margin:0 0 6px">3 · Status &amp; History</h4>
+          <div style="font-size:11px;color:#888;margin-bottom:4px">Last backup: <span id="backupLastInfo">—</span></div>
+          <div style="font-size:11px;color:#888;margin-bottom:8px"><span id="backupNextDue">—</span></div>
+          <div id="backupHistory" style="max-height:300px;overflow-y:auto;border:1px solid #1e1e40;border-radius:3px"></div>
+          <div style="font-size:10px;color:#666;margin-top:8px">Restoring a backup: a safety copy of the current state is saved first, then all settings are applied and the page reloads. Auto backups capture the exact same data as "Export Now".</div>
+        </div>
+      </div>
+    </div>
+    <div class="tab-content" id="tab-updater"></div>
+    <div class="tab-content" id="tab-placeholder">
+      <div class="ind-empty">This tab will be built in a later Rust phase.</div>
+    </div>
+    </div>
+  </div>
+</div>
+<div id="sidebarBackdrop" class="sidebar-backdrop"></div>
+
+<script src="./vendor/chart.umd.min.js" defer></script>
+<script type="module">
+  import init, { select_symbol, update_oc_quotes, open_option_chart_by_sid, set_oi_trend_enabled, set_trade_lines, clear_trade_lines, set_chart_kind, chart_kind_json, set_chart_timeframe, set_nifty_bbpct_pane, set_formed_only } from "./pkg/algo_web.js?v=85";
+  import { bootSidebar } from "./sidebar.js?v=30";
+  import { bootConnection } from "./connection.js?v=15";
+  import { bootRealtime } from "./rt181.js?v=37";
+  import { bootRtStats } from "./rtstats.js?v=11";
+  import { bootBackup } from "./backup.js?v=3";
+  import { bootAccount } from "./account.js?v=2";
+  import { bootMarketAnalysis } from "./marketanalysis.js?v=6";
+  import { bootTargetLab } from "./targetlab.js?v=12";
+  import { bootEquityResearch } from "./equity.js?v=10";
+  import { bootUpdater } from "./updater.js?v=9";
+  import { bootTheme } from "./theme.js?v=4";
+  import { bootTextSize } from "./textsize.js?v=3";
+  import { bootIndGroup } from "./indgroup.js?v=5";
+  import { bootFloatMenu } from "./floatmenu.js?v=1";
+  import { mountSharedMarginHeader } from "./sharedmargin.js?v=7";
+  bootConnection();
+  mountSharedMarginHeader(document.getElementById("reconnectOnDisconnect"));
+  bootUpdater();
+  bootTheme();
+  bootTextSize();
+  bootIndGroup();
+  bootFloatMenu();
+  // Generic tab switcher: clicking a tab button activates its matching
+  // .tab-content pane and notifies modules so they can refresh.
+  document.querySelectorAll(".tab-btn[data-tab]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      if (btn.classList.contains("disabled")) return;
+      const t = btn.getAttribute("data-tab");
+      document.body.setAttribute("data-tab", t);
+      document.querySelectorAll(".tab-btn[data-tab]").forEach((b) =>
+        b.classList.toggle("active", b === btn));
+      document.querySelectorAll(".tab-content").forEach((c) =>
+        c.classList.toggle("active", c.id === "tab-" + t));
+      const scroll = btn.getAttribute("data-scroll");
+      if (scroll) {
+        const target = document.getElementById(scroll);
+        if (target) setTimeout(() => target.scrollIntoView({ behavior: "smooth", block: "start" }), 60);
+      }
+      document.dispatchEvent(new CustomEvent("tabshown", { detail: t }));
+    });
+  });
+  // Mobile/tablet: the instrument sidebar becomes an off-canvas drawer so the
+  // chart keeps the full viewport height (stacking it squeezed the chart away).
+  (function bootSidebarDrawer() {
+    const toggle = document.getElementById("sidebarToggle");
+    const backdrop = document.getElementById("sidebarBackdrop");
+    const close = () => document.body.classList.remove("sidebar-open");
+    if (toggle) toggle.addEventListener("click", (e) => {
+      e.stopPropagation();
+      document.body.classList.toggle("sidebar-open");
+    });
+    if (backdrop) backdrop.addEventListener("click", close);
+    document.addEventListener("keydown", (e) => { if (e.key === "Escape") close(); });
+    document.querySelectorAll(".tab-btn[data-tab]").forEach((b) => b.addEventListener("click", close));
+  })();
+  // The Rust chart listens only for mouse events (mousedown on the canvas,
+  // mousemove/mouseup on the window). Phones/tablets emit touch events, so map
+  // a single-finger drag onto the equivalent synthetic mouse events: pan,
+  // crosshair and the Long/Short position tools then work on touch. Multi-touch
+  // (pinch) is ignored. `touch-action:none` on the canvas stops the browser
+  // from turning the drag into a page scroll.
+  (function bootChartTouch() {
+    const container = document.getElementById("chart-container");
+    if (!container) return;
+    let active = false;
+    let touchId = null;
+    const send = (type, touch, target) => {
+      const e = new MouseEvent(type, {
+        bubbles: true, cancelable: true, view: window,
+        clientX: touch.clientX, clientY: touch.clientY,
+        button: 0, buttons: type === "mouseup" ? 0 : 1,
+      });
+      (target || window).dispatchEvent(e);
+    };
+    container.addEventListener("touchstart", (e) => {
+      if (e.touches.length !== 1) return;
+      const canvas = container.querySelector("canvas");
+      if (!canvas) return;
+      active = true;
+      touchId = e.changedTouches[0].identifier;
+      send("mousedown", e.changedTouches[0], canvas);
+      e.preventDefault();
+    }, { passive: false });
+    window.addEventListener("touchmove", (e) => {
+      if (!active) return;
+      const t = Array.from(e.changedTouches).find((x) => x.identifier === touchId);
+      if (!t) return;
+      send("mousemove", t);
+      e.preventDefault();
+    }, { passive: false });
+    const end = (e) => {
+      if (!active) return;
+      active = false;
+      touchId = null;
+      const t = e.changedTouches && e.changedTouches[0];
+      send("mouseup", t || { clientX: 0, clientY: 0 });
+    };
+    window.addEventListener("touchend", end);
+    window.addEventListener("touchcancel", end);
+  })();
+  // Sync the accent colour to whichever tab is active on first load.
+  const bootTab = document.querySelector(".tab-btn.active[data-tab]");
+  if (bootTab) document.body.setAttribute("data-tab", bootTab.getAttribute("data-tab"));
+  // Isolated paper panes (Paper Trade + Paper Trade Stats): load each on first
+  // open so an unused paper engine costs nothing until the operator visits it.
+  // Frames also self-gate their polling to real layout visibility, so a loaded
+  // but hidden paper tab stops refreshing.
+  document.addEventListener("tabshown", (e) => {
+    const t = e.detail;
+    const pane = document.getElementById("tab-" + t);
+    if (!pane) return;
+    pane.querySelectorAll("iframe[data-src]").forEach((frame) => {
+      if (!frame.getAttribute("src")) frame.setAttribute("src", frame.getAttribute("data-src"));
+    });
+    // Push the current chart selection to the paper panes so their order cards
+    // are priced off the symbol the user is viewing.
+    if ((t === "papertrade" || t === "papertrade2" || t === "papertrade3" || t === "realtime2" || t === "realtime3") && pane.querySelector("iframe")) postChartSelection();
+  });
+  // Bridge the main window's live chart selection into BOTH paper frames. The
+  // paper pages read window.__chartSelection on demand, so a re-dispatch is
+  // enough to make them re-price without reloading.
+  function postChartSelection() {
+    document.querySelectorAll("#tab-papertrade iframe, #tab-papertrade2 iframe, #tab-papertrade3 iframe, #tab-realtime2 iframe, #tab-realtime3 iframe").forEach((f) => {
+      try { if (f && f.contentWindow) f.contentWindow.postMessage({ type: "chartselection" }, "*"); } catch (_) {}
+    });
+  }
+  window.addEventListener("chartselection", postChartSelection);
+  document.querySelectorAll("#tab-papertrade iframe, #tab-papertrade2 iframe, #tab-papertrade3 iframe, #tab-realtime2 iframe, #tab-realtime3 iframe, #tab-paperstats iframe").forEach((f) => {
+    f.addEventListener("load", () => { if (f.closest("#tab-papertrade, #tab-papertrade2, #tab-papertrade3, #tab-realtime2, #tab-realtime3")) postChartSelection(); });
+  });
+  // Old-app global name for the option-premium chart opener (used by the
+  // strategies/paper-trade modules).
+  window.openOptionChartBySid = (sid, exch, inst, name) => {
+    window.__chartTarget = { securityId: Number(sid), exchangeSegment: exch || "NSE_FNO", instrument: inst || "OPTIDX", label: name || "" };
+    open_option_chart_by_sid(Number(sid), exch || "NSE_FNO", inst || "OPTIDX", name || "");
+  };
+  // Old-app global name for the OI Trend toggle (math lives in Rust).
+  window.setOITrend = on => set_oi_trend_enabled(!!on);
+
+  // -------------------------------------------------------------------------
+  // Trade chart overlay (old app: syncTradeChartLines -> IndChart.setTradeLines)
+  // -------------------------------------------------------------------------
+  // Opens the main chart on a running trade / picked strike's contract and starts
+  // drawing its live levels. Called from the RT tab directly and from the Paper
+  // Trade iframe via postMessage, so both tabs behave identically.
+  function openTradeChart(info) {
+    const sid = Number(info.securityId || info.sid || 0);
+    if (!sid) return;
+    window.__chartTarget = {
+      securityId: sid,
+      exchangeSegment: info.exchangeSegment || info.exch || "",
+      instrument: info.instrument || info.inst || "",
+      label: info.tradingSymbol || info.label || info.name || String(sid),
+    };
+    window.__rtChartOverlay = { paper: !!info.paper, base: info.paperBase || (info.paper ? "/api/paper" : "/api/rt") };
+    chartLinesKey = "";
+    // Show the chart tab before loading, so the canvas is measured against its
+    // real, visible size instead of the hidden tab's zero-width container.
+    const btn = document.querySelector('.tab-btn[data-tab="chart"]');
+    if (btn) btn.click();
+    select_symbol(sid, window.__chartTarget.exchangeSegment, window.__chartTarget.instrument, window.__chartTarget.label);
+    startChartLines();
+  }
+  window.openTradeChart = openTradeChart;
+
+  // Poll the engine ledger for this instrument's open positions and mirror the
+  // entry / P&L / SL / trail-SL / target levels onto the candles. Values are the
+  // engine's own ratcheted levels, so the lines can never disagree with the
+  // Running Trades list.
+  let chartLinesTimer = null;
+  let chartLinesKey = "";
+  function startChartLines() {
+    if (chartLinesTimer) return;
+    const tick = () => {
+      const t = window.__chartTarget;
+      if (!t || !t.securityId) return;
+      const tab = document.getElementById("tab-chart");
+      if (!tab || !tab.classList.contains("active")) return;
+      const ov = window.__rtChartOverlay || {};
+      const base = ov.base || (ov.paper ? "/api/paper" : "/api/rt");
+      const url = base + "/chart-lines?securityId=" + encodeURIComponent(t.securityId) +
+        "&exchangeSegment=" + encodeURIComponent(t.exchangeSegment || "");
+      fetch(url).then(r => r.json()).then(d => {
+        if (!d || !d.ok) return;
+        const lines = d.lines || [];
+        const key = JSON.stringify(lines);
+        if (key !== chartLinesKey) {
+          chartLinesKey = key;
+          try { set_trade_lines(JSON.stringify(lines)); } catch (_) {}
+        }
+        const pnlEl = document.getElementById("chartTradePnl");
+        if (pnlEl) {
+          if (d.count) {
+            const p = Number(d.pnl || 0);
+            pnlEl.textContent = "· " + d.count + " trade · Open P&L " + (p >= 0 ? "+" : "-") + Math.abs(p).toLocaleString("en-IN", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+            pnlEl.style.color = p >= 0 ? "#00d4aa" : "#ef5350";
+          } else {
+            pnlEl.textContent = "";
+          }
+        }
+      }).catch(() => {});
+    };
+    chartLinesTimer = setInterval(tick, 1000);
+    tick();
+  }
+  // Clear the overlay when the operator switches to an instrument with no open
+  // trade (the chart module itself also drops lines on symbol switch).
+  window.addEventListener("chartselection", () => { chartLinesKey = ""; });
+  window.addEventListener("message", (e) => {
+    const d = e.data || {};
+    if (d && d.type === "openTradeChart") openTradeChart(d);
+  });
+
+  // -------------------------------------------------------------------------
+  // Paper Trade 3 NIFTY-trend BB%b pane
+  // -------------------------------------------------------------------------
+  // The Paper Trade 3 NIFTY Trend Following engine runs on the NIFTY spot chart
+  // and posts its state here. On the off -> on edge we focus the NIFTY spot
+  // chart, set the engine's 1min/5min timeframe and ensure the normal BB%b pane;
+  // on the on -> off edge we remove only the pane this auto-API added. While the
+  // trend stays on we never re-focus the chart, so the operator can freely
+  // navigate without being yanked back.
+  let niftyPaneOn = false;
+  let niftyPaneTf = "";
+  window.addEventListener("message", (e) => {
+    const d = e.data || {};
+    if (!d || d.type !== "niftyBbPctPane") return;
+    const on = !!d.on;
+    const tf = d.tf === "1min" ? "1min" : "5min";
+    if (on) {
+      if (!niftyPaneOn) {
+        niftyPaneTf = "";
+        try { select_symbol(13, "IDX_I", "INDEX", "NIFTY 50"); } catch (_) {}
+      }
+      if (tf !== niftyPaneTf) {
+        niftyPaneTf = tf;
+        try { set_chart_timeframe(tf); } catch (_) {}
+      }
+      try { set_nifty_bbpct_pane(true); } catch (_) {}
+    } else if (niftyPaneOn) {
+      try { set_nifty_bbpct_pane(false); } catch (_) {}
+      niftyPaneTf = "";
+    }
+    niftyPaneOn = on;
+  });
+  // -------------------------------------------------------------------------
+  // Chart type: Candles / Heikin Ashi / Renko (TradingView-style settings).
+  // The transform itself lives in Rust/WASM; this only drives the dropdown,
+  // persists the choice, and pushes it to the chart.
+  // -------------------------------------------------------------------------
+  const CT_KEY = "chartType.v1";
+  let ctState = {
+    kind: "candles",
+    formedOnly: false,
+    renko: { mode: "traditional", boxSize: 10, atrLength: 14, percentage: 1, wicks: false, source: "close", nonRepaint: false },
+  };
+  function ctLoad() {
+    let s = null;
+    try { s = JSON.parse(localStorage.getItem(CT_KEY) || "null"); } catch (_) {}
+    if (!s || !s.kind) {
+      try { s = JSON.parse(chart_kind_json()); } catch (_) {}
+    }
+    if (s && s.kind) ctState.kind = s.kind;
+    if (s && typeof s.formedOnly === "boolean") ctState.formedOnly = s.formedOnly;
+    if (s && s.renko) Object.assign(ctState.renko, s.renko);
+  }
+  function ctSave() {
+    try { localStorage.setItem(CT_KEY, JSON.stringify(ctState)); } catch (_) {}
+  }
+  function ctSyncUI() {
+    const labels = { candles: "Candles", line: "Line", heikin_ashi: "Heikin Ashi", renko: "Renko" };
+    const btn = document.getElementById("chartTypeBtn");
+    if (btn) btn.textContent = "Chart: " + (labels[ctState.kind] || "Candles");
+    document.querySelectorAll("#chartTypeMenu .ct-opt").forEach((el) => {
+      const on = el.getAttribute("data-kind") === ctState.kind;
+      el.style.background = on ? "#2d2d5e" : "transparent";
+      el.style.color = on ? "#fff" : "#c8c8e0";
+    });
+    const rs = document.getElementById("renkoSettings");
+    if (rs) rs.style.display = ctState.kind === "renko" ? "block" : "none";
+    const r = ctState.renko;
+    const setv = (id, v) => { const el = document.getElementById(id); if (el) el.value = v; };
+    setv("renkoMode", r.mode);
+    setv("renkoBox", r.boxSize);
+    setv("renkoAtr", r.atrLength);
+    setv("renkoPct", r.percentage);
+    setv("renkoSource", r.source);
+    const w = document.getElementById("renkoWicks");
+    if (w) w.checked = !!r.wicks;
+    const nr = document.getElementById("renkoNonRepaint");
+    if (nr) nr.checked = !!r.nonRepaint;
+    const fo = document.getElementById("formedOnlyToggle");
+    if (fo) fo.checked = !!ctState.formedOnly;
+    const show = (id, on) => { const el = document.getElementById(id); if (el) el.style.display = on ? "flex" : "none"; };
+    show("renkoBoxRow", r.mode === "traditional");
+    show("renkoAtrRow", r.mode === "atr");
+    show("renkoPctRow", r.mode === "percentage");
+  }
+  function ctApply() {
+    try { set_chart_kind(ctState.kind, JSON.stringify(ctState.renko)); }
+    catch (err) { console.warn("chart type apply failed", err); }
+    try { set_formed_only(!!ctState.formedOnly); }
+    catch (err) { console.warn("formed-candle apply failed", err); }
+    ctSave();
+    ctSyncUI();
+  }
+  function bootChartType() {
+    ctLoad();
+    const btn = document.getElementById("chartTypeBtn");
+    const menu = document.getElementById("chartTypeMenu");
+    if (btn && menu) {
+      btn.addEventListener("click", (e) => { e.stopPropagation(); menu.classList.toggle("hidden"); });
+      document.addEventListener("click", (e) => {
+        if (!menu.contains(e.target) && e.target !== btn) menu.classList.add("hidden");
+      });
+    }
+    document.querySelectorAll("#chartTypeMenu .ct-opt").forEach((el) => {
+      el.addEventListener("click", () => {
+        ctState.kind = el.getAttribute("data-kind") || "candles";
+        ctApply();
+        if (menu) menu.classList.add("hidden");
+      });
+    });
+    const bind = (id, ev, fn) => {
+      const el = document.getElementById(id);
+      if (el) el.addEventListener(ev, fn);
+    };
+    bind("renkoMode", "change", () => { ctState.renko.mode = document.getElementById("renkoMode").value; ctApply(); });
+    bind("renkoSource", "change", () => { ctState.renko.source = document.getElementById("renkoSource").value; ctApply(); });
+    bind("renkoWicks", "change", () => { ctState.renko.wicks = document.getElementById("renkoWicks").checked; ctApply(); });
+    bind("renkoNonRepaint", "change", () => { ctState.renko.nonRepaint = document.getElementById("renkoNonRepaint").checked; ctApply(); });
+    bind("formedOnlyToggle", "change", () => { ctState.formedOnly = document.getElementById("formedOnlyToggle").checked; ctApply(); });
+    bind("renkoBox", "input", () => {
+      const v = parseFloat(document.getElementById("renkoBox").value);
+      if (v > 0) { ctState.renko.boxSize = v; ctApply(); }
+    });
+    bind("renkoAtr", "input", () => {
+      const v = parseInt(document.getElementById("renkoAtr").value, 10);
+      if (v >= 1) { ctState.renko.atrLength = v; ctApply(); }
+    });
+    bind("renkoPct", "input", () => {
+      const v = parseFloat(document.getElementById("renkoPct").value);
+      if (v > 0) { ctState.renko.percentage = v; ctApply(); }
+    });
+    ctSyncUI();
+    ctApply();
+  }
+
+  init({ module_or_path: "./pkg/algo_web_bg.wasm?v=85" })
+    .then(() => { bootSidebar({ select_symbol, update_oc_quotes }); bootRealtime(); bootRtStats(); bootBackup(); bootAccount(); bootMarketAnalysis(); bootTargetLab(); bootEquityResearch(); startChartLines(); bootChartType(); })
+    .catch(e => {
+      document.getElementById("loading").textContent = "WASM load error: " + e;
+      console.error(e);
+    });
+</script>
+</body>
+</html>
