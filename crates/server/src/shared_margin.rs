@@ -586,6 +586,14 @@ pub async fn get() -> Json<Value> {
     Json(view(&state()))
 }
 
+/// Plain view of the current shared-margin state for the diagnostics snapshot.
+/// Unlike [`view`] this is synchronous and carries no `ok` wrapper, so it can be
+/// embedded inside a larger report.
+pub fn snapshot_json() -> Value {
+    let s = state();
+    view(&s)
+}
+
 /// Set one pool total. Body: `{ "group": "paper" | "realtime", "total": n }`
 /// plus, for the realtime pool, an optional `"source"`: `dhan` (default, live
 /// account money) or `manual` (fixed fallback). A body with only `total` (no

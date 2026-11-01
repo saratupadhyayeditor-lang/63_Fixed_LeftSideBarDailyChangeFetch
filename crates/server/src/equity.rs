@@ -64,6 +64,15 @@ pub struct Filters {
     /// Minutes between automatic scans while `auto_scan` is ON (clamped to a safe
     /// 5-minute floor so a typo cannot hammer the free data sources).
     pub auto_scan_minutes: f64,
+    /// "Auto send scanned stocks to trading engines". When ON, every scan that
+    /// finishes pushes the stocks it has NOT already sent into both equity
+    /// engines' selected-symbol list, and the armed engine buys each new name
+    /// while a free slot and shared margin remain.
+    pub auto_push: bool,
+    /// Symbols already handed to the equity engines, so a re-scan only sends
+    /// genuinely NEW names instead of re-pushing the whole screen. Persisted
+    /// with the cache so a restart does not repeat the same push.
+    pub pushed_symbols: Vec<String>,
 }
 
 impl Default for Filters {
@@ -76,6 +85,8 @@ impl Default for Filters {
             scan_all: false,
             auto_scan: false,
             auto_scan_minutes: 60.0,
+            auto_push: false,
+            pushed_symbols: Vec::new(),
         }
     }
 }
@@ -3608,6 +3619,7 @@ async fn scan(dhan: &DhanState) -> Result<(), String> {
         "note": "Replay = 3-9 month old entries re-scored on point-in-time prices with current fundamentals (lookahead) and today's liquid universe (survivorship). Indicative only, not a guarantee.",
         "updated": now_secs(),
     });
+    let (snapshot, pushed_now) = {
     let mut c = cache().lock().map_err(|_| "cache lock")?;
     c.as_of = as_of;
     c.at = now_secs();
@@ -3624,11 +3636,74 @@ async fn scan(dhan: &DhanState) -> Result<(), String> {
     } else {
         format!("Completed with {} source warning(s)", c.errors.len())
     };
+    // "Auto send scanned stocks to trading engines": every scan that brings
+    // names the engines have not already been given pushes just those NEW names,
+    // so a re-scan of the same screen sends nothing. The push is recorded in the
+    // persisted filter state so a restart neither repeats it nor loses it.
+    let mut pushed_now: Vec<String> = Vec::new();
+    if c.filters.auto_push {
+        let known: std::collections::HashSet<String> = c
+            .filters
+            .pushed_symbols
+            .iter()
+            .map(|x| x.to_uppercase())
+            .collect();
+        for row in &c.rows {
+            if pushed_now.len() >= 50 {
+                break;
+            }
+            let sym = row
+                .get("symbol")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_uppercase();
+            // A row without a price cannot be bought, so it is not a candidate.
+            let px = row
+                .get("price")
+                .and_then(|x| x.as_f64())
+                .or_else(|| row.get("lastPrice").and_then(|x| x.as_f64()))
+                .unwrap_or(0.0);
+            if sym.is_empty() || known.contains(&sym) || px <= 0.0 {
+                continue;
+            }
+            if pushed_now.iter().any(|x| x == &sym) {
+                continue;
+            }
+            pushed_now.push(sym);
+        }
+        for sym in &pushed_now {
+            c.filters.pushed_symbols.push(sym.clone());
+        }
+        // Keep the ledger bounded; it only needs to remember recent names.
+        let over = c.filters.pushed_symbols.len().saturating_sub(2_000);
+        if over > 0 {
+            c.filters.pushed_symbols.drain(0..over);
+        }
+    }
     DONE_AT.store(c.finished_at, Ordering::Relaxed);
-    let snapshot = (*c).clone();
+    let snap = (*c).clone();
     drop(c);
+    (snap, pushed_now)
+    };
     let value = serde_json::to_value(&snapshot).unwrap_or(Value::Null);
     let _ = write_json(&data_path("equity_cache.json"), &value);
+    // The cache lock MUST be released before this point: the push wakes the
+    // equity books, which take their own locks and hit the network, and holding
+    // a std MutexGuard across an await would make the scan future non-Send.
+    if !pushed_now.is_empty() {
+        let (paper, live) = crate::equity_engine::accept_pushed_symbols(&pushed_now);
+        if paper > 0 || live > 0 {
+            if let Ok(mut note) = cache().lock() {
+                note.note = format!(
+                    "{} new stock(s) auto-sent to equity engines (paper +{paper}, live +{live})",
+                    pushed_now.len()
+                );
+            }
+            // Both books consider the new names immediately.
+            crate::equity_engine::run_armed_now(&dhan).await;
+        }
+    }
     Ok(())
 }
 
@@ -3721,6 +3796,7 @@ pub async fn status(State(_st): State<DhanState>) -> Json<Value> {
         "bse": bse,
         "errors": errors,
         "filters": c.as_ref().map(|x| x.filters.clone()),
+        "pushedCount": c.as_ref().map(|x| x.filters.pushed_symbols.len()).unwrap_or(0),
         "nextRefreshAt": at + c.as_ref().map(|x| auto_scan_secs(&x.filters)).unwrap_or(SCAN_TTL_SECS),
         "autoScanSecs": c.as_ref().map(|x| auto_scan_secs(&x.filters)).unwrap_or(SCAN_TTL_SECS),
     }))
@@ -3789,6 +3865,7 @@ pub async fn cache_json() -> Json<Value> {
             "nse": c.nse,
             "bse": c.bse,
             "filters": c.filters,
+            "pushedCount": c.filters.pushed_symbols.len(),
             "note": c.note,
             "errors": c.errors,
             "backtest": c.backtest,
@@ -3812,6 +3889,7 @@ pub async fn filters_set(State(st): State<DhanState>, Json(v): Json<Value>) -> J
     let scan_all = v.get("scanAll").and_then(|x| x.as_bool());
     let auto_scan = v.get("autoScan").and_then(|x| x.as_bool());
     let auto_mins = v.get("autoScanMinutes").and_then(|x| x.as_f64());
+    let auto_push = v.get("autoPush").and_then(|x| x.as_bool());
     let mut changed = false;
     if let Some(mut c) = cache().lock().ok() {
         if let Some(on) = scan_all {
@@ -3829,6 +3907,26 @@ pub async fn filters_set(State(st): State<DhanState>, Json(v): Json<Value>) -> J
         if let Some(mins) = auto_mins {
             c.filters.auto_scan_minutes = mins.max(5.0).min(24.0 * 60.0);
         }
+        if let Some(on) = auto_push {
+            if on && !c.filters.auto_push {
+                // Switching ON must not immediately dump the ENTIRE current
+                // screen into the books. Seed the ledger with what is already
+                // known, so only genuinely NEW names are sent from here on.
+                let seed: Vec<String> = c
+                    .rows
+                    .iter()
+                    .filter_map(|row| row.get("symbol").and_then(|x| x.as_str()))
+                    .map(|s| s.trim().to_uppercase())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                for sym in seed {
+                    if !c.filters.pushed_symbols.iter().any(|x| x == &sym) {
+                        c.filters.pushed_symbols.push(sym);
+                    }
+                }
+            }
+            c.filters.auto_push = on;
+        }
         let snap = c.filters.clone();
         drop(c);
         // Patch only the filters key: writing the whole cache here could race a
@@ -3843,6 +3941,26 @@ pub async fn filters_set(State(st): State<DhanState>, Json(v): Json<Value>) -> J
             let _ = start_scan(st);
         }
         return Json(json!({"ok": true, "filters": snap, "rescan": changed, "autoScanSecs": auto_scan_secs(&snap)}));
+    }
+    Json(json!({"ok": false}))
+}
+
+/// Forget which symbols were already pushed, so the next scan re-sends the whole
+/// current screen (the operator asked for a fresh hand-over).
+pub async fn push_reset() -> Json<Value> {
+    if let Ok(mut c) = cache().lock() {
+        let n = c.filters.pushed_symbols.len();
+        c.filters.pushed_symbols.clear();
+        let path = data_path("equity_cache.json");
+        let mut doc = read_json(&path).unwrap_or_else(|| json!({}));
+        if let Some(obj) = doc.as_object_mut() {
+            obj.insert(
+                "filters".to_string(),
+                serde_json::to_value(&c.filters).unwrap_or(Value::Null),
+            );
+        }
+        let _ = write_json(&path, &doc);
+        return Json(json!({"ok": true, "cleared": n}));
     }
     Json(json!({"ok": false}))
 }
@@ -3950,6 +4068,29 @@ mod tests {
         let back: Filters = serde_json::from_value(json!({"auto_scan": true})).unwrap();
         assert!(back.auto_scan);
         assert_eq!(back.auto_scan_minutes, 60.0, "old cache file still loads");
+    }
+
+    #[test]
+    fn auto_push_defaults_off_and_keeps_a_ledger() {
+        // The push must default OFF (an upgraded install must not suddenly send
+        // its whole screen to the live book) and must round-trip its ledger.
+        let d = Filters::default();
+        assert!(!d.auto_push);
+        assert!(d.pushed_symbols.is_empty());
+
+        let back: Filters = serde_json::from_value(json!({
+            "auto_push": true,
+            "pushed_symbols": ["ITC", "BEL"]
+        }))
+        .unwrap();
+        assert!(back.auto_push);
+        assert_eq!(back.pushed_symbols, vec!["ITC".to_string(), "BEL".to_string()]);
+
+        // An older cache file without the new keys still loads, with the switch
+        // off and an empty ledger.
+        let old: Filters = serde_json::from_value(json!({"auto_scan": true})).unwrap();
+        assert!(!old.auto_push);
+        assert!(old.pushed_symbols.is_empty());
     }
 
     #[test]

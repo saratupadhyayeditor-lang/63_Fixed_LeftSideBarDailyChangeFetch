@@ -515,6 +515,60 @@ pub fn broker_owns_trail(brokers: &[String], method: &str, point_trail: f64) -> 
 // API handlers
 // ---------------------------------------------------------------------------
 
+/// Presence-only credential report for the diagnostics bundle. NEVER returns a
+/// stored value: a secret or field is reported as filled/empty only, so the
+/// operator can share the bundle safely.
+pub fn presence_json() -> Value {
+    let s = state();
+    let mut present: Vec<&str> = Vec::new();
+    let mut partial: Vec<Value> = Vec::new();
+    let mut enabled: Vec<&str> = Vec::new();
+    let mut accounts = serde_json::Map::new();
+    for b in CATALOG.iter() {
+        let Some(a) = s.accounts.get(b.id) else { continue };
+        if a.enabled {
+            enabled.push(b.id);
+        }
+        let mut counts = serde_json::Map::new();
+        let mut filled = 0usize;
+        let mut required_missing = 0usize;
+        for f in b.fields.iter() {
+            let has = a
+                .fields
+                .get(f.key)
+                .map(|v| !v.trim().is_empty())
+                .unwrap_or(false);
+            counts.insert(
+                f.key.to_string(),
+                json!({
+                    "present": has,
+                    "secret": f.secret,
+                    "required": f.required,
+                }),
+            );
+            if has {
+                filled += 1;
+            } else if f.required {
+                required_missing += 1;
+            }
+        }
+        if filled > 0 && required_missing == 0 {
+            present.push(b.id);
+        } else if filled > 0 {
+            partial.push(json!({"id": b.id, "missingRequired": required_missing}));
+        }
+        accounts.insert(b.id.to_string(), Value::Object(counts));
+    }
+    json!({
+        "secretMask": SECRET_MASK,
+        "note": "Values are never included - only present/absent.",
+        "present": present,
+        "enabled": enabled,
+        "partial": partial,
+        "accounts": Value::Object(accounts),
+    })
+}
+
 pub async fn catalog_get() -> Json<Value> {
     Json(catalog_json())
 }

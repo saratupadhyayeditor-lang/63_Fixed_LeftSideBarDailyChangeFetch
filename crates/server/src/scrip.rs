@@ -184,6 +184,22 @@ pub fn pending() -> bool {
     STATUS.load(Ordering::Relaxed) == PENDING
 }
 
+/// Warm-state label for diagnostics: "loading", "ready" or "failed". A failed
+/// master load is a silent killer for entries (no security id resolves), so the
+/// support bundle must be able to state it explicitly.
+pub fn warm_status() -> &'static str {
+    match STATUS.load(Ordering::Relaxed) {
+        PENDING => "loading",
+        READY => "ready",
+        _ => "failed",
+    }
+}
+
+/// Number of resolved contracts in the loaded master (0 while loading/failed).
+pub fn contract_count() -> usize {
+    get().map(|s| s.contract_ids().len()).unwrap_or(0)
+}
+
 pub fn strike_key(strike: f64) -> i64 {
     (strike * 100.0).round() as i64
 }

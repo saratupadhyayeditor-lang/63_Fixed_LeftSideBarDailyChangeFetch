@@ -57,6 +57,22 @@ pub struct Settings {
     pub net_tp_on: bool,
     pub net_tp_min: f64,
     pub net_tp_giveback_pct: f64,
+    /// Daily square-off: exit EVERY open position at a fixed IST time each day
+    /// so the freed margin is redeployed into the freshest, highest-probability
+    /// names the same cycle. `daily_exit_time` is IST `HH:MM` (blank = 15:20).
+    /// The exit fires once per calendar day; a new day re-arms it.
+    pub daily_exit_on: bool,
+    pub daily_exit_time: String,
+    /// Last IST day (yyyymmdd-style day count) the daily square-off ran, so it
+    /// fires exactly once per day even though the cycle ticks every 45 seconds.
+    pub daily_exit_day: i64,
+    /// Symbols handed over by Equity Research's "Auto send scanned stocks to
+    /// trading engines" switch. They are bought as soon as a slot and shared
+    /// margin are free, WITHOUT waiting for a Buy call or the confidence /
+    /// upside filters - the operator explicitly asked for these names. A name is
+    /// removed from this list once it is opened (or the list is cleared from the
+    /// UI), so an unbought name keeps retrying while the book is full.
+    pub auto_push_symbols: Vec<String>,
 }
 
 impl Default for Settings {
@@ -80,6 +96,10 @@ impl Default for Settings {
             net_tp_on: false,
             net_tp_min: 0.0,
             net_tp_giveback_pct: 25.0,
+            daily_exit_on: false,
+            daily_exit_time: "15:20".to_string(),
+            daily_exit_day: 0,
+            auto_push_symbols: Vec::new(),
         }
     }
 }
@@ -189,6 +209,47 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 fn ymd(days: i64) -> String {
     let (y, m, d) = civil_from_days(days);
     format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// Parse an IST `HH:MM` clock string into minutes past midnight.
+fn parse_hhmm(s: &str) -> Option<i64> {
+    let (h, m) = s.trim().split_once(':')?;
+    let h: i64 = h.trim().parse().ok()?;
+    let m: i64 = m.trim().parse().ok()?;
+    if !(0..=23).contains(&h) || !(0..=59).contains(&m) {
+        return None;
+    }
+    Some(h * 60 + m)
+}
+
+/// IST minute-of-day, or `None` on a weekend (Mon-Fri only).
+fn ist_weekday_minutes(now: i64) -> Option<i64> {
+    let ist = now + 19_800;
+    let weekday = (ist.div_euclid(86_400) + 4).rem_euclid(7);
+    if weekday == 0 || weekday == 6 {
+        return None;
+    }
+    Some(ist.rem_euclid(86_400) / 60)
+}
+
+/// Should the daily square-off fire right now? It is due once per IST day,
+/// after the configured clock time, and only while the NSE session is open so
+/// the broker will actually accept the sell orders. Kept pure for tests.
+fn daily_exit_due(now: i64, time: &str, last_day: i64, session_open: bool) -> bool {
+    if !session_open {
+        return false;
+    }
+    let Some(target) = parse_hhmm(time) else {
+        return false;
+    };
+    let Some(now_mins) = ist_weekday_minutes(now) else {
+        return false;
+    };
+    now_mins >= target && today_ist_at(now) != last_day
+}
+
+fn today_ist_at(now: i64) -> i64 {
+    (now + 19_800) / 86_400
 }
 
 fn data_path(mode: &str) -> PathBuf {
@@ -510,6 +571,7 @@ fn view(mode: &str) -> Value {
         "log": st.log.iter().rev().take(80).collect::<Vec<_>>(),
         "lastRun": st.last_run,
         "lastError": st.last_error,
+        "autoPushPending": st.settings.auto_push_symbols.len(),
     })
 }
 
@@ -580,6 +642,10 @@ pub struct SettingsReq {
     pub net_tp_on: Option<bool>,
     pub net_tp_min: Option<f64>,
     pub net_tp_giveback_pct: Option<f64>,
+    pub daily_exit_on: Option<bool>,
+    pub daily_exit_time: Option<String>,
+    /// `true` empties the auto-push pending list (UI "Clear" button).
+    pub clear_auto_push: Option<bool>,
 }
 
 pub async fn settings(Json(req): Json<SettingsReq>) -> Json<Value> {
@@ -647,6 +713,23 @@ pub async fn settings(Json(req): Json<SettingsReq>) -> Json<Value> {
     }
     if let Some(v) = req.net_tp_giveback_pct {
         s.settings.net_tp_giveback_pct = v.clamp(0.0, 99.0);
+    }
+    if let Some(v) = req.daily_exit_on {
+        s.settings.daily_exit_on = v;
+        // Re-arm on every toggle so switching the feature on fires today.
+        if v {
+            s.settings.daily_exit_day = 0;
+        }
+    }
+    if let Some(t) = req.daily_exit_time {
+        if let Some(mins) = parse_hhmm(&t) {
+            s.settings.daily_exit_time = format!("{:02}:{:02}", mins / 60, mins % 60);
+            // A time change must be able to run again the same day.
+            s.settings.daily_exit_day = 0;
+        }
+    }
+    if let Some(true) = req.clear_auto_push {
+        s.settings.auto_push_symbols.clear();
     }
     // Only journal a real change: the UI autosaves on every field edit, so an
     // unconditional log line would flood the 300-entry activity log.
@@ -926,7 +1009,7 @@ async fn enter_one(
     manual: bool,
     qty_override: Option<i64>,
 ) -> Result<String, String> {
-    let (symbol, name, exch, status, conf, target, stop, row_px, settings, open, slots, remaining, capital) = {
+    let (symbol, name, exch, status, conf, target, stop, row_px, settings, open, slots, remaining, capital, pushed) = {
         let s = guard(mode);
         let symbol = row.get("symbol").and_then(|x| x.as_str()).unwrap_or("").to_string();
         if symbol.is_empty() {
@@ -938,22 +1021,16 @@ async fn enter_one(
         if manual && s.trades.iter().any(|t| t.is_open() && t.symbol == symbol) {
             return Err("already in an open position".into());
         }
-        if !manual {
-            if let Some(last) = s
-                .trades
-                .iter()
-                .filter(|t| t.symbol == symbol)
-                .max_by_key(|t| t.exited_at)
+        // A name pushed by Equity Research is an explicit operator instruction:
+        // it skips the watch list and the research-call filters, and only needs a
+        // free slot + shared margin.
+        let pushed = !manual && s.settings.auto_push_symbols.iter().any(|w| w == &symbol);
+        if !manual && !pushed {
+            if !s.settings.watch_symbols.is_empty()
+                && !s.settings.watch_symbols.iter().any(|w| w == &symbol)
             {
-                if !last.is_open() && now_secs() - last.exited_at < 15 * 86_400 && status_str(row) != "Strong Buy" {
-                    return Err("recently exited - cooling off".into());
-                }
+                return Err("not in the selected-symbols list".into());
             }
-        }
-        if !manual && !s.settings.watch_symbols.is_empty()
-            && !s.settings.watch_symbols.iter().any(|w| w == &symbol)
-        {
-            return Err("not in the selected-symbols list".into());
         }
         let (status, conf, target, stop, px) = if manual {
             let call = call_of(row);
@@ -962,6 +1039,24 @@ async fn enter_one(
                 .and_then(|x| x.as_str())
                 .filter(|x| !x.is_empty())
                 .unwrap_or("Manual")
+                .to_string();
+            (
+                status,
+                num(call.get("confidence")),
+                num(call.get("targetPrice")),
+                num(call.get("stopPrice")),
+                row_price(row),
+            )
+        } else if pushed {
+            // Rank/pricing still come from the row; only the entry filters are
+            // waived. A row without a call uses "Auto (sent by Equity Research)"
+            // as the status so the book shows why it was bought.
+            let call = call_of(row);
+            let status = call
+                .get("status")
+                .and_then(|x| x.as_str())
+                .filter(|x| !x.is_empty())
+                .unwrap_or("Auto (Equity Research)")
                 .to_string();
             (
                 status,
@@ -983,7 +1078,7 @@ async fn enter_one(
         let remaining = (capital - invested).max(0.0);
         let name = row.get("name").and_then(|x| x.as_str()).unwrap_or("").to_string();
         let exch = row.get("exchange").and_then(|x| x.as_str()).unwrap_or("NSE").to_string();
-        (symbol, name, exch, status, conf, target, stop, px, s.settings.clone(), open, slots, remaining, capital)
+        (symbol, name, exch, status, conf, target, stop, px, s.settings.clone(), open, slots, remaining, capital, pushed)
     };
     if manual {
         if open >= settings.max_positions {
@@ -1017,8 +1112,9 @@ async fn enter_one(
         return Err("allocation too small for one share".into());
     }
     // Automatic entries must not pick a name whose target profit is smaller than
-    // its own broker charges; a manual override is the operator's call.
-    if !manual {
+    // its own broker charges; a manual override - or an explicit push from
+    // Equity Research - is the operator's call.
+    if !manual && !pushed {
         let guard_target = if target > px { target } else { round2(px * 1.18) };
         charges_leave_room(px, guard_target, qty, settings.charges_aware)?;
     }
@@ -1105,8 +1201,23 @@ async fn enter_one(
     Ok(msg)
 }
 
-fn status_str(row: &Value) -> &str {
-    call_of(row).get("status").and_then(|x| x.as_str()).unwrap_or("")
+
+/// Should this row become an entry candidate, and with what confidence?
+///
+/// Auto-pushed names are bought on slot + margin alone: they skip the Buy call,
+/// confidence / upside / price-band gates and the watch list, because the
+/// operator explicitly asked Equity Research to send them. Everything else still
+/// has to pass the normal entry rules. Kept pure so both behaviours are
+/// unit-tested without a running engine.
+fn candidate_confidence(sym: &str, row: &Value, settings: &Settings) -> Option<f64> {
+    let pushed = settings.auto_push_symbols.iter().any(|w| w == sym);
+    if pushed {
+        return Some(num(call_of(row).get("confidence")));
+    }
+    if !settings.watch_symbols.is_empty() && !settings.watch_symbols.iter().any(|w| w == sym) {
+        return None;
+    }
+    tradable(row, settings).map(|(_, conf, _, _, _)| conf)
 }
 
 async fn run_cycle(st: &DhanState, mode: &str) {
@@ -1239,6 +1350,18 @@ async fn run_cycle_inner(st: &DhanState, mode: &str) {
         s.trades.iter().filter(|t| t.is_open()).cloned().collect()
     };
     let settings = guard(mode).settings.clone();
+    // Daily square-off: sell every position that was NOT opened today (CNC
+    // delivery shares are not sellable on the buy date), leaving the freed
+    // margin to the buy loop further down this same cycle. It fires once per
+    // IST day, only inside the cash session, so a failed/blocked sell retries
+    // on the next 45-second tick instead of being silently skipped.
+    let daily_due = daily_exit_due(
+        now_secs(),
+        &settings.daily_exit_time,
+        settings.daily_exit_day,
+        matches!(ist_weekday_minutes(now_secs()), Some(m) if (9 * 60 + 15..=15 * 60 + 30).contains(&m)),
+    );
+    let today = ymd(today_ist());
     for t in open_now {
         let px = price_of(&t.symbol);
         if px <= 0.0 {
@@ -1263,7 +1386,9 @@ async fn run_cycle_inner(st: &DhanState, mode: &str) {
                 .map(|floor| net_now < floor)
                 .unwrap_or(false);
         let hit_trail = t.trail_stop > 0.0 && px <= t.trail_stop;
-        let reason = if px <= t.stop {
+        let reason = if daily_due && t.opened_date != today {
+            Some("Daily square-off (scheduled)")
+        } else if px <= t.stop {
             Some("Stop loss hit")
         } else if px >= t.target {
             Some("Target achieved")
@@ -1288,21 +1413,48 @@ async fn run_cycle_inner(st: &DhanState, mode: &str) {
         }
     }
 
+    // Mark the day done only once every sellable position is actually closed.
+    // A position whose sell failed (or has no price) keeps the day unmarked, so
+    // the next tick retries instead of leaving a stale holding overnight.
+    if daily_due {
+        let mut s = guard(mode);
+        let left = s.trades.iter().filter(|t| t.is_open() && t.opened_date != today).count();
+        if left == 0 {
+            s.settings.daily_exit_day = today_ist();
+            log(&mut s, format!("Daily square-off complete for {today}."));
+            save(mode, &s);
+        }
+    }
+
+    // Names sold by TODAY's daily square-off are excluded for the rest of the
+    // day: rebuying them minutes later would just pay the delivery + DP charges
+    // twice for the same holding. They are fully eligible again tomorrow, so a
+    // good stock genuinely can be bought, sold and re-bought over the days.
+    let sold_today: HashSet<String> = {
+        let s = guard(mode);
+        s.trades
+            .iter()
+            .filter(|t| {
+                !t.is_open()
+                    && t.exit_date == today
+                    && t.exit_reason.starts_with("Daily square-off")
+            })
+            .map(|t| t.symbol.clone())
+            .collect()
+    };
+
     let mut candidates: Vec<(f64, f64, String, Value)> = row_map
         .iter()
         .filter_map(|(sym, row)| {
-            if !settings.watch_symbols.is_empty()
-                && !settings.watch_symbols.iter().any(|w| w == sym)
-            {
+            if sold_today.contains(sym) {
                 return None;
             }
-            tradable(row, &settings).map(|(_, conf, _, _, _)| {
-                // Rank by EXPECTED RETURN (upside to target) first, so the engine
-                // always buys the highest-possible-return names before the rest;
-                // buy-confidence breaks ties.
-                let ret = equity::row_expected_return(row);
-                (ret, conf, sym.clone(), row.clone())
-            })
+            let conf = candidate_confidence(sym, row, &settings)?;
+            // Rank by EXPECTED RETURN (upside to target) first, so the engine
+            // always buys the highest-possible-return names before the rest;
+            // buy-confidence breaks ties.
+            let ret = equity::row_expected_return(row);
+            Some((ret, conf, sym.clone(), row.clone()))
         })
         .collect();
     order_candidates(&mut candidates);
@@ -1339,8 +1491,17 @@ async fn run_cycle_inner(st: &DhanState, mode: &str) {
         if !guard(mode).enabled {
             break;
         }
+        let was_pushed = guard(mode).settings.auto_push_symbols.iter().any(|w| w == &sym);
         match enter_one(st, mode, &row, as_of.as_str(), false, None).await {
-            Ok(_) => {}
+            Ok(_) => {
+                if was_pushed {
+                    // Bought: stop retrying this name. Anything not bought (no
+                    // slot / no margin this cycle) stays pending on purpose.
+                    let mut s = guard(mode);
+                    s.settings.auto_push_symbols.retain(|w| w != &sym);
+                    save(mode, &s);
+                }
+            }
             Err(_) => {}
         }
     }
@@ -1349,6 +1510,112 @@ async fn run_cycle_inner(st: &DhanState, mode: &str) {
         let mut s = guard(mode);
         s.last_run = now_secs();
         save(mode, &s);
+    }
+}
+
+/// Maximum number of names a book keeps queued for auto-buy. Bounds both the
+/// state file and the number of orders a single cycle can attempt.
+const PENDING_CAP: usize = 200;
+
+/// Append the incoming names that are not already pending, preserving order and
+/// never exceeding `cap`. Pure so the dedupe / cap behaviour is unit-tested.
+fn merge_pending(existing: &[String], incoming: &[String], cap: usize) -> Vec<String> {
+    let mut out: Vec<String> = existing.to_vec();
+    for sym in incoming {
+        if out.len() >= cap {
+            break;
+        }
+        if !out.iter().any(|x| x == sym) {
+            out.push(sym.clone());
+        }
+    }
+    out
+}
+
+/// Hand freshly scanned symbols to BOTH equity books.
+///
+/// Returns `(added_paper, added_live)`: only names that were not already
+/// pending are appended, so a re-scan of the same screen adds nothing. The list
+/// is persisted with the engine state, so a server restart keeps the pending
+/// push instead of silently dropping it.
+pub fn accept_pushed_symbols(symbols: &[String]) -> (usize, usize) {
+    let clean: Vec<String> = {
+        let mut seen = HashSet::new();
+        symbols
+            .iter()
+            .map(|x| x.trim().to_uppercase())
+            .filter(|x| !x.is_empty() && seen.insert(x.clone()))
+            .collect()
+    };
+    if clean.is_empty() {
+        return (0, 0);
+    }
+    let mut out = (0, 0);
+    for (i, mode) in MODES.iter().enumerate() {
+        let mut s = guard(mode);
+        let merged = merge_pending(&s.settings.auto_push_symbols, &clean, PENDING_CAP);
+        let added = merged.len().saturating_sub(s.settings.auto_push_symbols.len());
+        s.settings.auto_push_symbols = merged;
+        if added > 0 {
+            log(
+                &mut s,
+                format!(
+                    "Equity Research ne {added} naya stock bheja (auto send) - slot + margin mile to buy hoga."
+                ),
+            );
+            save(mode, &s);
+        }
+        if i == 0 {
+            out.0 = added;
+        } else {
+            out.1 = added;
+        }
+    }
+    out
+}
+
+/// Compact per-mode equity state for the diagnostics snapshot: whether the book
+/// is armed, how many positions are open, how many pushed names are still
+/// waiting, and the daily square-off configuration. Read-only.
+pub fn diagnostic_block(mode: &str) -> Value {
+    let Some(mode) = esc_mode(mode) else {
+        return json!({"error": "unknown engine"});
+    };
+    let s = guard(mode);
+    let open = s.trades.iter().filter(|t| t.is_open()).count();
+    let invested: f64 = s.trades.iter().filter(|t| t.is_open()).map(|t| t.invested).sum();
+    let empty_rows = s.settings.auto_push_symbols.len();
+    json!({
+        "mode": mode,
+        "enabled": s.enabled,
+        "openPositions": open,
+        "closedTrades": s.trades.len().saturating_sub(open),
+        "invested": round2(invested),
+        "capital": round2(s.settings.capital),
+        "effectiveCapital": round2(engine_capital(mode, s.settings.capital)),
+        "autoBuy": s.settings.auto_buy,
+        "autoPush": !s.settings.auto_push_symbols.is_empty(),
+        "pendingPush": empty_rows,
+        "dailyExitOn": s.settings.daily_exit_on,
+        "dailyExitTime": s.settings.daily_exit_time,
+        "dailyExitDay": s.settings.daily_exit_day,
+        "lastRun": s.last_run,
+        "lastError": s.last_error,
+    })
+}
+
+/// Count of symbols still waiting for a free slot / margin, for the UI badge.
+pub fn pending_push_count(mode: &str) -> usize {
+    guard(mode).settings.auto_push_symbols.len()
+}
+
+/// Run one buy cycle right now for every armed engine (used after a push so the
+/// new names are considered immediately instead of waiting for the 45s tick).
+pub async fn run_armed_now(st: &DhanState) {
+    for mode in MODES {
+        if guard(mode).enabled {
+            run_cycle(st, mode).await;
+        }
     }
 }
 
@@ -1383,6 +1650,125 @@ mod tests {
         assert_eq!(candidate_step(false, 3, 999.0), CandidateStep::Stop);
         // Free slot + margin enters.
         assert_eq!(candidate_step(false, 3, 1_000.0), CandidateStep::Go);
+    }
+
+    fn push_row(status: &str, conf: f64) -> Value {
+        json!({
+            "symbol": "NEWCO",
+            "price": 100.0,
+            "call": { "status": status, "confidence": conf, "upsidePct": 2.0, "targetPrice": 102.0, "stopPrice": 95.0 }
+        })
+    }
+
+    #[test]
+    fn a_pushed_symbol_skips_the_buy_call_and_confidence_gates() {
+        // This is the whole point of the feature: a name Equity Research sent is
+        // bought on slot + margin alone. With the normal rules an "Avoid" call at
+        // 5% confidence and only 2% upside would be rejected three ways.
+        let mut s = Settings::default();
+        s.min_confidence = 70.0;
+        s.min_upside_pct = 12.0;
+        let row = push_row("Avoid", 5.0);
+        assert_eq!(candidate_confidence("NEWCO", &row, &s), None, "normal gate rejects it");
+
+        s.auto_push_symbols = vec!["NEWCO".into()];
+        assert!(
+            candidate_confidence("NEWCO", &row, &s).is_some(),
+            "a pushed name must be a candidate regardless of the call"
+        );
+    }
+
+    #[test]
+    fn a_pushed_symbol_skips_the_watch_list() {
+        // "Only these symbols" must not silently drop an explicitly pushed name.
+        let mut s = Settings::default();
+        s.watch_symbols = vec!["ITC".into()];
+        let row = push_row("Strong Buy", 90.0);
+        assert_eq!(candidate_confidence("NEWCO", &row, &s), None);
+        s.auto_push_symbols = vec!["NEWCO".into()];
+        assert!(candidate_confidence("NEWCO", &row, &s).is_some());
+    }
+
+    #[test]
+    fn a_symbol_that_is_not_pushed_still_needs_a_good_call() {
+        // The bypass must be scoped to the pushed name only; every other row
+        // keeps the normal rules.
+        let s = Settings::default();
+        let row = push_row("Avoid", 99.0);
+        assert_eq!(candidate_confidence("OTHER", &row, &s), None);
+    }
+
+    #[test]
+    fn pending_merge_dedupes_and_caps() {
+        let existing = vec!["ITC".to_string()];
+        // A re-scan that repeats a pending name must not queue it twice.
+        let out = merge_pending(&existing, &["ITC".into(), "BEL".into()], 10);
+        assert_eq!(out, vec!["ITC".to_string(), "BEL".to_string()]);
+
+        // Duplicates INSIDE one push are collapsed too.
+        let out = merge_pending(&[], &["BEL".into(), "BEL".into()], 10);
+        assert_eq!(out, vec!["BEL".to_string()]);
+
+        // The cap bounds the queue: pending names are kept, extras are dropped.
+        let out = merge_pending(&["A".into(), "B".into()], &["C".into(), "D".into()], 3);
+        assert_eq!(out, vec!["A".to_string(), "B".to_string(), "C".to_string()]);
+    }
+
+    #[test]
+    fn auto_push_symbols_default_empty_and_round_trip() {
+        // Pending pushes are durable: a restart must keep the names the operator
+        // already handed over, and a fresh install must start with none.
+        assert!(Settings::default().auto_push_symbols.is_empty());
+        let s: Settings = serde_json::from_value(json!({
+            "autoPushSymbols": ["ITC", "BEL"]
+        }))
+        .unwrap();
+        assert_eq!(s.auto_push_symbols, vec!["ITC".to_string(), "BEL".to_string()]);
+    }
+
+    #[test]
+    fn daily_square_off_fires_once_after_the_set_time() {
+        // Mon 2026-11-02, IST midnight, as epoch seconds.
+        let at = |h: i64, m: i64| 1_793_557_800i64 + h * 3_600 + m * 60;
+        // Before the clock: not due.
+        assert!(!daily_exit_due(at(15, 19), "15:20", 0, true));
+        // At/after the clock, first time today: due.
+        assert!(daily_exit_due(at(15, 20), "15:20", 0, true));
+        assert!(daily_exit_due(at(15, 29), "15:20", 0, true));
+        // Already ran today: never twice.
+        let ran = today_ist_at(at(15, 20));
+        assert!(!daily_exit_due(at(15, 25), "15:20", ran, true));
+        // Next day at the same clock: due again.
+        assert!(daily_exit_due(at(24, 0) + 15 * 3_600 + 20 * 60, "15:20", ran, true));
+        // Market shut: nothing is sold.
+        assert!(!daily_exit_due(at(15, 20), "15:20", 0, false));
+        // Weekend never fires.
+        assert!(!daily_exit_due(at(15, 20) + 5 * 86_400, "15:20", 0, true));
+        // Bad clock string never arms.
+        assert!(!daily_exit_due(at(15, 20), "abc", 0, true));
+    }
+
+    #[test]
+    fn daily_square_off_defaults_off_and_parses_hhmm() {
+        let s = Settings::default();
+        assert!(!s.daily_exit_on);
+        assert_eq!(s.daily_exit_time, "15:20");
+        assert_eq!(parse_hhmm("15:20"), Some(15 * 60 + 20));
+        assert_eq!(parse_hhmm("9:05"), Some(9 * 60 + 5));
+        assert_eq!(parse_hhmm("24:00"), None);
+        assert_eq!(parse_hhmm("hello"), None);
+        assert_eq!(parse_hhmm(""), None);
+    }
+
+    #[test]
+    fn daily_square_off_settings_round_trip() {
+        let s: Settings = serde_json::from_value(json!({
+            "dailyExitOn": true,
+            "dailyExitTime": "14:55"
+        }))
+        .unwrap();
+        assert!(s.daily_exit_on);
+        assert_eq!(s.daily_exit_time, "14:55");
     }
 
     #[test]

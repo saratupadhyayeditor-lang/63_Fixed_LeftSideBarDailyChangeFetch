@@ -23,6 +23,7 @@ mod backup;
 mod brain;
 mod broker;
 mod brokers;
+mod diagnostics;
 mod equity;
 mod equity_engine;
 mod instruments;
@@ -227,6 +228,24 @@ async fn main() {
     let paper_rt = RealtimeState::new_paper(dhan.clone()).with_template_pool(template_pool.clone());
     let paper2_rt = RealtimeState::new_paper2(dhan.clone()).with_template_pool(template_pool.clone());
     let paper3_rt = RealtimeState::new_paper3(dhan.clone()).with_template_pool(template_pool);
+    // Startup self-check + the auto-capture driver. Both only READ state and
+    // write local files, so they can never interfere with trading. The capture
+    // task is what makes a bug on an installed Windows machine debuggable: the
+    // frozen moment (blockers + margin + feed + log tail) is written to disk by
+    // the app itself, without the operator having to press anything.
+    diagnostics::startup_self_check(&dhan, &rt);
+    {
+        let dhan = dhan.clone();
+        let rt = rt.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(90)).await;
+            loop {
+                diagnostics::maybe_auto_capture(&dhan, &rt).await;
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            }
+        });
+    }
+
     let state = AppState { dhan, rt };
 
     let app = Router::new()
@@ -266,6 +285,7 @@ async fn main() {
         .route("/api/equity/cache", get(equity::cache_json))
         .route("/api/equity/refresh", post(equity::refresh))
         .route("/api/equity/filters", post(equity::filters_set))
+        .route("/api/equity/push-reset", post(equity::push_reset))
         .route("/api/equity/stock", get(equity::stock))
         .route("/api/equity/engines", get(equity_engine::engines))
         .route("/api/equity/engines/trades", get(equity_engine::trades))
@@ -287,6 +307,11 @@ async fn main() {
         .route("/api/backup/list", get(backup::list))
         .route("/api/backup/read", get(backup::read))
         .route("/api/backup/import", post(backup::import))
+        .route("/api/diagnostics/snapshot", get(diagnostics::get))
+        .route("/api/diagnostics/capture", post(diagnostics::capture))
+        .route("/api/diagnostics/captures", get(diagnostics::captures))
+        .route("/api/diagnostics/bundle", get(diagnostics::bundle))
+        .route("/api/diagnostics/bundle-file", post(diagnostics::bundle_file))
         .merge(realtime::router::<AppState>())
         .with_state(state)
         .merge(realtime::realtime2_router().with_state(realtime2_rt))

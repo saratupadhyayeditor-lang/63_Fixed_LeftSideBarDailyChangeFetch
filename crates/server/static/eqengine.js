@@ -68,6 +68,7 @@ export function bootEqEngine() {
   $("sDist").addEventListener("change", applyDistributeState);
   $("sTrailOn").addEventListener("change", applyTrailState);
   $("sNetTpOn").addEventListener("change", applyTrailState);
+  $("sDailyExitOn").addEventListener("change", applyDailyExitState);
   $("eqOpen").addEventListener("click", (e) => {
     const btn = e.target.closest("button[data-exit]");
     if (!btn) return;
@@ -98,6 +99,7 @@ export function bootEqEngine() {
   $("eqAutoBuy").addEventListener("click", toggleAutoBuy);
   if ($("eqResetPnl")) $("eqResetPnl").addEventListener("click", () => resetPnl());
   if ($("eqClearBook")) $("eqClearBook").addEventListener("click", () => clearBook());
+  if ($("sPushClear")) $("sPushClear").addEventListener("click", () => clearAutoPush());
   $("eqMore").addEventListener("click", () => {
     S.callsLimit += 60;
     S.callsSig = "";
@@ -199,6 +201,16 @@ function applyDistributeState() {
   }
 }
 
+function applyDailyExitState() {
+  const el = $("sDailyExitTime");
+  if (!el) return;
+  const on = $("sDailyExitOn").checked;
+  el.disabled = !on;
+  el.title = on
+    ? "Har din is IST time par saare open positions square off honge (us din khareede gaye chhod kar)."
+    : "Daily square-off OFF";
+}
+
 function applyTrailState() {
   const tOn = $("sTrailOn").checked;
   const tpOn = $("sNetTpOn").checked;
@@ -265,11 +277,16 @@ function render(v) {
   setChk("sCharges", s.chargesAware !== false);
   setVal("sQty", s.fixedQty ?? 0);
   setVal("sWatch", (s.watchSymbols || []).join(", "));
+  const pushN = document.getElementById("sPushN");
+  if (pushN) pushN.textContent = String(Number(v.autoPushPending) || 0);
   setChk("sTrailOn", !!s.trailSlOn);
   setVal("sTrailPct", s.trailSlPct ?? 25);
   setChk("sNetTpOn", !!s.netTpOn);
   setVal("sNetTpMin", s.netTpMin ?? 0);
   setVal("sNetTpGb", s.netTpGivebackPct ?? 25);
+  setChk("sDailyExitOn", !!s.dailyExitOn);
+  setVal("sDailyExitTime", s.dailyExitTime || "15:20");
+  applyDailyExitState();
   applyDistributeState();
   applyTrailState();
   paintAutoBuy(v);
@@ -535,6 +552,8 @@ const SETTING_FIELDS = {
   sNetTpOn: () => ({ netTpOn: $("sNetTpOn").checked }),
   sNetTpMin: () => ({ netTpMin: Number($("sNetTpMin").value) || 0 }),
   sNetTpGb: () => ({ netTpGivebackPct: Number($("sNetTpGb").value) || 0 }),
+  sDailyExitOn: () => ({ dailyExitOn: $("sDailyExitOn").checked }),
+  sDailyExitTime: () => ({ dailyExitTime: String($("sDailyExitTime").value || "15:20") }),
   sWatch: () => ({
     watchSymbols: String($("sWatch").value || "")
       .split(/[,\s;]+/)
@@ -542,6 +561,22 @@ const SETTING_FIELDS = {
       .filter(Boolean),
   }),
 };
+
+// Empty the auto-push waiting list for THIS engine: names Equity Research sent
+// that are still waiting for a slot / margin will no longer be auto-bought.
+async function clearAutoPush() {
+  try {
+    const r = await api(API + "/settings", {
+      method: "POST",
+      body: JSON.stringify({ mode: MODE, clearAutoPush: true }),
+    });
+    if (r.error) throw new Error(r.error);
+    if (r.engine) paint(r.engine);
+  } catch (e) {
+    const el = $("eqError");
+    if (el) el.textContent = String(e.message || e);
+  }
+}
 
 async function saveSettings(full) {
   const body = { mode: MODE };

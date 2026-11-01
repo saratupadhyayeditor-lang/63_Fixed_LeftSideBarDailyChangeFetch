@@ -626,6 +626,20 @@ impl DhanState {
     /// close backfill and the trading engine use, so cached / REST / historical
     /// values can never be acted on while the live feed is silent, closed or
     /// disconnected.
+    /// Compact feed health for the diagnostics snapshot. Includes the parked /
+    /// rate-limited flags so "the feed is down" can be told apart from "the app
+    /// put the feed to sleep itself after repeated failures".
+    pub fn feed_diagnostic(&self) -> Value {
+        let base = self.health.lock().map(|g| g.snapshot()).unwrap_or(Value::Null);
+        let mut out = base;
+        if let Some(o) = out.as_object_mut() {
+            o.insert("feedLive".into(), json!(self.feed_live()));
+            o.insert("parkedSec".into(), json!(self.current_park_secs()));
+            o.insert("rateLimited".into(), json!(self.rate_limited()));
+        }
+        out
+    }
+
     pub fn feed_live(&self) -> bool {
         let Ok(g) = self.health.lock() else {
             return false;

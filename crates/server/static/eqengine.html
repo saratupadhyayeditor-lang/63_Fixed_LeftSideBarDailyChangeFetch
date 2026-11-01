@@ -33,6 +33,10 @@
     <div class="eq-field"><label>Max holding days</label><input type="number" id="sDays" min="1" max="1000" step="1"></div>
     <div class="eq-field"><label>Quantity (0 = auto)</label><input type="number" id="sQty" min="0" step="1"></div>
     <div class="eq-field"><label>Only these symbols (comma, blank = all)</label><input type="text" id="sWatch" style="width:250px" placeholder="e.g. ITC, TCS, BEL"></div>
+    <div class="eq-field" title="Equity Research ke 'Auto send scanned stocks' se aaye hue symbols jo abhi slot ya shared margin ka wait kar rahe hain. Buy hote hi list se hat jaate hain.">
+      <label>Auto-sent waiting (<span id="sPushN">0</span>)</label>
+      <button class="eq-btn small" id="sPushClear" title="Waiting list clear karo - inme se koi bhi auto-buy nahi hoga.">Clear</button>
+    </div>
     <label class="eq-check"><input type="checkbox" id="sAuto"> Auto exit on target / stop / Avoid</label>
     <label class="eq-check"><input type="checkbox" id="sAcc"> Also enter Accumulate calls</label>
     <label class="eq-check" title="Bacha hua shared margin bache hue free slots me barabar baant kar har buy ki qty nikalta hai - is tarah poora margin deploy ho jaata hai. ON hone par Per trade % aur Quantity ignore hote hain."><input type="checkbox" id="sDist"> Auto-distribute margin across slots</label>
@@ -51,6 +55,11 @@
       <input type="number" id="sNetTpGb" min="0" max="99" step="1" placeholder="25">
     </div>
     <label class="eq-check" title="Net profit (delivery charges ke baad) ka peak track karke, peak se give-back % girawat par position exit kar dega."><input type="checkbox" id="sNetTpOn"> Net Take-Profit (give-back)</label>
+    <label class="eq-check" title="ON hone par har din diye gaye time par SAARE open positions square off ho jaayenge (jo us din khareede gaye hain wo chhod kar - CNC delivery same day sellable nahi hoti). Exit hote hi margin free hoga aur engine usi cycle me sabse zyada expected-return wale stocks kharid lega. Purane stocks dobara buy ho sakte hain."><input type="checkbox" id="sDailyExitOn"> Daily square-off all positions</label>
+    <div class="eq-field" title="IST time (HH:MM). Is time ke baad pehle hi cycle me square-off chalega - din me sirf ek baar. NSE session 09:15-15:30 ke andar rakhein.">
+      <label>Daily exit time (IST)</label>
+      <input type="time" id="sDailyExitTime" step="60" value="15:20">
+    </div>
     <button class="eq-btn" id="eqSave">Save settings</button>
     <button class="eq-btn" id="eqRefresh">Refresh</button>
   </div>
@@ -90,7 +99,7 @@
   <div class="eq-log" id="eqLog"><div class="dim">Waiting for the engine...</div></div>
 </div>
 <script type="module">
-  import { bootEqEngine } from "./eqengine.js?v=15";
+  import { bootEqEngine } from "./eqengine.js?v=17";
   bootEqEngine();
 </script>
 </body>

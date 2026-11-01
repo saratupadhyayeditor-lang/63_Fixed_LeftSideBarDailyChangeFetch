@@ -165,6 +165,24 @@ body.light #rtEquityResearch{--er-line:#d6dfea;--er-soft:#f2f6fb;--er-dim:#5c6b8
 #rtEquityResearch .er-log th{position:static;background:transparent;border-bottom:1px solid var(--er-line);padding:4px 6px}
 #rtEquityResearch .er-log td{padding:4px 6px;border-bottom:1px solid var(--er-line)}
 #rtEquityResearch .er-log tr{cursor:default}
+#rtEquityResearch .er-push{border:1px solid var(--er-line);background:var(--er-soft);border-radius:8px;
+  padding:8px 10px;margin:0 0 10px;transition:border-color .3s ease,background .3s ease,box-shadow .3s ease}
+#rtEquityResearch .er-push.on{border-color:var(--er-up);background:rgba(47,208,138,.07);box-shadow:0 0 0 1px rgba(47,208,138,.18) inset}
+#rtEquityResearch .er-push.busy{border-color:var(--er-warn)}
+#rtEquityResearch .er-push-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+#rtEquityResearch .er-push-info{flex:1;min-width:200px}
+#rtEquityResearch .er-push-info b{display:block;font-size:12px}
+#rtEquityResearch .er-push-info span{display:block;color:var(--er-dim);font-size:10px;margin-top:2px;line-height:1.45}
+#rtEquityResearch .er-push-meta{display:flex;gap:10px;flex-wrap:wrap}
+#rtEquityResearch .er-push-meta i{font-style:normal;display:block;font-size:12px;font-weight:700}
+#rtEquityResearch .er-push-meta em{font-style:normal;display:block;color:var(--er-dim);font-size:9px;text-transform:uppercase;letter-spacing:.3px}
+#rtEquityResearch .er-push-note{font-size:10px;color:var(--er-dim);margin-top:6px;line-height:1.5;
+  max-height:0;opacity:0;overflow:hidden;transition:max-height .35s ease,opacity .35s ease,margin-top .35s ease}
+#rtEquityResearch .er-push.on .er-push-note{max-height:120px;opacity:1}
+#rtEquityResearch .er-push-badge{font-size:10px;font-weight:700;padding:1px 8px;border-radius:10px;border:1px solid var(--er-line);color:var(--er-dim)}
+#rtEquityResearch .er-push.on .er-push-badge{border-color:var(--er-up);color:var(--er-up)}
+#rtEquityResearch .er-push.fade-in{animation:erPushIn .45s ease both}
+@keyframes erPushIn{from{opacity:0;transform:translateY(-6px)}to{opacity:1;transform:none}}
 #rtEquityResearch .er-engines{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:0 0 10px}
 @media (max-width:900px){#rtEquityResearch .er-engines{grid-template-columns:1fr}}
 #rtEquityResearch .er-eng{border:1px solid var(--er-line);background:var(--er-soft);border-radius:8px;
@@ -205,6 +223,25 @@ function shell() {
   </div>
   <div class="er-progress"><i id="erBar"></i></div>
   <div class="er-cards" id="erCards"></div>
+  <div class="er-push" id="erPush">
+    <div class="er-push-row">
+      <div class="er-push-info">
+        <b>Auto send scanned stocks to trading engines</b>
+        <span>ON: har naye scan me jo naye stocks aayenge wo turant Equity Paper + Realtime Equity dono tabs me send ho jayenge, aur slot + margin available hote hi buy ho jayenge.</span>
+      </div>
+      <div class="er-push-meta">
+        <div><i id="erPushState">OFF</i><em>Status</em></div>
+        <div><i id="erPushSent">0</i><em>Known</em></div>
+        <div><i id="erPushPending">0</i><em>Waiting buy</em></div>
+      </div>
+      <span class="er-push-badge" id="erPushBadge">INACTIVE</span>
+      <label class="er-switch" id="erPushLbl" title="Auto send: naye scanned stocks ko dono equity engines me bhejta hai. Engine unhe sirf slot + shared margin check par buy karta hai.">
+        <input type="checkbox" id="erPushChk">
+        <span class="er-slider"></span>
+      </label>
+    </div>
+    <div class="er-push-note" id="erPushNote"></div>
+  </div>
   <div class="er-engines" id="erEngines"></div>
   <div class="er-panels">
     <div id="erAcc"></div>
@@ -356,6 +393,17 @@ function bind() {
         if (minEl) minEl.disabled = false;
       });
   };
+  if ($("erPushChk")) $("erPushChk").addEventListener("change", saveAutoPush);
+  if ($("erPushBadge")) {
+    // Clicking the badge toggles the same switch, so the ACTIVE / INACTIVE label
+    // is a real control too.
+    $("erPushBadge").addEventListener("click", () => {
+      const chk = $("erPushChk");
+      if (!chk) return;
+      chk.checked = !chk.checked;
+      saveAutoPush();
+    });
+  }
   if ($("erAuto")) $("erAuto").addEventListener("change", saveAutoScan);
   if ($("erAutoHr")) {
     $("erAutoHr").addEventListener("change", saveAutoScan);
@@ -444,6 +492,7 @@ async function loadEngines() {
     const d = await api("/api/equity/engines");
     STORE.engines = d;
     renderEngines(d);
+    paintAutoPush(STORE.status && STORE.status.filters, d);
   } catch (_) {}
 }
 
@@ -542,6 +591,7 @@ async function loadStatus() {
 // (and while a scan is busy the badge says the mode the running scan uses).
 function paintScanAll(filters) {
   paintAutoScan(filters);
+  paintAutoPush(filters, STORE.engines);
   const cb = document.getElementById("erAll");
   const stat = document.getElementById("erAllStat");
   const lbl = document.getElementById("erAllLbl");
@@ -582,6 +632,75 @@ function paintAutoScan(filters) {
   const lbl = document.getElementById("erAutoLbl");
   if (lbl) lbl.style.color = on ? "var(--er-up)" : "";
 }
+
+// "Auto send scanned stocks to trading engines": persist the switch, reflect it
+// with an ACTIVE / INACTIVE badge and a fade-in card, and show how many names
+// have been sent and how many are still waiting for a free slot / margin.
+function paintAutoPush(filters, engines) {
+  const f = filters || (STORE.status && STORE.status.filters) || null;
+  const box = document.getElementById("erPush");
+  const chk = document.getElementById("erPushChk");
+  const badge = document.getElementById("erPushBadge");
+  const state = document.getElementById("erPushState");
+  const note = document.getElementById("erPushNote");
+  const sentEl = document.getElementById("erPushSent");
+  const pendEl = document.getElementById("erPushPending");
+  if (!box || !chk) return;
+  if (f && typeof f.auto_push !== "undefined") chk.checked = !!f.auto_push;
+  else if (f && typeof f.autoPush !== "undefined") chk.checked = !!f.autoPush;
+  const on = !!chk.checked;
+  box.classList.toggle("on", on);
+  if (badge) badge.textContent = on ? "ACTIVE" : "INACTIVE";
+  if (state) {
+    state.textContent = on ? "ON" : "OFF";
+    state.style.color = on ? "var(--er-up)" : "";
+  }
+  if (sentEl) {
+    const n = f ? Number(typeof f.pushedCount !== "undefined" ? f.pushedCount : f.pushed_symbols ? f.pushed_symbols.length : 0) : 0;
+    sentEl.textContent = String(Number.isFinite(n) ? n : 0);
+  }
+  if (pendEl) {
+    const paper = engines && engines.paper ? Number(engines.paper.autoPushPending) || 0 : 0;
+    const live = engines && engines.live ? Number(engines.live.autoPushPending) || 0 : 0;
+    pendEl.textContent = `${paper}/${live}`;
+    pendEl.title = `Paper ${paper} · Live ${live} - slot ya margin ka wait`;
+  }
+  if (note) {
+    note.textContent = on
+      ? "Naya scan finish hote hi naye symbols dono engines me jayenge; jo buy nahi ho paaye (slot/margin full) wo waiting me rahenge aur margin khulte hi buy honge."
+      : "OFF hai: engines sirf apne normal Buy-call rules par chalte rahenge, koi auto push nahi hoga.";
+  }
+}
+
+const saveAutoPush = () => {
+  const chk = document.getElementById("erPushChk");
+  const box = document.getElementById("erPush");
+  if (!chk) return;
+  const on = !!chk.checked;
+  if (box) {
+    box.classList.toggle("on", on);
+    box.classList.add("fade-in");
+    setTimeout(() => box.classList.remove("fade-in"), 500);
+  }
+  chk.disabled = true;
+  api("/api/equity/filters", { method: "POST", body: JSON.stringify({ autoPush: on }) })
+    .then((r) => {
+      const f = (r && r.filters) || null;
+      if (f) paintAutoPush(f, STORE.engines);
+      if (on) {
+        // A fresh hand-over should also clear the "already sent" ledger? No -
+        // the server seeds it on enable, so only genuinely NEW scans are sent.
+        loadStatus();
+      }
+    })
+    .catch(() => {
+      chk.checked = !on;
+      if (box) box.classList.toggle("on", !on);
+    })
+    .finally(() => {
+      chk.disabled = false;
+    });
+};
 
 // "1h 30m" style label for the stage line.
 function fmtCadence(totalMins) {

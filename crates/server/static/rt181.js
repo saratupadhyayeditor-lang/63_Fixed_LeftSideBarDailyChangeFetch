@@ -54,6 +54,12 @@ const API = {
   logs: () => get("/api/rt/logs"),
   blockers: () => get("/api/rt/blockers"),
   blockersClear: () => post("/api/rt/blockers", { action: "clear" }),
+  // Live diagnostics are shared across every engine tab (one process-wide
+  // report), so these deliberately do NOT go through the `/api/rt` -> engine
+  // rewrite that the paper frames install.
+  diagSnapshot: () => get("/api/diagnostics/snapshot"),
+  diagCapture: () => post("/api/diagnostics/capture", { reason: "manual" }),
+  diagBundleFile: () => post("/api/diagnostics/bundle-file", {}),
 };
 
 // Paper Trade runs this exact module inside an isolated frame that pre-sets
@@ -1682,6 +1688,9 @@ function shell() {
           <span id="rtBlockerCount" style="font-size:8px;color:#888;margin-left:auto">0 reason(s)</span>
           <button class="btn-action" id="rtBlockerRefresh" style="width:auto;padding:1px 8px;margin:0;font-size:8px">Refresh</button>
           <button class="btn-action" id="rtBlockerClear" style="width:auto;padding:1px 8px;margin:0;font-size:8px">Clear</button>
+          <button class="btn-action" id="rtDiagCapture" style="width:auto;padding:1px 8px;margin:0;font-size:8px;background:#6a4c93;color:#fff" title="Is waqt ka poora diagnostic snapshot (engine/scan heartbeat, feed, margin, blockers, server log tail) disk par save karo. Installed app me bug hone par yahi file bhejni hai.">Capture now</button>
+          <button class="btn-action" id="rtDiagBundle" style="width:auto;padding:1px 8px;margin:0;font-size:8px;background:#8e3b46;color:#fff" title="Ek support bundle file banao: snapshot + startup self-check + latest captures + server log tail. Secrets kabhi include nahi hote (sirf present/absent).">Support bundle</button>
+          <span id="rtDiagNote" style="font-size:8px;color:#7ec8ff;flex-basis:100%;word-break:break-all"></span>
         </div>
         <div id="rtBlockerHeadline" style="font-size:9px;color:#ffd54f;padding:3px 6px;background:#1a1205;border:1px solid #4a3a10;border-radius:4px;margin:2px 0 4px">Waiting for engine state...</div>
         <div id="rtBlockerBody" style="max-height:170px;overflow-y:auto;font-size:9px;line-height:1.5;background:#0a0a18;border:1px solid #1e1e40;border-radius:4px;padding:4px 6px;color:#aaa"></div>
@@ -2988,6 +2997,46 @@ function wire() {
     };
   const blkRefresh = $("rtBlockerRefresh");
   if (blkRefresh) blkRefresh.onclick = () => loadBlockers();
+  const diagCap = $("rtDiagCapture");
+  if (diagCap)
+    diagCap.onclick = async () => {
+      const note = $("rtDiagNote");
+      if (note) note.textContent = "Capturing...";
+      diagCap.disabled = true;
+      try {
+        const r = await API.diagCapture();
+        if (note) {
+          note.textContent = r && r.ok
+            ? "Saved: " + (r.file || "(file written)")
+            : "Capture failed: " + ((r && r.error) || "unknown error");
+          note.style.color = r && r.ok ? "#7ec8ff" : "#ff8a80";
+        }
+      } catch (e) {
+        if (note) { note.style.color = "#ff8a80"; note.textContent = "Capture failed: " + String(e.message || e); }
+      } finally {
+        diagCap.disabled = false;
+      }
+    };
+  const diagBnd = $("rtDiagBundle");
+  if (diagBnd)
+    diagBnd.onclick = async () => {
+      const note = $("rtDiagNote");
+      if (note) note.textContent = "Building support bundle...";
+      diagBnd.disabled = true;
+      try {
+        const r = await API.diagBundleFile();
+        if (note) {
+          note.textContent = r && r.ok
+            ? "Bundle saved: " + (r.file || "(file written)") + " - isi file ko bhejein"
+            : "Bundle failed: " + ((r && r.error) || "unknown error");
+          note.style.color = r && r.ok ? "#7ec8ff" : "#ff8a80";
+        }
+      } catch (e) {
+        if (note) { note.style.color = "#ff8a80"; note.textContent = "Bundle failed: " + String(e.message || e); }
+      } finally {
+        diagBnd.disabled = false;
+      }
+    };
   const condRefresh = $("rtCondLogRefresh");
   if (condRefresh) condRefresh.onclick = () => refreshLogs();
   const condLvl = $("rtCondLogLevel");
@@ -6785,6 +6834,10 @@ function renderEntryTiming() {
 // as the rest of the engine and needs no extra polling in the common case.
 // ---------------------------------------------------------------------------
 let blockerRenderSig = "";
+// Latest process-wide diagnostics block for THIS tab. Kept outside STATE so a
+// fresh snapshot (which overwrites STATE wholesale) cannot wipe the heartbeat
+// readout between polls.
+let DIAG = null;
 
 async function loadBlockers() {
   try {
@@ -6793,46 +6846,128 @@ async function loadBlockers() {
   } catch (e) {
     /* keep the last snapshot view */
   }
+  loadDiag();
+}
+
+// Pull the process-wide diagnostics snapshot and keep THIS tab's own engine
+// block on STATE.diag. The heartbeat numbers (loop / scan / last entry) live
+// there because the blocker list can only report gates that actually ran - a
+// dead scan or a stalled loop produces no blocker at all.
+let diagBusy = false;
+let diagLastMs = 0;
+// Heartbeats only need a couple of seconds of resolution, so the 1s engine poll
+// piggybacks on this cheap throttle instead of adding a second request every tick.
+function loadDiagThrottled() {
+  const now = Date.now();
+  if (now - diagLastMs < 2000) return;
+  diagLastMs = now;
+  loadDiag();
+}
+async function loadDiag() {
+  if (diagBusy) return;
+  diagBusy = true;
+  try {
+    const r = await API.diagSnapshot();
+    if (!r || !Array.isArray(r.engines)) return;
+    const want = realtimeEngineId();
+    const block = r.engines.find((e) => e && e.engine === want) || null;
+    DIAG = block;
+    if (STATE) STATE.diag = block;
+    if (block) {
+      // Repaint the panel with the fresh heartbeat even when the 1s snapshot has
+      // not landed yet (STATE still empty) or it carried no blocker rows.
+      const src = STATE && STATE.blockers ? Object.assign({}, STATE.blockers) : { blockers: [] };
+      if (src.engineOn == null) src.engineOn = block.engineOn;
+      if (src.armed == null) src.armed = !!block.armed;
+      if (src.connected == null) src.connected = !!(block.runtime && block.runtime.connected);
+      if (src.feedLive == null) src.feedLive = !!(block.runtime && block.runtime.feed && block.runtime.feed.feedLive);
+      const m = block.margin || {};
+      if (src.marginFree == null) src.marginFree = num(m.free);
+      if (src.marginBudget == null) src.marginBudget = num(m.cap);
+      if (src.openPositions == null) src.openPositions = num(m.openPositions);
+      renderBlockers(src);
+    }
+  } catch (e) {
+    /* diagnostics are optional - never break the engine pane */
+  } finally {
+    diagBusy = false;
+  }
 }
 
 function blockersPayload(src) {
-  // Accepts either the `/api/rt/blockers` response (headline + rows) or a full
-  // snapshot, whose `blockers` member is just `{ ok, at, blockers: [...] }`.
+  // Accepts:
+  //  - /api/rt/blockers  -> { ok, at, blockers: [...], engineOn, marginBudget, ... }
+  //  - the engine snapshot -> { engineOn, armed, margin: {...}, blockers: { ok, blockers: [...] } }
+  //  - /api/diagnostics/snapshot engine block -> { engineOn, margin: {cap,free,...}, blockers: {...}, runtime: {...} }
+  // Every path lands on one flat shape the renderer can trust.
   if (!src || typeof src !== "object") return null;
-  if (Array.isArray(src.blockers)) return src;
-  if (src.blockers && Array.isArray(src.blockers.blockers)) {
-    const b = src.blockers;
-    // Derive the headline from the snapshot when the dedicated endpoint has not
-    // been called yet, so the panel reads correctly straight after boot.
-    if (b.headline == null) {
-      const eng = !!src.engineOn;
-      const armed = !!src.armed;
-      const m = src.margin || {};
-      const free = num(m.available);
-      const locked = num(m.locked);
-      const budget = num(m.budget);
-      const open = num(m.count);
-      const rows = b.blockers || [];
-      let hl;
-      if (!eng) hl = "Engine is OFF - turn on AI Smart Trading";
-      else if (!armed) hl = "Engine is ON but disarmed for today (auto square-off already ran)";
-      else if (budget <= 0) hl = "No shared margin allotted to this tab - set an allotment";
-      else if (free <= 0)
-        hl = "Margin fully locked by " + open + " open position(s) (Rs " +
-          Math.round(locked) + " of Rs " + Math.round(budget) + ") - square off or raise the allotment";
-      else if (rows.length && rows[0].level === "warn") hl = "Blocked: " + (rows[0].detail || rows[0].code);
-      else hl = "Engine is armed and evaluating - see the blocking reasons below";
-      b.headline = hl;
-      b.engineOn = eng;
-      b.armed = armed;
-      b.marginFree = free;
-      b.marginBudget = budget;
-      b.marginLocked = locked;
-      b.openPositions = open;
-    }
-    return b;
+  let rows = null;
+  let engineOn = src.engineOn;
+  let armed = src.armed;
+  let margin = src.margin || null;
+  let connected = src.connected;
+  let feedLive = src.feedLive;
+  if (Array.isArray(src.blockers)) {
+    // Raw blockers response, or the nested `blockers` object passed directly.
+    rows = src.blockers;
+  } else if (src.blockers && Array.isArray(src.blockers.blockers)) {
+    rows = src.blockers.blockers;
+  } else {
+    return null;
   }
-  return null;
+  if (rows === null) return null;
+
+  // The raw blockers endpoint carries no engine/feed/margin fields; borrow the
+  // last snapshot's so the headline does not read "engine OFF" just because that
+  // particular response had no engine fields.
+  const st = STATE && typeof STATE === "object" ? STATE : null;
+  if (st) {
+    if (engineOn == null) engineOn = st.engineOn;
+    if (armed == null) armed = st.armed;
+    if (!margin) margin = st.margin;
+    if (connected == null) connected = st.connected;
+    if (feedLive == null) feedLive = st.feedLive;
+  }
+  const rt = src.runtime || {};
+  if (rt.connected != null && connected == null) connected = !!rt.connected;
+  if (rt.feed && rt.feed.feedLive != null && feedLive == null) feedLive = !!rt.feed.feedLive;
+
+  // Two margin shapes reach here: the engine snapshot uses
+  // available/locked/budget/count, /api/diagnostics/snapshot uses
+  // cap/free/locked/openPositions.
+  const m = margin || {};
+  const free = num(m.available != null ? m.available : m.free != null ? m.free : src.marginFree);
+  const locked = num(m.locked != null ? m.locked : src.marginLocked);
+  const budget = num(m.budget != null ? m.budget : m.cap != null ? m.cap : src.marginBudget);
+  const open = num(m.count != null ? m.count : m.openPositions != null ? m.openPositions : src.openPositions);
+  const capIsZero = m.capIsZero != null ? !!m.capIsZero : budget <= 0;
+
+  const eng = engineOn != null ? !!engineOn : false;
+  const isArmed = !!armed;
+  let hl = src.headline;
+  if (!hl) {
+    if (!eng) hl = "Engine is OFF - turn on AI Smart Trading";
+    else if (!isArmed) hl = "Engine is ON but disarmed for today (auto square-off already ran)";
+    else if (capIsZero) hl = "No shared margin allotted to this tab - set an allotment";
+    else if (free <= 0)
+      hl = "Margin fully locked by " + open + " open position(s) (Rs " +
+        Math.round(locked) + " of Rs " + Math.round(budget) + ") - square off or raise the allotment";
+    else if (rows.length && rows[0].level === "warn") hl = "Blocked: " + (rows[0].detail || rows[0].code);
+    else hl = "Engine is armed and evaluating - see the blocking reasons below";
+  }
+  return {
+    ok: true,
+    blockers: rows,
+    headline: hl,
+    engineOn: eng,
+    armed: isArmed,
+    connected,
+    feedLive,
+    marginFree: free,
+    marginBudget: budget,
+    marginLocked: locked,
+    openPositions: open,
+  };
 }
 
 function renderBlockers(src) {
@@ -6845,6 +6980,12 @@ function renderBlockers(src) {
   const rows = Array.isArray(b.blockers) ? b.blockers : [];
   if (cnt) cnt.textContent = rows.length + " reason(s)";
   if (head) {
+    // The dedicated `/api/rt/blockers` response only carries the rows, so the
+    // connection/feed/margin/heartbeat bits come from the diagnostics snapshot
+    // when it is available, falling back to whatever the snapshot already put
+    // on the payload.
+    const diag = DIAG || (STATE && STATE.diag) || null;
+    const drt = (diag && diag.runtime) || {};
     const stateBits = [];
     if (b.connected === false) stateBits.push("Dhan: disconnected");
     else if (b.connected === true) stateBits.push("Dhan: connected");
@@ -6852,6 +6993,20 @@ function renderBlockers(src) {
     stateBits.push("engine " + (b.engineOn ? (b.armed ? "ON+armed" : "ON (disarmed)") : "OFF"));
     stateBits.push("margin Rs " + Math.round(num(b.marginFree)) + " free of " + Math.round(num(b.marginBudget)));
     stateBits.push(num(b.openPositions) + " open");
+    if (num(b.marginBudget) <= 0) stateBits.push("NO ALLOTMENT");
+    // Heartbeats: a dead scan records NO blocker, so without these two numbers
+    // an empty panel would look like "nothing is wrong" instead of "the engine
+    // never ran". Shows seconds since the last loop tick and the last scan.
+    if (diag && diag.runtime) {
+      const fmtAge = (v) => (v == null ? "never" : (Number(v) < 90 ? Math.round(Number(v)) + "s" : Math.round(Number(v) / 60) + "m") + " ago");
+      stateBits.push("loop " + fmtAge(drt.loopAgeSec));
+      stateBits.push("scan " + fmtAge(drt.scanAgeSec));
+      stateBits.push("last entry " + fmtAge(drt.lastEntryAgeSec));
+      if (drt.loopAgeSec != null && Number(drt.loopAgeSec) > 120)
+        stateBits.push("LOOP STALLED");
+      if (b.connected && drt.scanAgeSec != null && Number(drt.scanAgeSec) > 180)
+        stateBits.push("SCAN STALLED");
+    }
     head.innerHTML =
       `<b style="color:#ffd54f">${esc(b.headline || "No blocking reason recorded yet")}</b>` +
       `<span style="color:#777;margin-left:8px">${esc(stateBits.join(" · "))}</span>`;
@@ -7270,6 +7425,7 @@ async function refresh() {
     // a belt-and-braces guard against any future parallel path.
     if (seq !== refreshSeq) return;
     renderSnapshot(s);
+    loadDiagThrottled();
     const conn = document.getElementById("rtConn");
     if (conn && !document.body.classList.contains("link-alarm")) {
       conn.textContent = PAPER ? "Paper engine ready" : "Engine session ready";

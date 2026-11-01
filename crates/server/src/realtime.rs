@@ -2162,6 +2162,23 @@ pub struct RealtimeState {
     /// the whole universe every ~100ms tick while the feed was down, which kept
     /// Dhan's rate limit tripped and made the disconnect permanent.
     last_scan_rest: Arc<AtomicI64>,
+    /// Millisecond clock of the last COMPLETED `scan_signals` pass, plus a
+    /// monotonic counter of passes started and of entries actually placed.
+    /// Used by the "Why no trades?" diagnostics to prove the scan is alive
+    /// (heartbeat) instead of silently dead - the one failure mode the blocker
+    /// panel cannot see, because a dead scan records no blocker at all.
+    scan_heartbeat: Arc<AtomicI64>,
+    /// Millisecond clock of the last engine-loop iteration. Proves the loop
+    /// itself is alive even while the engine is OFF / disarmed (in which case no
+    /// scan and therefore no heartbeat would exist).
+    loop_heartbeat: Arc<AtomicI64>,
+    /// Times the engine loop went around since boot.
+    loop_passes: Arc<AtomicI64>,
+    scan_passes: Arc<AtomicI64>,
+    entries_placed: Arc<AtomicI64>,
+    /// Millisecond clock of the last entry that reached the broker (paper or
+    /// live), for the "no entry for N minutes" auto-capture trigger.
+    last_entry_ms: Arc<AtomicI64>,
     /// Throttle for the MCX commodity "Picked Strikes" refresh (millisecond
     /// clock). Kept separate from `last_movers` so the commodity rows are
     /// populated even when Top Movers is OFF.
@@ -2573,6 +2590,35 @@ fn sideways_read(c: &[Candle]) -> Option<SidewaysRead> {
     })
 }
 
+/// Process-wide registry of the constructed engines, keyed by engine id. The
+/// diagnostics module uses it to inspect EVERY tab (paper included) from a
+/// single JSON endpoint instead of one route per engine.
+static ENGINES: OnceLock<Mutex<HashMap<&'static str, RealtimeState>>> = OnceLock::new();
+
+fn engine_registry() -> &'static Mutex<HashMap<&'static str, RealtimeState>> {
+    ENGINES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn register_engine(state_file: &'static str, st: &RealtimeState) {
+    let id = match state_file {
+        STATE_FILE_REAL => "realtime",
+        STATE_FILE_REAL2 => "realtime2",
+        STATE_FILE_REAL3 => "realtime3",
+        STATE_FILE_PAPER => "paper",
+        STATE_FILE_PAPER2 => "paper2",
+        STATE_FILE_PAPER3 => "paper3",
+        _ => return,
+    };
+    if let Ok(mut m) = engine_registry().lock() {
+        m.insert(id, st.clone());
+    }
+}
+
+/// Every registered engine id, in tab order.
+pub fn rt_engine_ids() -> Vec<&'static str> {
+    vec!["realtime", "realtime2", "realtime3", "paper", "paper2", "paper3"]
+}
+
 impl RealtimeState {
     pub fn new(dhan: DhanState) -> Self {
         Self::new_mode(dhan, false, STATE_FILE_REAL)
@@ -2849,6 +2895,12 @@ impl RealtimeState {
             mover_bias: Arc::new(AtomicI64::new(0)),
             last_movers: Arc::new(AtomicI64::new(0)),
             last_scan_rest: Arc::new(AtomicI64::new(0)),
+            scan_heartbeat: Arc::new(AtomicI64::new(0)),
+            loop_heartbeat: Arc::new(AtomicI64::new(0)),
+            loop_passes: Arc::new(AtomicI64::new(0)),
+            scan_passes: Arc::new(AtomicI64::new(0)),
+            entries_placed: Arc::new(AtomicI64::new(0)),
+            last_entry_ms: Arc::new(AtomicI64::new(0)),
             last_commodity: Arc::new(AtomicI64::new(0)),
             last_brain: Arc::new(AtomicI64::new(0)),
             movers_cache: Arc::new(Mutex::new((0, Value::Null))),
@@ -2898,6 +2950,7 @@ impl RealtimeState {
         // Resume the operator's saved master-switch state: ON stays ON (armed
         // unless today's auto square-off already ran), OFF stays OFF.
         st.sync_auto_armed();
+        register_engine(state_file, &st);
         st.clone().spawn_engine();
         st.clone().spawn_guard();
         st.clone().spawn_nifty_watch();
@@ -3601,6 +3654,75 @@ impl RealtimeState {
         json!({ "ok": true, "at": now, "blockers": rows })
     }
 
+    /// Engine handle for the diagnostics module: the registry stores a clone of
+    /// each engine, so all state is reachable from one snapshot request.
+    pub fn engine_handle(&self, id: &str) -> Option<RealtimeState> {
+        if self.engine_id() == id {
+            return Some(self.clone());
+        }
+        engine_registry().lock().ok().and_then(|m| m.get(id).cloned())
+    }
+
+    /// Freshness of the engine loop (ms stamp; 0 = never ran).
+    pub fn diagnostic_loop_heartbeat(&self) -> i64 {
+        self.loop_heartbeat.load(Ordering::Relaxed)
+    }
+
+    pub fn diagnostic_loop_passes(&self) -> i64 {
+        self.loop_passes.load(Ordering::Relaxed)
+    }
+
+    /// Freshness of the SIGNAL SCAN (ms stamp; 0 = never ran). This is the value
+    /// that separates "gates are blocking" from "the scan itself is dead".
+    pub fn diagnostic_scan_heartbeat(&self) -> i64 {
+        self.scan_heartbeat.load(Ordering::Relaxed)
+    }
+
+    pub fn diagnostic_scan_passes(&self) -> i64 {
+        self.scan_passes.load(Ordering::Relaxed)
+    }
+
+    pub fn diagnostic_entries_placed(&self) -> i64 {
+        self.entries_placed.load(Ordering::Relaxed)
+    }
+
+    pub fn diagnostic_last_entry(&self) -> i64 {
+        self.last_entry_ms.load(Ordering::Relaxed)
+    }
+
+    /// `(engineOn, armed, compact doc state)` for the diagnostics snapshot.
+    pub fn diagnostic_engine_state(&self) -> Option<(bool, bool, Value)> {
+        let d = self.doc()?;
+        let strategies = d.strategies.iter().filter(|s| s.enabled).count();
+        let doc = json!({
+            "engineOn": d.engine_on,
+            "armed": d.armed,
+            "filterMode": d.settings.filter_mode,
+            "requireCondition": d.settings.require_condition,
+            "moversOn": d.settings.movers_on,
+            "commodityOn": d.settings.commodity_on,
+            "premiumOnly": d.settings.premium_only,
+            "lots": d.settings.lots,
+            "scanIntervalOn": d.settings.scan_interval_on,
+            "scanIntervalMs": d.settings.scan_interval_ms,
+            "scanBarClose": d.settings.scan_bar_close,
+            "tradeLimit": d.settings.trade_limit,
+            "tradeLimitCount": d.settings.trade_limit_count,
+            "strategies": d.strategies.len(),
+            "enabledStrategies": strategies,
+            "selected": d.selected.values().filter(|v| **v).count(),
+            "openPositions": d.positions.len(),
+            "closedTrades": d.closed.len(),
+            "lastSquareOffDay": d.last_square_off_day,
+        });
+        Some((d.engine_on, d.armed, doc))
+    }
+
+    /// `(locked margin, open positions)` for this engine.
+    pub fn diagnostic_locked_margin(&self) -> (f64, i64) {
+        self.locked_margin()
+    }
+
     /// Clear the recorded blockers (operator pressed "Clear").
     pub(crate) fn clear_blockers(&self) {
         if let Ok(mut m) = self.blockers.lock() {
@@ -3976,6 +4098,8 @@ impl RealtimeState {
             // means a new bar just opened, which is exactly when we scan.
             let mut last_bar_bucket = 0i64;
             loop {
+                self.loop_heartbeat.store(now_ms(), Ordering::Relaxed);
+                self.loop_passes.fetch_add(1, Ordering::Relaxed);
                 // The master switch owns run/stop; this only keeps `armed`
                 // consistent with it (and re-arms on the next IST day while the
                 // master stays ON). Auto square-off keeps today's entries blocked.
@@ -6955,6 +7079,13 @@ impl RealtimeState {
     // -----------------------------------------------------------------------
 
     async fn scan_signals(&self) {
+        // Heartbeat: proving the scan actually runs is the ONE thing the blocker
+        // list cannot show - a dead / never-scheduled scan records no blocker, so
+        // the operator would see an empty panel and no reason. Stamp the attempt
+        // here (before any early return) so "scanAgeSec" in the diagnostics tells
+        // apart "gates blocking" from "scan never ran".
+        self.scan_passes.fetch_add(1, Ordering::Relaxed);
+        self.scan_heartbeat.store(now_ms(), Ordering::Relaxed);
         // Entries only while Dhan is connected AND the live feed is streaming a
         // fresh tick: a silent / closed / disconnected feed must not trade on a
         // stale mark (which would produce fake results).
@@ -11440,6 +11571,8 @@ impl RealtimeState {
             }
         }
         let placed = self.et_placed.fetch_add(1, Ordering::Relaxed) + 1;
+        self.entries_placed.fetch_add(1, Ordering::Relaxed);
+        self.last_entry_ms.store(now_ms(), Ordering::Relaxed);
         if let Some(mut d) = self.doc() {
             d.positions.push(position);
             let pending = self.take_entry_timing(&strat.id, origin_id);

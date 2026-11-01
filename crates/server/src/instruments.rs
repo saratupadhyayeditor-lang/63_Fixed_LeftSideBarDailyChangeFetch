@@ -240,6 +240,26 @@ async fn master_for(broker: &str) -> Result<Arc<Master>, String> {
     }
 }
 
+/// Read-only snapshot of every broker master slot: how many contracts are
+/// loaded, how old the copy is, and the last download error. Never triggers a
+/// download - the support bundle must be cheap even when a master is broken.
+pub fn status_json() -> Value {
+    let map = slots().lock().unwrap_or_else(|e| e.into_inner());
+    let mut out = serde_json::Map::new();
+    for (id, slot) in map.iter() {
+        out.insert(
+            (*id).to_string(),
+            serde_json::json!({
+                "loaded": slot.master.as_ref().map(|m| m.by_key.len()).unwrap_or(0),
+                "ageSec": slot.fetched.map(|t| t.elapsed().as_secs()).unwrap_or(0),
+                "loading": slot.loading,
+                "error": slot.error,
+            }),
+        );
+    }
+    Value::Object(out)
+}
+
 fn spec_id(broker: &str) -> Result<&'static str, String> {
     crate::brokers::spec(broker)
         .map(|s| s.id)
