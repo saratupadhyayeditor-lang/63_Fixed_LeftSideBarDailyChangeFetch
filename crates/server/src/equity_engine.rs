@@ -560,6 +560,28 @@ fn view(mode: &str) -> Value {
     });
     let effective_capital = engine_capital(mode, st.settings.capital);
     let shared_cap = crate::shared_margin::cap_for(if mode == "live" { "equitylive" } else { "equitypaper" });
+    // Per-trade charges are computed on read (never stored) so the UI can show
+    // exactly what a trade paid without migrating the durable state. A closed
+    // trade uses its real entry/exit pair; an open one estimates the round trip
+    // at the live mark, which is the same number Net TP already watches.
+    let trades: Vec<Value> = trades
+        .iter()
+        .map(|t| {
+            let exit = if t.is_open() { t.last_price } else { t.exit_price };
+            let charges = equity_charges(t.entry_price, exit, t.qty);
+            let gross = if t.is_open() {
+                (t.last_price - t.entry_price) * t.qty as f64
+            } else {
+                t.pnl
+            };
+            let mut v = serde_json::to_value(t).unwrap_or_else(|_| json!({}));
+            if let Some(o) = v.as_object_mut() {
+                o.insert("charges".into(), json!(round2(charges)));
+                o.insert("netPnl".into(), json!(round2(gross - charges)));
+            }
+            v
+        })
+        .collect();
     json!({
         "mode": mode,
         "enabled": st.enabled,

@@ -936,6 +936,23 @@ pub struct Settings {
     /// Paper fills: probability (0-100) that a simulated entry order is rejected
     /// instead of filled. 0 disables simulated rejections.
     pub paper_reject_pct: f64,
+    /// Paper-only bid/ask spread simulation (master switch). When ON, every
+    /// simulated fill is crossed by half the configured spread: a BUY fills at
+    /// `mark + half`, a SELL at `mark - half`, exactly like paying the real
+    /// spread on Dhan. Spread is the SUM of `paper_bid_ask_rs` and
+    /// `paper_bid_ask_pct`% of the price, so a per-strike rupee spread and a
+    /// percentage spread can be combined. OFF = spread ignored (slippage still
+    /// applies). Kept separate from `paper_slippage_bps` (which models
+    /// impact/latency); both stack.
+    pub paper_bid_ask_on: bool,
+    /// Paper-only bid/ask spread in absolute rupees (full spread, both sides).
+    /// Half of it is applied to each fill. Only used while
+    /// `paper_bid_ask_on` is ON.
+    pub paper_bid_ask_rs: f64,
+    /// Paper-only bid/ask spread as a percentage of the traded price (full
+    /// spread). Half of it is applied to each fill. Only used while
+    /// `paper_bid_ask_on` is ON.
+    pub paper_bid_ask_pct: f64,
     /// Paper-only execution-latency simulation. When on, a qualifying entry is
     /// queued and placed `paper_exec_delay_ms` milliseconds after the entry
     /// condition first held, mimicking real order latency, instead of filling on
@@ -1199,6 +1216,9 @@ impl Default for Settings {
             ai_pick_bear: true,
             paper_slippage_bps: 5.0,
             paper_reject_pct: 0.0,
+            paper_bid_ask_on: false,
+            paper_bid_ask_rs: 0.0,
+            paper_bid_ask_pct: 0.0,
             paper_exec_delay_on: false,
             paper_exec_delay_ms: 500.0,
             paper_exit_delay_on: false,
@@ -1682,6 +1702,62 @@ fn paper_fill_price(mark: f64, is_buy: bool, bps: f64) -> f64 {
     } else {
         (mark - slip).max(0.05)
     }
+}
+
+/// A snapshot of the bid/ask spread config that can be carried into closures
+/// (net-TP marking, target economics) without borrowing the whole `Settings`.
+#[derive(Clone, Copy, Default)]
+struct PaperSpread {
+    on: bool,
+    rs: f64,
+    pct: f64,
+}
+
+impl From<&Settings> for PaperSpread {
+    fn from(s: &Settings) -> Self {
+        PaperSpread { on: s.paper_bid_ask_on, rs: s.paper_bid_ask_rs, pct: s.paper_bid_ask_pct }
+    }
+}
+
+impl PaperSpread {
+    /// Full spread in rupees for this mark (0 when off/empty).
+    fn full(&self, mark: f64) -> f64 {
+        if !self.on || mark <= 0.0 {
+            return 0.0;
+        }
+        let rs = self.rs.max(0.0);
+        let pct = (mark * self.pct.max(0.0) / 100.0).abs();
+        // Never let the synthetic spread exceed twice the price: a fill is only
+        // pushed by half the spread, so a >200% spread would drive a SELL below 0.
+        (rs + pct).min(mark * 2.0)
+    }
+
+    /// Half spread in rupees - the per-side cost added on a BUY / removed on a SELL.
+    fn half(&self, mark: f64) -> f64 {
+        self.full(mark) / 2.0
+    }
+
+    /// Cross the mark by half the spread toward the adverse side, then apply
+    /// slippage on top. When the feature is OFF this is exactly the old
+    /// slippage-only fill.
+    fn fill(&self, mark: f64, is_buy: bool, slip_bps: f64) -> f64 {
+        let half = self.half(mark);
+        let crossed = if is_buy {
+            mark + half
+        } else {
+            (mark - half).max(0.05)
+        };
+        paper_fill_price(crossed, is_buy, slip_bps)
+    }
+}
+
+/// One paper fill with BOTH models applied in order: the bid/ask spread is
+/// crossed first (the price you actually transact at), then the slippage/impact
+/// is added on top of it. Stacking them mirrors reality - you pay the spread
+/// and then your own order's impact - and keeps the existing slippage-only
+/// behaviour identical when the spread is OFF.
+fn paper_exec_fill(mark: f64, is_buy: bool, settings: &Settings) -> f64 {
+    PaperSpread::from(settings).fill(mark, is_buy, settings.paper_slippage_bps)
 }
 
 /// Paper-only F&O limit price for a BUY: a marketable price placed above the
@@ -2334,6 +2410,28 @@ pub struct RealtimeState {
     /// it to perform one immediate evaluation pass instead of waiting for the
     /// next scheduled tick.
     force_tick: Arc<AtomicBool>,
+    /// Millisecond clock of the last COMPLETED background scanner refresh pass.
+    /// The scanner REST work (Top Movers / Liquid F&O / trend sections) used to
+    /// run inline in the engine loop, so a Dhan rate-limit hold blocked the whole
+    /// loop and froze entries entirely. It now runs on its own task and the loop
+    /// only reads the caches, flagging a stale pass instead of stalling.
+    scanner_heartbeat: Arc<AtomicI64>,
+    /// Guard so two background scanner passes can never overlap (the previous
+    /// pass may still be waiting out a Dhan hold).
+    scanner_busy: Arc<AtomicBool>,
+    /// Candle series currently warming from a background REST seed, keyed by
+    /// `"{exch}:{sec}:{tf}"`. The evaluation loop never blocks on that seed: it
+    /// reads the live series and, when cold, asks for a background fetch and
+    /// evaluates on the next pass instead. A synchronous seed inside the scan was
+    /// one of the ways a slow / rate-limited Dhan call froze the whole engine.
+    seed_inflight: Arc<Mutex<std::collections::HashSet<String>>>,
+    /// Negative cache for option-leg resolution: `"{security_id}:{side}"` -> the
+    /// epoch ms at which a resolve last came back with no contract (missing
+    /// expiry / empty strike bucket / all strikes red). Without it a stock whose
+    /// premium leg cannot be resolved is re-resolved on EVERY scan tick (100ms),
+    /// which is what produced hundreds of `no-premium` blocker hits and kept the
+    /// option chain / quote surface busy.
+    no_premium_until: Arc<Mutex<HashMap<String, i64>>>,
 }
 
 /// One row of the per-instrument trend readout. `prev` is the instrument's last
@@ -2946,12 +3044,17 @@ impl RealtimeState {
             blockers: Arc::new(Mutex::new(HashMap::new())),
             log_throttle: Arc::new(Mutex::new(HashMap::new())),
             force_tick: Arc::new(AtomicBool::new(false)),
+            scanner_heartbeat: Arc::new(AtomicI64::new(0)),
+            scanner_busy: Arc::new(AtomicBool::new(false)),
+            no_premium_until: Arc::new(Mutex::new(HashMap::new())),
+            seed_inflight: Arc::new(Mutex::new(std::collections::HashSet::new())),
         };
         // Resume the operator's saved master-switch state: ON stays ON (armed
         // unless today's auto square-off already ran), OFF stays OFF.
         st.sync_auto_armed();
         register_engine(state_file, &st);
         st.clone().spawn_engine();
+        st.clone().spawn_scanners();
         st.clone().spawn_guard();
         st.clone().spawn_nifty_watch();
         st
@@ -3042,6 +3145,45 @@ impl RealtimeState {
             }
         }
         self.log(level, msg);
+    }
+
+    /// Negative-cache key for one underlying + option side.
+    fn no_premium_key(sid: i64, side: &str) -> String {
+        format!("{}:{}", sid, side.to_uppercase())
+    }
+
+    /// True while a previous resolve of this underlying + side failed recently
+    /// enough that re-resolving on every 100ms scan tick would be pure waste.
+    fn no_premium_cached(&self, sid: i64, side: &str) -> bool {
+        let key = Self::no_premium_key(sid, side);
+        let now = now_ms();
+        self.no_premium_until
+            .lock()
+            .map(|m| m.get(&key).map(|until| *until > now).unwrap_or(false))
+            .unwrap_or(false)
+    }
+
+    /// Record that this underlying + side has no resolvable premium leg for the
+    /// next [`NO_PREMIUM_CACHE_MS`], so the scan stops hammering the resolver
+    /// (and the blocker panel stops inflating its count) until the timer lapses.
+    fn mark_no_premium(&self, sid: i64, side: &str) {
+        let key = Self::no_premium_key(sid, side);
+        let now = now_ms();
+        if let Ok(mut m) = self.no_premium_until.lock() {
+            m.insert(key, now + NO_PREMIUM_CACHE_MS);
+            if m.len() > 4096 {
+                m.retain(|_, until| *until > now);
+            }
+        }
+    }
+
+    /// A resolve succeeded: forget any negative entry so the very next scan can
+    /// re-resolve normally.
+    fn clear_no_premium(&self, sid: i64, side: &str) {
+        let key = Self::no_premium_key(sid, side);
+        if let Ok(mut m) = self.no_premium_until.lock() {
+            m.remove(&key);
+        }
     }
 
     fn doc(&self) -> Option<std::sync::MutexGuard<'_, RtDoc>> {
@@ -3179,6 +3321,37 @@ impl RealtimeState {
         0.0
     }
 
+    /// Ask a background task to REST-seed one candle series. Deduplicated by
+    /// `"{exch}:{sec}:{tf}"`, so a scan that finds the series still cold every
+    /// 100ms queues exactly one fetch instead of one per pass. The fetch itself
+    /// waits on the shared Dhan gate, which is why it must never run inline in
+    /// the evaluation loop.
+    fn request_candle_seed(&self, sec_id: i64, exch: &str, inst: &str, tf: &str) {
+        if sec_id <= 0 {
+            return;
+        }
+        let key = format!("{}:{}:{}", exch.to_uppercase(), sec_id, tf);
+        {
+            let Ok(mut g) = self.seed_inflight.lock() else { return };
+            if !g.insert(key.clone()) {
+                return;
+            }
+        }
+        let this = self.clone();
+        let (inst, tf) = (inst.to_string(), tf.to_string());
+        let (exch, key2) = (exch.to_string(), key);
+        tokio::spawn(async move {
+            if !this.dhan.rate_limited() {
+                if let Ok(c) = this.dhan.fetch_candles(sec_id, &exch, &inst, &tf).await {
+                    this.dhan.market.seed_bars(sec_id, &exch, &tf, c);
+                }
+            }
+            if let Ok(mut g) = this.seed_inflight.lock() {
+                g.remove(&key2);
+            }
+        });
+    }
+
     /// Tick-native candle series.
     ///
     /// First use seeds the series from one REST fetch; every later call is
@@ -3201,23 +3374,39 @@ impl RealtimeState {
     ) -> Result<Vec<Candle>, dhan_hq::DhanError> {
         let raw = if let Some(c) = self.dhan.market.live_bars_for(sec_id, exch, tf, LIVE_BAR_TTL) {
             c
-        } else {
-            match self.dhan.fetch_candles(sec_id, exch, inst, tf).await {
-                Ok(c) => {
-                    self.dhan.market.seed_bars(sec_id, exch, tf, c.clone());
-                    c
+        } else if self.dhan.rate_limited() {
+            // Dhan's data gate is holding after a 429. A REST call here would
+            // sleep for the whole penalty (up to 120s) INSIDE the scan loop, which
+            // is exactly what froze entries. Serve the last series instead (it is
+            // still tick-advanced) and let the gate reopen on its own.
+            match self
+                .dhan
+                .market
+                .live_bars_for(sec_id, exch, tf, Duration::from_secs(900))
+            {
+                Some(stale) => stale,
+                None => {
+                    return Err(dhan_hq::DhanError::Message(
+                        "Dhan data gate is holding after a rate limit; no live series yet".into(),
+                    ))
                 }
-                Err(e) => {
-                    // Never blank a running strategy just because one REST refresh
-                    // failed - serve the last live series (bounded) instead.
-                    match self
-                        .dhan
-                        .market
-                        .live_bars_for(sec_id, exch, tf, Duration::from_secs(900))
-                    {
-                        Some(stale) => stale,
-                        None => return Err(e),
-                    }
+            }
+        } else {
+            // Cold series: ask for a BACKGROUND seed and return the last known
+            // series (if any) this pass. Seeding synchronously here is what let a
+            // single throttled Dhan candle call hold the whole evaluation loop for
+            // seconds at a time - the loop now never waits on it.
+            self.request_candle_seed(sec_id, exch, inst, tf);
+            match self
+                .dhan
+                .market
+                .live_bars_for(sec_id, exch, tf, Duration::from_secs(900))
+            {
+                Some(stale) => stale,
+                None => {
+                    return Err(dhan_hq::DhanError::Message(
+                        "candle series is warming from a background seed".into(),
+                    ))
                 }
             }
         };
@@ -3682,6 +3871,13 @@ impl RealtimeState {
         self.scan_passes.load(Ordering::Relaxed)
     }
 
+    /// Freshness of the background scanner pass (ms stamp; 0 = never completed).
+    /// A stale value here means Top Movers / Liquid F&O picks are frozen (usually
+    /// a Dhan rate-limit hold) while the evaluation loop itself stays alive.
+    pub fn diagnostic_scanner_heartbeat(&self) -> i64 {
+        self.scanner_heartbeat.load(Ordering::Relaxed)
+    }
+
     pub fn diagnostic_entries_placed(&self) -> i64 {
         self.entries_placed.load(Ordering::Relaxed)
     }
@@ -4087,6 +4283,69 @@ impl RealtimeState {
     // Engine loop
     // -----------------------------------------------------------------------
 
+    /// Background scanner pass: Top Movers, Liquid F&O and every trend section.
+    ///
+    /// This is the engine's heaviest Dhan REST consumer (whole-universe quote
+    /// walks + candle fetches). It used to run inline in the engine loop, so a
+    /// `429` hold (10s, doubling to 120s) blocked the loop itself: the heartbeat
+    /// went stale and NOTHING was evaluated - the trade-less stall this task
+    /// exists to prevent. It now runs on its own task, never concurrently with
+    /// itself, and the engine loop only reads the caches it publishes.
+    fn spawn_scanners(self) {
+        tokio::spawn(async move {
+            loop {
+                // Manual Strike Select owns the readout: pause the scanner
+                // universe exactly like the inline version did.
+                let manual = self
+                    .doc()
+                    .map(|d| d.settings.manual_strikes_enabled)
+                    .unwrap_or(false);
+                if !manual && !self.scanner_busy.swap(true, Ordering::AcqRel) {
+                    self.refresh_movers().await;
+                    self.refresh_liquid().await;
+                    self.refresh_nifty_trend().await;
+                    self.refresh_nifty_scan().await;
+                    self.refresh_commodity_picked().await;
+                    self.refresh_index_comm_trends().await;
+                    self.scanner_heartbeat.store(now_ms(), Ordering::Relaxed);
+                    self.scanner_busy.store(false, Ordering::Release);
+                }
+                // The individual refreshes keep their own cadence throttles; this
+                // only bounds how often the pass is re-attempted.
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        });
+    }
+
+    /// Record a `scanner-stale` blocker when the background scanner pass has not
+    /// completed for a while, so a rate-limited / parked scanner is visible in
+    /// the "Why no trades?" panel instead of silently producing no picks.
+    fn note_stale_scanner(&self) {
+        let stamp = self.scanner_heartbeat.load(Ordering::Relaxed);
+        if stamp <= 0 {
+            return;
+        }
+        let age = now_ms().saturating_sub(stamp);
+        if age >= SCANNER_STALE_MS {
+            let hold = self.dhan.rate_hold_remaining();
+            let detail = if hold > 0.0 {
+                format!(
+                    "scanner pass has not completed for {}s - Dhan data gate is holding {} more seconds after a 429 (picks are frozen, entries resume when it clears)",
+                    age / 1000,
+                    hold
+                )
+            } else {
+                format!(
+                    "scanner pass has not completed for {}s - Top Movers / Liquid F&O picks are frozen until it returns",
+                    age / 1000
+                )
+            };
+            self.note_blocker("warn", "scanner-stale", "", &detail);
+        } else {
+            self.clear_blocker_codes(&["scanner-stale"]);
+        }
+    }
+
     fn spawn_engine(self) {
         tokio::spawn(async move {
             // Engine loop. Housekeeping runs on a base ~100ms cadence; the entry
@@ -4114,6 +4373,11 @@ impl RealtimeState {
                     .doc()
                     .map(|d| d.settings.manual_strikes_enabled)
                     .unwrap_or(false);
+                // The scanner REST work runs on its OWN task (see
+                // `spawn_scanners`): it is the biggest Dhan data consumer and a
+                // rate-limit hold there must never freeze the evaluation loop
+                // that this heartbeat proves alive. The loop only publishes the
+                // manual rows and reads the scanner caches.
                 if manual_mode {
                     // Manual Strike Select (testing): the scanner universes are
                     // inactive, and the Picked Strikes readout is the manual list.
@@ -4122,12 +4386,7 @@ impl RealtimeState {
                     // Leaving manual mode: drop any leftover manual rows so the
                     // scanner readouts own the list again.
                     self.update_picked("Manual", Vec::new());
-                    self.refresh_movers().await;
-                    self.refresh_liquid().await;
-                    self.refresh_nifty_trend().await;
-                    self.refresh_nifty_scan().await;
-                    self.refresh_commodity_picked().await;
-                    self.refresh_index_comm_trends().await;
+                    self.note_stale_scanner();
                 }
                 // Broker account (funds/positions/holdings) and open-position LTP
                 // refresh regardless of run/arm, so the Account view is live
@@ -4788,7 +5047,7 @@ impl RealtimeState {
         // - the loop that keeps Dhan rate-limited and makes the disconnect stick.
         // Allow only an occasional seed while the socket is down, and never while
         // the account is parked or already rate-limited.
-        if !self.dhan.feed_live() {
+        if !self.dhan.feed_live() || self.dhan.rate_limited() {
             if self.dhan.park_active() || self.dhan.rate_limited() {
                 return rows;
             }
@@ -4804,6 +5063,11 @@ impl RealtimeState {
             return rows;
         };
         for chunk in missing.chunks(100) {
+            // A chunk may have charged the adaptive gate a `429` hold. Stop the
+            // pass instead of paying the hold again for every remaining chunk.
+            if self.dhan.rate_limited() {
+                break;
+            }
             let mut req: BTreeMap<String, Vec<i64>> = BTreeMap::new();
             for (id, seg) in chunk {
                 if *id > 0 {
@@ -4816,6 +5080,7 @@ impl RealtimeState {
             self.dhan.dhan_throttle().await;
             match client.market_feed_quote(&req).await {
                 Ok(resp) => {
+                    self.dhan.note_data_ok();
                     for (seg, m) in resp.iter() {
                         for (sid, q) in m.iter() {
                             let prev = q.ohlc.as_ref().map(|o| o.close).unwrap_or(0.0);
@@ -4928,6 +5193,11 @@ impl RealtimeState {
                 univ.push((*sid, "NSE_EQ".to_string()));
             }
         }
+        // Stream the liquid basket (and manual adds) on Ticker packets so its
+        // ranking reads the websocket cache instead of REST-seeding the whole
+        // basket on every pass. It used to be the one scanner with no
+        // subscription at all, which is why it kept charging the data gate.
+        self.dhan.watch_scanner_now(&univ);
         let rows: Vec<Value> = self.quote_rows(&univ).await;
         let mut sorted = rows.clone();
         sorted.sort_by(|a, b| jf(b, "changePct").partial_cmp(&jf(a, "changePct")).unwrap_or(std::cmp::Ordering::Equal));
@@ -5084,8 +5354,11 @@ impl RealtimeState {
         univ.dedup();
         // Stream the whole scan universe on the live feed so the Top Movers /
         // Top Losers re-rank from the websocket cache (fast) instead of a REST
-        // round-trip on every 100ms pass. The first pass still REST-seeds.
-        self.dhan.watch_options_now(&univ);
+        // round-trip on every 100ms pass. The universe only needs an LTP for
+        // ranking, so it rides on Ticker packets; the first pass still
+        // REST-seeds. Option strikes resolved from it are promoted to Full
+        // separately by the strike path.
+        self.dhan.watch_scanner_now(&univ);
         let rows: Vec<Value> = self.quote_rows(&univ).await;
         // A stock that the Liquid F&O scanner owns (whole liquid basket while it
         // is armed, plus its manual adds and explicit gainer/loser picks) must
@@ -5280,14 +5553,16 @@ impl RealtimeState {
             self.update_picked("Commodities", Vec::new());
             return;
         }
-        // Warm the commodity underlyings (+ their resolved option legs below) on
-        // the live feed so the ATM centring spot and the +green scan have quotes.
+        // Warm the commodity underlyings on the live feed so the ATM centring
+        // spot has a quote. Underlyings only need an LTP, so they ride on
+        // Ticker packets; the resolved option legs below are promoted to Full
+        // by the strike path.
         let univ: Vec<(i64, String)> = rows
             .iter()
             .filter(|c| c.has_options)
             .map(|c| (c.security_id, "MCX_COMM".to_string()))
             .collect();
-        self.dhan.watch_options_now(&univ);
+        self.dhan.watch_scanner_now(&univ);
         let mut legs: Vec<Value> = Vec::new();
         for c in rows {
             if !c.has_options {
@@ -7328,10 +7603,26 @@ impl RealtimeState {
                 }
             }
             if want_premium {
-                if let Some(pair) = self.premium_candles(&strat, &settings).await {
+                let side = self.desired_option_side(&settings, &strat);
+                if self.no_premium_cached(strat.security_id, &side) {
+                    // A recent resolve failed for this underlying + side. Skip the
+                    // whole resolution instead of re-walking the option chain on
+                    // every 100ms tick; the cache lapses on its own. The blocker is
+                    // still refreshed so the panel keeps naming the live reason.
+                    if run_mode == "premium" {
+                        self.note_blocker(
+                            "warn",
+                            "no-premium",
+                            &strat.name,
+                            &format!("{} - no {side} option contracts available (premium leg missing, retrying in {})", strat.name, (NO_PREMIUM_CACHE_MS / 1000)),
+                        );
+                        continue;
+                    }
+                } else if let Some(pair) = self.premium_candles(&strat, &settings).await {
+                    self.clear_no_premium(strat.security_id, &side);
                     eval.push(pair);
                 } else {
-                    let side = self.desired_option_side(&settings, &strat);
+                    self.mark_no_premium(strat.security_id, &side);
                     if run_mode == "premium" {
                         self.note_blocker(
                             "warn",
@@ -7647,14 +7938,33 @@ impl RealtimeState {
                 // trading the raw spot would book F&O-sized quantity at full notional
                 // and trip the margin gate.
                 let mut spot = self.ltp_of(strat.security_id, &strat.exchange_segment);
-                if spot <= 0.0 && !self.paper {
+                if spot <= 0.0 {
+                    // Make sure the underlying is streaming, then give the feed a
+                    // short bounded window to print its first tick (paper never
+                    // pays a REST quote for it).
+                    self.dhan
+                        .subscribe_options(&[(strat.security_id, strat.exchange_segment.clone())])
+                        .await;
+                    spot = self.wait_feed_ltp(strat.security_id, &strat.exchange_segment, 800).await;
+                }
+                if spot <= 0.0 && !self.paper && !self.dhan.rate_limited() {
                     spot = self.fetch_ltp(strat.security_id, &strat.exchange_segment).await;
                 }
                 // Resolve the execution contracts from the operator's strike
                 // preferences (ATM / ITM / OTM / strike mode + Number of Strikes).
-                let legs = self.resolve_option_strategies(&strat, spot, &settings, false, false);
+                let side = self.desired_option_side(&settings, &strat);
+                let legs = if self.no_premium_cached(strat.security_id, &side) {
+                    Vec::new()
+                } else {
+                    let legs = self.resolve_option_strategies(&strat, spot, &settings, false, false);
+                    if legs.is_empty() {
+                        self.mark_no_premium(strat.security_id, &side);
+                    } else {
+                        self.clear_no_premium(strat.security_id, &side);
+                    }
+                    legs
+                };
                 if legs.is_empty() {
-                    let side = self.desired_option_side(&settings, &strat);
                     self.note_blocker(
                         "warn",
                         "no-premium",
@@ -8153,6 +8463,7 @@ impl RealtimeState {
                 net_tp_min,
                 net_tp_giveback_pct,
                 slip_bps,
+                spread,
                 net_deduct_charges,
                 breakeven_done,
                 partial_done,
@@ -8189,6 +8500,7 @@ impl RealtimeState {
                     d.settings.net_tp_min,
                     d.settings.net_tp_giveback_pct,
                     d.settings.paper_slippage_bps,
+                    PaperSpread::from(&d.settings),
                     // Charges are a real cost on every engine: real Dhan trades
                     // settle them broker-side (so the ledger shows gross) but the
                     // Net TP decision must still deduct them.
@@ -8251,6 +8563,7 @@ impl RealtimeState {
                             spot,
                             self.paper,
                             slip_bps,
+                            spread,
                         );
                         if dir.abs() == 1
                             && dir as i32 == exposure
@@ -8418,8 +8731,8 @@ impl RealtimeState {
             // the operator's rupee floor; after that it gives back a fixed
             // percentage of that peak (25% by default) before exiting.
             let net_at = |px: f64| -> f64 {
-                let exit_px = if slip_bps > 0.0 {
-                    paper_fill_price(px, !is_buy, slip_bps)
+                let exit_px = if slip_bps > 0.0 || spread.on {
+                    spread.fill(px, !is_buy, slip_bps)
                 } else {
                     px
                 };
@@ -8524,8 +8837,8 @@ impl RealtimeState {
                         // round-trip charges + exit slippage. A target can be
                         // technically hit while a far-OTM/near-expiry option's
                         // premium stays flat; cutting there only realises a loss.
-                        let exit_px = if self.paper && slip_bps > 0.0 {
-                            paper_fill_price(ltp, false, slip_bps)
+                        let exit_px = if self.paper && (slip_bps > 0.0 || spread.on) {
+                            spread.fill(ltp, false, slip_bps)
                         } else {
                             ltp
                         };
@@ -10218,7 +10531,21 @@ impl RealtimeState {
             None => (strat.security_id, strat.exchange_segment.clone()),
         };
         let mut spot = self.ltp_of(spot_sid, &spot_seg);
-        if spot <= 0.0 && !self.paper {
+        if spot <= 0.0 {
+            // The underlying is not streaming yet. Subscribe it on the live feed
+            // (paper is REST-free by design) and give the socket a short bounded
+            // window to deliver its first tick. Previously paper returned `None`
+            // here immediately, so any scanner pick whose underlying had not been
+            // subscribed reported "no option contracts available" forever.
+            self.dhan
+                .subscribe_options(&[(spot_sid, spot_seg.clone())])
+                .await;
+            spot = self.wait_feed_ltp(spot_sid, &spot_seg, 1500).await;
+        }
+        if spot <= 0.0 && !self.paper && !self.dhan.rate_limited() {
+            // Live may pay one REST LTP call, but never while Dhan's data gate is
+            // holding after a 429 - that call would sleep the whole penalty inside
+            // the scan loop.
             spot = self.fetch_ltp(spot_sid, &spot_seg).await;
         }
         if spot <= 0.0 {
@@ -11261,7 +11588,7 @@ impl RealtimeState {
                 return Err(msg);
             }
             filled = qty;
-            let base = paper_fill_price(ltp, is_buy_entry, settings.paper_slippage_bps);
+            let base = paper_exec_fill(ltp, is_buy_entry, &settings);
             if slice_plan.is_empty() {
                 base
             } else {
@@ -11557,6 +11884,7 @@ impl RealtimeState {
                     spot,
                     self.paper,
                     settings.paper_slippage_bps,
+                    PaperSpread::from(&settings),
                 );
                 if side.eq_ignore_ascii_case("BUY")
                     && pdir.abs() == 1
@@ -11933,11 +12261,12 @@ fn apportion(total: i64, held: &BTreeMap<String, i64>, route: &[String]) -> BTre
         let broker = jb(&pos, "broker");
         let cfg = cfg_map.get(&method).cloned().unwrap_or(json!({}));
         let is_buy = side == "BUY";
-        // Paper exits fill at the mark with adverse slippage. The exit order is
-        // the opposite side of the position (a BUY position sells, a SELL
-        // position buys), so pass `!is_buy` to get the adverse direction.
+        // Paper exits fill at the mark with the bid/ask spread crossed and then
+        // adverse slippage applied. The exit order is the opposite side of the
+        // position (a BUY position sells, a SELL position buys), so pass
+        // `!is_buy` to get the adverse direction.
         let exit_price = if self.paper {
-            paper_fill_price(exit_price, !is_buy, settings.paper_slippage_bps)
+            paper_exec_fill(exit_price, !is_buy, &settings)
         } else {
             exit_price
         };
@@ -13968,6 +14297,19 @@ const IND_GLOBAL_CAP: usize = 8192;
 /// scan re-seeds it from REST. Kept a few seconds so a subscribed feed keeps the
 /// hot path REST-free while an unsubscribe/quiet symbol still self-heals.
 const LIVE_BAR_TTL: Duration = Duration::from_secs(2);
+
+/// Age of the last completed background scanner pass after which the "Why no
+/// trades?" panel reports `scanner-stale`. The pass normally completes in well
+/// under a second; anything this old means the Dhan data gate is holding it (a
+/// `429` penalty) or the pass is wedged, so the operator sees frozen picks
+/// explained instead of silently empty Top Movers / Liquid F&O lists.
+const SCANNER_STALE_MS: i64 = 20_000;
+
+/// How long an underlying + option side whose premium leg could not be resolved
+/// (missing expiry, empty strike bucket, or every strike red) is skipped before
+/// the resolver is tried again. The scan runs at 100ms, so without this the same
+/// failure re-ran the whole option resolution on every tick.
+const NO_PREMIUM_CACHE_MS: i64 = 90_000;
 
 /// Fixed cadence at which the colour detection is re-read. Both the NIFTY-trend
 /// colour confirmation and the `SlColor*` indicator-filter gate scan the line
@@ -17399,6 +17741,7 @@ fn target_econ(
     spot: f64,
     paper: bool,
     slip_bps: f64,
+    spread: PaperSpread,
 ) -> Value {
     let dir = plan.get("direction").and_then(|v| v.as_i64()).unwrap_or(0);
     let target = plan.get("target").and_then(|v| v.as_f64()).unwrap_or(0.0);
@@ -17442,8 +17785,8 @@ fn target_econ(
         // Futures / linear exposure: one point of underlying is one point of P&L.
         ((entry + (target - spot)).max(0.01), (entry + (stop - spot)).max(0.01))
     };
-    let target_fill = if paper { paper_fill_price(target_exit, false, slip_bps) } else { target_exit };
-    let stop_fill = if paper { paper_fill_price(stop_exit, false, slip_bps) } else { stop_exit };
+    let target_fill = if paper { spread.fill(target_exit, false, slip_bps) } else { target_exit };
+    let stop_fill = if paper { spread.fill(stop_exit, false, slip_bps) } else { stop_exit };
     let gross_profit = (target_fill - entry) * qty;
     let gross_loss = (stop_fill - entry) * qty;
     let charges_profit = compute_charges_for_trade(
@@ -17658,6 +18001,7 @@ fn target_lab_view(p: &Value, settings: &Settings, ltp_map: &HashMap<i64, f64>, 
                     spot,
                     paper,
                     settings.paper_slippage_bps,
+                    PaperSpread::from(settings),
                 )
             })
     } else {
@@ -18101,6 +18445,12 @@ pub async fn settings_post(State(rt): State<RealtimeState>, Json(v): Json<Value>
         d.settings.auto_lot_oi_pct = d.settings.auto_lot_oi_pct.clamp(0.0, 100.0);
         d.settings.slice_lot_limit = d.settings.slice_lot_limit.max(0.0).round();
         d.settings.slice_lots = d.settings.slice_lots.max(0.0).round();
+        // Bid/Ask spread hygiene: both legs are non-negative costs, and a spread
+        // wider than the price itself is meaningless (the fill model already
+        // caps it at 2x the mark). Clamp here so a hand-edited state file or a
+        // raw POST can never store a negative cost that would INCREASE P&L.
+        d.settings.paper_bid_ask_rs = d.settings.paper_bid_ask_rs.max(0.0);
+        d.settings.paper_bid_ask_pct = d.settings.paper_bid_ask_pct.clamp(0.0, 100.0);
         // PRIMARY "Entry indicator filter" hygiene: trim, drop blanks and
         // de-duplicate so a hand-edited file or repeated POST can never grow the
         // list with duplicates (which would be harmless but noisy in the UI).
@@ -22165,6 +22515,7 @@ mod gate_tests {
             22600.0,
             true,
             5.0,
+            PaperSpread::default(),
         );
         assert_eq!(good["ok"], json!(true));
         assert!(good["expectedProfit"].as_f64().unwrap_or(0.0) > 0.0);
@@ -22193,6 +22544,7 @@ mod gate_tests {
             252.0,
             true,
             5.0,
+            PaperSpread::default(),
         );
         assert_eq!(bad["ok"], json!(false));
         assert!(bad["expectedProfit"].as_f64().unwrap_or(0.0) <= 1.0);
@@ -22399,6 +22751,39 @@ mod gate_tests {
             let r = paper_rand01(paper_seed(i));
             assert!((0.0..1.0).contains(&r), "rand out of range: {r}");
         }
+    }
+
+    #[test]
+    fn paper_spread_crosses_half_per_side_and_stacks_with_slippage() {
+        // OFF = no spread, identical to a slippage-only fill.
+        let off = PaperSpread::default();
+        assert_eq!(off.full(100.0), 0.0);
+        assert_eq!(off.fill(100.0, true, 0.0), 100.0);
+        assert_eq!(off.fill(100.0, false, 0.0), 100.0);
+
+        // Rs and % are summed into one full spread; each side pays half.
+        let s = PaperSpread { on: true, rs: 1.0, pct: 1.0 };
+        // 1 rupee + 1% of 100 = 2 rupees full, 1 rupee half.
+        assert!((s.full(100.0) - 2.0).abs() < 1e-9);
+        assert!((s.fill(100.0, true, 0.0) - 101.0).abs() < 1e-9);
+        assert!((s.fill(100.0, false, 0.0) - 99.0).abs() < 1e-9);
+
+        // Slippage stacks on top of the spread-crossed price.
+        let slipped = s.fill(100.0, true, 100.0);
+        // 101 crossed, then +1% slippage of 101 = 102.01.
+        assert!((slipped - 102.01).abs() < 1e-9);
+
+        // A SELL can never be pushed below the 0.05 floor, even with a huge spread.
+        let huge = PaperSpread { on: true, rs: 1_000_000.0, pct: 0.0 };
+        assert!(huge.fill(1.0, false, 0.0) >= 0.05);
+    }
+
+    #[test]
+    fn paper_exec_fill_matches_slippage_only_when_spread_off() {
+        let mut s = Settings::default();
+        s.paper_slippage_bps = 5.0;
+        assert!((paper_exec_fill(100.0, true, &s) - paper_fill_price(100.0, true, 5.0)).abs() < 1e-9);
+        assert!((paper_exec_fill(100.0, false, &s) - paper_fill_price(100.0, false, 5.0)).abs() < 1e-9);
     }
 
     #[test]
@@ -25449,5 +25834,54 @@ mod account_tests {
                 c.name
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod no_premium_cache_tests {
+    use super::*;
+
+    fn state() -> RealtimeState {
+        RealtimeState::new_paper(crate::broker::DhanState::new(crate::market::MarketState::new()))
+    }
+
+    #[tokio::test]
+    async fn a_failed_resolve_is_cached_per_underlying_and_side() {
+        let rt = state();
+        assert!(!rt.no_premium_cached(22377, "CE"));
+        rt.mark_no_premium(22377, "CE");
+        assert!(rt.no_premium_cached(22377, "CE"));
+        // The other side and every other underlying stay resolvable: the cache is
+        // per underlying + side, never a global switch.
+        assert!(!rt.no_premium_cached(22377, "PE"));
+        assert!(!rt.no_premium_cached(9599, "CE"));
+    }
+
+    #[tokio::test]
+    async fn a_successful_resolve_clears_the_cache() {
+        let rt = state();
+        rt.mark_no_premium(22377, "CE");
+        rt.clear_no_premium(22377, "CE");
+        assert!(!rt.no_premium_cached(22377, "CE"));
+    }
+
+    #[tokio::test]
+    async fn an_expired_entry_is_no_longer_cached() {
+        let rt = state();
+        rt.mark_no_premium(22377, "CE");
+        // Simulate the TTL lapsing without sleeping 90s.
+        if let Ok(mut m) = rt.no_premium_until.lock() {
+            m.insert(RealtimeState::no_premium_key(22377, "CE"), now_ms() - 1);
+        }
+        assert!(!rt.no_premium_cached(22377, "CE"));
+    }
+
+    #[tokio::test]
+    async fn side_keys_are_case_insensitive() {
+        let rt = state();
+        rt.mark_no_premium(13, "ce");
+        assert!(rt.no_premium_cached(13, "CE"));
+        rt.clear_no_premium(13, "CE");
+        assert!(!rt.no_premium_cached(13, "ce"));
     }
 }

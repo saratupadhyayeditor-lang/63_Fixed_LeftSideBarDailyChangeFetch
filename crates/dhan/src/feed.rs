@@ -93,6 +93,20 @@ impl FeedMode {
         }
     }
 
+    /// Depth of this mode. A subscribe request may only PROMOTE an instrument
+    /// (Ticker -> Full once a strike needs OI/volume); a request for a shallower
+    /// mode must never downgrade an existing subscription, or the scanner's
+    /// repeated Ticker registrations would keep re-sending the same instrument
+    /// and rebuilding its stream (subscription churn that trips Dhan's limits).
+    pub fn depth(&self) -> u8 {
+        match self {
+            FeedMode::Ticker => 0,
+            FeedMode::Quote => 1,
+            FeedMode::Full => 2,
+            FeedMode::FullDepth => 3,
+        }
+    }
+
     /// Matching unsubscribe request code (Annexure - Feed Request Code).
     pub fn unsubscribe_code(&self) -> u32 {
         match self {
@@ -693,14 +707,19 @@ impl MarketFeed {
                             for s in new {
                                 match subs.iter_mut().find(|e| Self::same(e, &s)) {
                                     // Already subscribed in the same mode: nothing
-                                    // to do. A different mode is an upgrade
+                                    // to do. A deeper mode is an upgrade
                                     // (e.g. Ticker -> Full for a promoted strike),
-                                    // so re-send it with the new RequestCode.
+                                    // so re-send it with the new RequestCode. A
+                                    // shallower one is IGNORED: the scanner
+                                    // re-registers its universe on every pass, and
+                                    // downgrading sent the same instrument back
+                                    // over the wire each time.
                                     Some(e) if e.mode == s.mode => {}
-                                    Some(e) => {
+                                    Some(e) if s.mode.depth() > e.mode.depth() => {
                                         e.mode = s.mode;
                                         added.push(s);
                                     }
+                                    Some(_) => {}
                                     None => {
                                         subs.push(s.clone());
                                         added.push(s);

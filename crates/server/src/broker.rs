@@ -5,7 +5,7 @@
 //! (which is intentionally in-memory only) and bridges live ticks into the
 //! shared [`MarketState`] quote cache.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -113,14 +113,25 @@ const RATE_LIMIT_DECAY_SECS: u64 = 120;
 /// returns a rate-limit error the gate refuses to fire again until `hold_until`,
 /// so a retrying scanner cannot keep the account throttled (the positive
 /// feedback loop that made the feed disconnect every few minutes).
+///
+/// `seen_in_hold` counts the successive `429`s observed inside the CURRENT hold
+/// window; the penalty only doubles when that count looks like a real continued
+/// burst rather than the tail of the initial one.
 #[derive(Default)]
 struct RateHold {
     /// Earliest instant the data gate may fire again.
     hold_until: Option<Instant>,
     /// Current penalty duration in seconds (0 = none).
     penalty_secs: u64,
-    /// When a rate limit was last seen, so a long quiet spell can clear it.
+    /// When the rate limit was last seen, so a long quiet spell can clear it.
     last_limit: Option<Instant>,
+    /// `429` replies absorbed inside the current hold window. Drives the
+    /// once-per-window escalation below.
+    seen_in_hold: u32,
+    /// `429`s absorbed without any successful Dhan data call in between. A
+    /// successful call proves the account recovered, so it resets the ramp
+    /// instead of leaving the penalty at its ceiling for the rest of the day.
+    consecutive_limits: u32,
 }
 
 #[derive(Default)]
@@ -228,6 +239,18 @@ pub struct DhanState {
     /// symbols Dhan's `/marketfeed/quote` reports with `net_change == 0`
     /// (weekends, holidays and pre-open, when the day-close equals the LTP).
     watch: Arc<Mutex<Vec<(i64, String)>>>,
+    /// Option strikes already promoted to Full mode, kept separate from
+    /// [`Self::watch`]. A scanner underlying is registered in `watch` on Ticker
+    /// mode, so using that list to dedup the option hot path would skip the
+    /// Full-mode promotion for any strike whose id was also a scanner
+    /// underlying (leaving its IV/OI/volume permanently missing).
+    option_subs: Arc<Mutex<HashSet<(i64, String)>>>,
+    /// Scanner-underlying instruments already subscribed in Ticker mode. Kept
+    /// apart from [`Self::option_subs`] so a strike can still be promoted from
+    /// Ticker to Full, and cleared whenever a new socket is dialled: the fresh
+    /// connection carries none of the previous socket's instruments, so the
+    /// scanner must re-register its universe on it.
+    scanner_subs: Arc<Mutex<HashSet<(i64, String)>>>,
     /// Serialises every outbound Dhan data call (quote / candle / option chain /
     /// portfolio) and keeps them >= ~1/s apart. Dhan rate-limits these surfaces
     /// together per user (DH-904 / error 805 "too many requests"); running the
@@ -292,6 +315,8 @@ impl DhanState {
             health: Arc::new(Mutex::new(FeedHealth::default())),
             auth_error: Arc::new(Mutex::new(None)),
             watch: Arc::new(Mutex::new(Vec::new())),
+            option_subs: Arc::new(Mutex::new(HashSet::new())),
+            scanner_subs: Arc::new(Mutex::new(HashSet::new())),
             gate: Arc::new(tokio::sync::Mutex::new(
                 Instant::now() - Duration::from_secs(5),
             )),
@@ -451,6 +476,72 @@ impl DhanState {
         }
     }
 
+    /// Subscribe the scanner's UNDERLYING universe in Ticker mode (LTP only).
+    ///
+    /// The scanners re-register their whole universe on every pass, and the
+    /// universe only needs an LTP plus the prev-close backfill for its
+    /// gain/loss ranking - no volume, OI or depth. Sending it as Full pulled
+    /// 21-field quote packets for hundreds of underlyings on every pass, which
+    /// is where most of the websocket bandwidth (and the "corrupt message"
+    /// resets that churned the socket) came from. Option strikes still go
+    /// through [`Self::watch_options_now`] in Full mode because IV, OI and the
+    /// order pricing need them.
+    pub fn watch_scanner_now(&self, secs: &[(i64, String)]) {
+        if secs.is_empty() {
+            return;
+        }
+        self.market.register_extra(secs);
+        // Only feed the prev-close backfill set; the Ticker subscription has its
+        // own dedup book so it survives a mode mismatch with the option path.
+        {
+            let Ok(mut g) = self.watch.lock() else { return };
+            for (sid, exch) in secs {
+                if *sid <= 0 {
+                    continue;
+                }
+                let entry = (*sid, exch.to_uppercase());
+                if !g.contains(&entry) {
+                    g.push(entry);
+                }
+            }
+            const MAX_WATCH: usize = 8000;
+            if g.len() > MAX_WATCH {
+                let drop_n = g.len() - MAX_WATCH;
+                g.drain(0..drop_n);
+            }
+        }
+        let mut fresh: Vec<(i64, String)> = Vec::new();
+        {
+            let Ok(mut g) = self.scanner_subs.lock() else { return };
+            for (sid, exch) in secs {
+                if *sid <= 0 {
+                    continue;
+                }
+                let entry = (*sid, exch.to_uppercase());
+                if g.insert(entry.clone()) {
+                    fresh.push(entry);
+                }
+            }
+        }
+        if fresh.is_empty() {
+            return;
+        }
+        let subs: Vec<FeedSubscription> = fresh
+            .iter()
+            .filter_map(|(sid, exch)| {
+                exchange_segment(exch).map(|seg| FeedSubscription::with_mode(seg, *sid, FeedMode::Ticker))
+            })
+            .collect();
+        if subs.is_empty() {
+            return;
+        }
+        if let Ok(g) = self.feed_tx.lock() {
+            if let Some(tx) = g.as_ref() {
+                let _ = tx.send(FeedCommand::Subscribe(subs));
+            }
+        }
+    }
+
     /// Synchronous, deduplicated "make sure these strikes are streaming" used by
     /// the entry hot path (the "+green premium" scan) so its candidate window can
     /// be quoted without awaiting a REST/feed round-trip. Returns immediately;
@@ -460,7 +551,9 @@ impl DhanState {
             return;
         }
         self.market.register_extra(secs);
-        let mut fresh: Vec<(i64, String)> = Vec::new();
+        // Register these in the daily-candle backfill set too (the strike's prev
+        // close drives its change%), but dedup the FEED subscription on the
+        // dedicated Full-mode set so a scanner-underlying id still gets promoted.
         {
             let Ok(mut g) = self.watch.lock() else { return };
             for (sid, exch) in secs {
@@ -469,7 +562,24 @@ impl DhanState {
                 }
                 let entry = (*sid, exch.to_uppercase());
                 if !g.contains(&entry) {
-                    g.push(entry.clone());
+                    g.push(entry);
+                }
+            }
+            const MAX_WATCH: usize = 8000;
+            if g.len() > MAX_WATCH {
+                let drop_n = g.len() - MAX_WATCH;
+                g.drain(0..drop_n);
+            }
+        }
+        let mut fresh: Vec<(i64, String)> = Vec::new();
+        {
+            let Ok(mut g) = self.option_subs.lock() else { return };
+            for (sid, exch) in secs {
+                if *sid <= 0 {
+                    continue;
+                }
+                let entry = (*sid, exch.to_uppercase());
+                if g.insert(entry.clone()) {
                     fresh.push(entry);
                 }
             }
@@ -504,11 +614,21 @@ impl DhanState {
         // in-flight gate wait.
         let hold = {
             let mut h = self.rate_hold.lock().unwrap_or_else(|e| e.into_inner());
+            // The hold window has expired: this gate is opening again, so the
+            // burst counter restarts (the next `429` is a NEW burst and may
+            // escalate). The penalty itself is only forgotten after a long quiet
+            // spell, so a rapid re-burst keeps its larger step.
+            if h.hold_until.map(|u| u <= Instant::now()).unwrap_or(false) {
+                h.hold_until = None;
+                h.seen_in_hold = 0;
+            }
             if let Some(t) = h.last_limit {
                 if t.elapsed() >= Duration::from_secs(RATE_LIMIT_DECAY_SECS) {
                     h.penalty_secs = 0;
                     h.hold_until = None;
                     h.last_limit = None;
+                    h.seen_in_hold = 0;
+                    h.consecutive_limits = 0;
                 }
             }
             h.hold_until
@@ -531,20 +651,64 @@ impl DhanState {
     /// penalty (10s, 20s, ... capped at 120s) so a retrying scanner/chart cannot
     /// keep the account throttled - the loop that used to reset the websocket and
     /// eventually park the feed for minutes.
+    ///
+    /// A single burst produces MANY `429` replies (one per in-flight call), so
+    /// the escalation is stepped at most once per hold window and the ramp is
+    /// reset by any successful data call. Without that, one burst jumped the
+    /// penalty to the 120s ceiling and every later burst re-armed it, leaving the
+    /// data gate effectively closed for the whole session.
     pub fn note_rate_limited(&self) {
         let mut h = self.rate_hold.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        let in_current_hold = h.hold_until.map(|u| u > now).unwrap_or(false);
+        h.seen_in_hold = h.seen_in_hold.saturating_add(1);
+        h.consecutive_limits = h.consecutive_limits.saturating_add(1);
+        h.last_limit = Some(now);
+        if in_current_hold && h.seen_in_hold > 1 {
+            // Tail of the same burst: keep the existing hold, never escalate.
+            return;
+        }
         h.penalty_secs = if h.penalty_secs == 0 {
             RATE_LIMIT_FIRST_PENALTY_SECS
         } else {
             (h.penalty_secs * 2).min(RATE_LIMIT_MAX_PENALTY_SECS)
         };
-        let now = Instant::now();
-        h.last_limit = Some(now);
         h.hold_until = Some(now + Duration::from_secs(h.penalty_secs));
         tracing::warn!(
-            "Dhan rate limit hit; pausing data calls for {}s (adaptive)",
-            h.penalty_secs
+            "Dhan rate limit hit; pausing data calls for {}s (adaptive, {} consecutive)",
+            h.penalty_secs,
+            h.consecutive_limits
         );
+    }
+
+    /// A data call actually succeeded: the account is answering again, so the
+    /// adaptive ramp restarts from its first step instead of staying pinned at
+    /// the ceiling. Called from the successful paths of the quote / candle /
+    /// option-chain calls.
+    pub fn note_data_ok(&self) {
+        let mut h = self.rate_hold.lock().unwrap_or_else(|e| e.into_inner());
+        if h.consecutive_limits > 0 {
+            h.consecutive_limits = 0;
+            h.penalty_secs = 0;
+            h.hold_until = None;
+            h.last_limit = None;
+            h.seen_in_hold = 0;
+        }
+    }
+
+    /// Seconds left on the adaptive data-gate hold (0 when the gate is open).
+    /// Surfaced in the diagnostics so a stalled engine can be told apart from one
+    /// that is simply waiting out Dhan's penalty.
+    pub fn rate_hold_remaining(&self) -> f64 {
+        self.rate_hold
+            .lock()
+            .ok()
+            .and_then(|h| {
+                h.hold_until
+                    .map(|u| u.saturating_duration_since(Instant::now()).as_secs_f64())
+            })
+            .map(|v| (v * 10.0).round() / 10.0)
+            .unwrap_or(0.0)
     }
 
     /// True while the adaptive data-gate penalty is still counting down.
@@ -636,6 +800,7 @@ impl DhanState {
             o.insert("feedLive".into(), json!(self.feed_live()));
             o.insert("parkedSec".into(), json!(self.current_park_secs()));
             o.insert("rateLimited".into(), json!(self.rate_limited()));
+            o.insert("rateHoldRemainingSec".into(), json!(self.rate_hold_remaining()));
         }
         out
     }
@@ -808,6 +973,7 @@ impl DhanState {
                 if let Ok(mut c) = self.candle_cache.lock() {
                     c.insert(key.clone(), (Instant::now(), out.clone()));
                 }
+                self.note_data_ok();
                 return Ok(out);
             }
             last_err = Some(DhanError::Invalid("no candles after resample".into()));
@@ -940,6 +1106,7 @@ impl DhanState {
                 match client.market_feed_quote(&one).await {
                     Ok(r) => {
                         any_ok = true;
+                        self.note_data_ok();
                         for (s, m) in r {
                             resp.entry(s).or_default().extend(m);
                         }
@@ -952,6 +1119,13 @@ impl DhanState {
                             "Dhan market quote failed (segment={seg}, n={}): {e}",
                             chunk.len()
                         );
+                        // A `429` means Dhan's budget is gone for the WHOLE
+                        // account: every further chunk in this call would just
+                        // re-arm the penalty and extend the hold. Abort the pass
+                        // and let the caller retry once the gate reopens.
+                        if e.is_rate_limit() {
+                            return None;
+                        }
                     }
                 }
             }
@@ -1496,6 +1670,16 @@ impl DhanState {
         // what produced the endless reconnect + park loop.
         if let Some(prev) = self.take_feed_task() {
             reap_feed_task(prev).await;
+        }
+        // The new socket starts with only the bounded initial set, so both
+        // dedup books must forget the previous socket's instruments; otherwise
+        // the scanner and the option hot path would believe their strikes are
+        // still streaming and never re-subscribe them on the fresh connection.
+        if let Ok(mut g) = self.scanner_subs.lock() {
+            g.clear();
+        }
+        if let Ok(mut g) = self.option_subs.lock() {
+            g.clear();
         }
         // Bound the initial subscribe set. A reconnect used to replay the whole
         // accumulated option-strike set (it grew to ~4k over a session), which
@@ -2862,3 +3046,82 @@ mod data_stall_tests {
     }
 }
 
+
+#[cfg(test)]
+mod rate_hold_tests {
+    use super::*;
+
+    fn state() -> DhanState {
+        DhanState::new(MarketState::new())
+    }
+
+    #[tokio::test]
+    async fn burst_escalates_only_once_per_hold_window() {
+        let st = state();
+        // The first 429 opens the hold at the first penalty step...
+        st.note_rate_limited();
+        let first = st.rate_hold_remaining();
+        assert!(first > 0.0, "first hit must open a hold");
+        assert!(first <= RATE_LIMIT_FIRST_PENALTY_SECS as f64 + 0.1);
+        // ...and every other reply from the SAME burst is absorbed, so one burst
+        // can never jump the penalty to its ceiling.
+        for _ in 0..50 {
+            st.note_rate_limited();
+        }
+        let after = st.rate_hold_remaining();
+        assert!(
+            after <= first + 0.5,
+            "tail of a burst must not escalate (before {first}s, after {after}s)"
+        );
+        assert!(after < RATE_LIMIT_MAX_PENALTY_SECS as f64);
+    }
+
+    #[tokio::test]
+    async fn a_successful_call_resets_the_ramp() {
+        let st = state();
+        st.note_rate_limited();
+        st.note_data_ok();
+        assert_eq!(st.rate_hold_remaining(), 0.0);
+        assert!(!st.rate_limited());
+        // After recovery the next hit starts from the first step again.
+        st.note_rate_limited();
+        let again = st.rate_hold_remaining();
+        assert!(again > 0.0);
+        assert!(again <= RATE_LIMIT_FIRST_PENALTY_SECS as f64 + 0.1);
+    }
+
+    #[tokio::test]
+    async fn open_gate_reports_no_hold() {
+        let st = state();
+        assert_eq!(st.rate_hold_remaining(), 0.0);
+        assert!(!st.rate_limited());
+    }
+
+    /// A scanner underlying is subscribed on Ticker mode; when the strike path
+    /// later asks for the SAME security id it must still emit a Full-mode
+    /// subscribe, otherwise the scanner's Ticker registration would silently
+    /// suppress the strike's IV/OI/volume stream.
+    #[tokio::test]
+    async fn scanner_ticker_does_not_block_full_promotion() {
+        let st = state();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        if let Ok(mut g) = st.feed_tx.lock() {
+            *g = Some(tx);
+        }
+        st.watch_scanner_now(&[(11536, "NSE_EQ".to_string())]);
+        let first = rx.try_recv().expect("scanner subscribe must be sent");
+        let FeedCommand::Subscribe(first) = first else { panic!("expected subscribe") };
+        assert_eq!(first[0].mode, FeedMode::Ticker);
+        // Re-running the scanner pass is deduplicated (no socket churn).
+        st.watch_scanner_now(&[(11536, "NSE_EQ".to_string())]);
+        assert!(rx.try_recv().is_err(), "repeat scanner pass must not resubscribe");
+        // The strike path must still promote the same id to Full.
+        st.watch_options_now(&[(11536, "NSE_EQ".to_string())]);
+        let promote = rx.try_recv().expect("Full promotion must be sent");
+        let FeedCommand::Subscribe(promote) = promote else { panic!("expected subscribe") };
+        assert_eq!(promote[0].mode, FeedMode::Full);
+        // ...and its own dedup keeps it from re-sending on the next tick.
+        st.watch_options_now(&[(11536, "NSE_EQ".to_string())]);
+        assert!(rx.try_recv().is_err(), "repeat strike pass must not resubscribe");
+    }
+}

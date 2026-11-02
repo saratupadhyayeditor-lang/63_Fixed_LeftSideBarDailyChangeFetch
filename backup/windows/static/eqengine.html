@@ -91,15 +91,15 @@
   <h3 class="eq-h">Closed trades</h3>
   <div class="eq-table-wrap">
     <table class="eq-t">
-      <thead><tr><th>Symbol</th><th>Status</th><th>Entry</th><th>Exit</th><th>Qty</th><th>P&amp;L</th><th>P&amp;L %</th><th>Days</th><th>Exit date</th><th>Reason</th></tr></thead>
-      <tbody id="eqClosed"><tr><td colspan="10" class="eq-empty">No closed trades yet.</td></tr></tbody>
+      <thead><tr><th>Symbol</th><th>Status</th><th>Entry</th><th>Exit</th><th>Qty</th><th>P&amp;L</th><th>P&amp;L %</th><th>Charges</th><th>Net P&amp;L</th><th>Days</th><th>Exit date</th><th>Reason</th></tr></thead>
+      <tbody id="eqClosed"><tr><td colspan="12" class="eq-empty">No closed trades yet.</td></tr></tbody>
     </table>
   </div>
   <h3 class="eq-h">Activity log</h3>
   <div class="eq-log" id="eqLog"><div class="dim">Waiting for the engine...</div></div>
 </div>
 <script type="module">
-  import { bootEqEngine } from "./eqengine.js?v=17";
+  import { bootEqEngine } from "./eqengine.js?v=18";
   bootEqEngine();
 </script>
 </body>

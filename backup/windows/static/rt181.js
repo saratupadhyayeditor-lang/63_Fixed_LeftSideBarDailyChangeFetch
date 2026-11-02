@@ -7001,11 +7001,18 @@ function renderBlockers(src) {
       const fmtAge = (v) => (v == null ? "never" : (Number(v) < 90 ? Math.round(Number(v)) + "s" : Math.round(Number(v) / 60) + "m") + " ago");
       stateBits.push("loop " + fmtAge(drt.loopAgeSec));
       stateBits.push("scan " + fmtAge(drt.scanAgeSec));
+      stateBits.push("scanner " + fmtAge(drt.scannerAgeSec));
       stateBits.push("last entry " + fmtAge(drt.lastEntryAgeSec));
       if (drt.loopAgeSec != null && Number(drt.loopAgeSec) > 120)
         stateBits.push("LOOP STALLED");
       if (b.connected && drt.scanAgeSec != null && Number(drt.scanAgeSec) > 180)
         stateBits.push("SCAN STALLED");
+      // The scanner pass is separate from the evaluation scan: when it is stale
+      // the engine still evaluates, but its Top Movers / Liquid F&O picks are
+      // frozen (typically a Dhan 429 hold). Surfacing it prevents "engine looks
+      // alive yet nothing new is picked" from being a mystery.
+      if (b.connected && drt.scannerAgeSec != null && Number(drt.scannerAgeSec) > 20)
+        stateBits.push("SCANNER STALE");
     }
     head.innerHTML =
       `<b style="color:#ffd54f">${esc(b.headline || "No blocking reason recorded yet")}</b>` +
@@ -7039,6 +7046,7 @@ function renderBlockers(src) {
       case "research": return "Research / target";
       case "quantity": return "Quantity";
       case "engine-state": return "Engine state";
+      case "scanner-stale": return "Scanner stale";
       case "order-error": return "Order rejected / error";
       default: return code ? String(code) : "Other";
     }

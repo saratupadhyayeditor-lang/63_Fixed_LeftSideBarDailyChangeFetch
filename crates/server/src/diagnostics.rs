@@ -156,6 +156,7 @@ async fn engine_block(rt: &RealtimeState, dhan: &DhanState, engine: &str) -> Val
             "loopPasses": rt.diagnostic_loop_passes(),
             "scanAgeSec": age_secs(rt.diagnostic_scan_heartbeat()),
             "scanPasses": rt.diagnostic_scan_passes(),
+            "scannerAgeSec": age_secs(rt.diagnostic_scanner_heartbeat()),
             "entriesPlaced": rt.diagnostic_entries_placed(),
             "lastEntryAgeSec": age_secs(rt.diagnostic_last_entry()),
         },

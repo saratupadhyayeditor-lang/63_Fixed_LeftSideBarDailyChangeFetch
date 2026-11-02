@@ -316,13 +316,19 @@ function render(v) {
 
   const closed = (v.trades || []).filter((t) => t.exitedAt);
   $("eqClosed").innerHTML = closed.length
-    ? closed.map((t) => `<tr>
+    ? closed.map((t) => {
+        const charges = Number(t.charges) || 0;
+        const net = Number.isFinite(Number(t.netPnl)) ? Number(t.netPnl) : Number(t.pnl) - charges;
+        return `<tr>
         <td class="sym">${esc(t.symbol)}<span class="nm">${esc(t.name)}</span></td>
         <td>${esc(t.status)}</td><td>${fmt(t.entryPrice)}</td><td>${fmt(t.exitPrice)}</td><td>${fmt(t.qty, 0)}</td>
         <td class="${cls(t.pnl)}">${inr(t.pnl)}</td><td class="${cls(t.pnlPct)}">${pct(t.pnlPct)}</td>
+        <td class="dim" title="Round-trip delivery charges (STT + txn + SEBI + stamp + IPFT + GST) for this trade">${inr(-charges)}</td>
+        <td class="${cls(net)}" title="P&L after round-trip delivery charges">${inr(net)}</td>
         <td>${t.days || 0}</td><td>${esc(t.exitDate)}</td><td class="dim">${esc(t.exitReason)}</td>
-      </tr>`).join("")
-    : `<tr><td colspan="10" class="eq-empty">No closed trades yet. Trades close on target, stop, Avoid downgrade or max holding.</td></tr>`;
+      </tr>`;
+      }).join("")
+    : `<tr><td colspan="12" class="eq-empty">No closed trades yet. Trades close on target, stop, Avoid downgrade or max holding.</td></tr>`;
 
   $("eqLog").innerHTML = (v.log && v.log.length)
     ? v.log.map((l) => `<div>${esc(l)}</div>`).join("")
