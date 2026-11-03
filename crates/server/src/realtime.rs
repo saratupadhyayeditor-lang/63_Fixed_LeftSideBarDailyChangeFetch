@@ -618,6 +618,39 @@ pub struct Settings {
     /// indicator reads bullish (no dissenting/bearish line), and a Top Loser (PE)
     /// leg only while EVERY assigned line reads bearish. Any mixed read blocks.
     pub nifty_all_agree_strict: bool,
+    /// "Ignore fake breakouts / fake reversals" master switch. When ON, every
+    /// trend-driven entry (NIFTY, per-index, per-commodity) is checked at the
+    /// pre-order gate against the underlying candles and BLOCKED while the move
+    /// looks like a small fake breakout / fake reversal: too few same-side
+    /// closes, no higher-high/higher-low (bull) or lower-high/lower-low (bear)
+    /// structure, momentum smaller than the ATR multiple, thin volume, weak ADX
+    /// or high chop, or a rejection wick. Running trades are never touched - the
+    /// gate only stops NEW entries. Default OFF (legacy behaviour).
+    pub anti_fake_on: bool,
+    /// Number of most-recent CLOSED candles that must all close on the entry's
+    /// side for a move to count as a real (persistent) trend instead of a
+    /// one-bar blip. Clamped to 1..=20. Default 2.
+    pub anti_fake_bars: usize,
+    /// Minimum net move across the persistence window, as a multiple of ATR.
+    /// A move smaller than this is treated as noise / a fake poke. Clamped to
+    /// 0..=5. Default 0.25.
+    pub anti_fake_atr_mult: f64,
+    /// Minimum volume of the newest closed candle, as a FRACTION of the window's
+    /// average volume. A breakout on clearly thin volume is ignored. Volume data
+    /// that is missing / zero for the series disables this one check. Keep this
+    /// below 1.0 so a steady-volume trend is not blocked. Clamped to 0..=5.
+    /// Default 0.5.
+    pub anti_fake_vol_mult: f64,
+    /// Minimum ADX for a move to count as trending rather than chop. Clamped to
+    /// 0..=100. Default 18.
+    pub anti_fake_adx_min: f64,
+    /// Maximum Choppiness Index allowed for a real trend. Clamped to 0..=100.
+    /// Default 61.8.
+    pub anti_fake_chop_max: f64,
+    /// Minimum bars since the last committed side flip before a NEW opposite
+    /// entry is allowed - a short cooldown that ignores immediate small
+    /// reversals right after a flip. Clamped to 0..=50. Default 2.
+    pub anti_fake_cooldown_bars: usize,
     /// Per-filter settings for the "BB%b Straight Line" NIFTY confirmation
     /// indicator. The engine computes `bbpctsl` with these values (instead of the
     /// chart indicator defaults) when it is one of the assigned confirm
@@ -1106,6 +1139,13 @@ impl Default for Settings {
             ind_cross_bars: 0,
             nifty_net_strict: false,
             nifty_all_agree_strict: false,
+            anti_fake_on: false,
+            anti_fake_bars: 2,
+            anti_fake_atr_mult: 0.25,
+            anti_fake_vol_mult: 0.5,
+            anti_fake_adx_min: 18.0,
+            anti_fake_chop_max: 61.8,
+            anti_fake_cooldown_bars: 2,
             nbsl_length: 20.0,
             nbsl_mult: 2.0,
             nbsl_threshold: 0.5,
@@ -2686,6 +2726,131 @@ fn sideways_read(c: &[Candle]) -> Option<SidewaysRead> {
         range_atr,
         score,
     })
+}
+
+/// Verdict of the "ignore fake breakouts / reversals" filter. `fake` = the
+/// move is a small blip that must not open a NEW trade; `reason` explains why
+/// (surfaced in the entry-blocker log). When the filter is OFF the caller never
+/// invokes this, so a false verdict can never affect legacy behaviour.
+struct FakeMoveRead {
+    fake: bool,
+    reason: &'static str,
+    adx: f64,
+    chop: f64,
+    move_atr: f64,
+}
+
+/// Evaluate whether the newest price action on `c` is a genuine trend move in
+/// the `bull` direction, or a fake breakout / fake reversal that should be
+/// ignored. Every check is fail-OPEN on missing data (returns `fake = false`
+/// when a series/regime cannot be measured) so a thin feed never silently
+/// blocks every entry; only measurable contradictions mark a move fake.
+///
+/// Checks, in order (first failure wins):
+///  1. Persistence: the last `bars` closed candles must ALL close on `bull`'s
+///     side of the window's open - a one-bar flip is a fake reversal.
+///  2. ATR displacement: the net move must be >= `atr_mult` x ATR - a poke
+///     smaller than noise is a fake breakout.
+///  3. Structure: bull needs higher-high + higher-low vs the prior bar, bear
+///     the mirror - a lone close without structure is not a trend.
+///  4. Volume: the newest closed candle must carry >= `vol_mult` x the window's
+///     average volume (skipped when the series has no volume data).
+///  5. Regime: ADX >= `adx_min` and chop <= `chop_max` - blocks entries inside
+///     a choppy / range-bound tape even when a candle pokes out.
+fn anti_fake_read(c: &[Candle], bull: bool, s: &Settings) -> FakeMoveRead {
+    let bars = s.anti_fake_bars.clamp(1, 20);
+    let atr_mult = s.anti_fake_atr_mult.clamp(0.0, 5.0);
+    let vol_mult = s.anti_fake_vol_mult.clamp(0.0, 5.0);
+    let adx_min = s.anti_fake_adx_min.clamp(0.0, 100.0);
+    let chop_max = s.anti_fake_chop_max.clamp(0.0, 100.0);
+    let neutral = FakeMoveRead { fake: false, reason: "", adx: 0.0, chop: 0.0, move_atr: 0.0 };
+    if c.len() < 35 {
+        return neutral;
+    }
+    let Some(atr) = regime_atr(c, 14) else { return neutral };
+    let Some(adx) = adx_last(c, 14) else { return neutral };
+    let Some(chop) = choppiness_last(c, 14) else { return neutral };
+    let n = c.len();
+    let win = bars.min(n - 1);
+    let base = c[n - 1 - win];
+    let last = c[n - 1];
+    let prev = c[n - 2];
+    let move_atr = (last.close - base.open).abs() / atr;
+    let read = |fake: bool, reason: &'static str| FakeMoveRead { fake, reason, adx, chop, move_atr };
+
+    // 1. Persistence: every bar in the window must close on the entry's side.
+    for i in (n - win)..n {
+        let up = c[i].close > c[i].open;
+        let down = c[i].close < c[i].open;
+        if bull && !up {
+            return read(true, "no persistent bullish closes - fake reversal/blip");
+        }
+        if !bull && !down {
+            return read(true, "no persistent bearish closes - fake reversal/blip");
+        }
+    }
+    // 1b. Cooldown right after a flip: if the newest bar's side differs from the
+    //     immediately preceding bars, a fresh reversal just printed. Require at
+    //     least `cooldown` bars of the new side before trusting it, so the small
+    //     flip that always follows a real turn is not traded as its own signal.
+    let cooldown = s.anti_fake_cooldown_bars.clamp(0, 50);
+    if cooldown > 0 {
+        let side_at = |i: usize| -> i8 {
+            if c[i].close > c[i].open { 1 } else if c[i].close < c[i].open { -1 } else { 0 }
+        };
+        let cur_side = if bull { 1 } else { -1 };
+        let mut run = 0usize;
+        let mut i = n;
+        while i > 0 {
+            i -= 1;
+            if side_at(i) == cur_side {
+                run += 1;
+            } else {
+                break;
+            }
+        }
+        if run < cooldown {
+            return read(true, "too soon after a side flip - small reversal cooldown");
+        }
+    }
+    // 2. ATR displacement across the window.
+    if move_atr < atr_mult {
+        return read(true, "net move smaller than ATR multiple - fake breakout");
+    }
+    // 3. Structure: newest closed bar must make the trend's own swing.
+    if bull && !(last.high > prev.high && last.low > prev.low) {
+        return read(true, "no higher-high/higher-low structure - fake breakout");
+    }
+    if !bull && !(last.high < prev.high && last.low < prev.low) {
+        return read(true, "no lower-high/lower-low structure - fake breakout");
+    }
+    // 4. Wick rejection: the candle must not close back inside the prior range
+    //    (a long rejection wick = a failed breakout / reversal trap).
+    let rng = (prev.high - prev.low).max(atr * 0.1);
+    if bull && last.close < prev.high - 0.25 * rng {
+        return read(true, "bullish close rejected back into range - fake breakout");
+    }
+    if !bull && last.close > prev.low + 0.25 * rng {
+        return read(true, "bearish close rejected back into range - fake breakout");
+    }
+    // 5. Volume confirmation, only when the series actually carries volume. A
+    //    candle carrying clearly less than `vol_mult` x the window average is a
+    //    thin move the market did not follow (< 1.0 = "below average" guard).
+    let vol_in_window: f64 = ((n - win - 1)..n).map(|i| c[i].volume).sum();
+    if vol_in_window > 0.0 && last.volume > 0.0 {
+        let avg = vol_in_window / (win + 1) as f64;
+        if avg > 0.0 && last.volume < vol_mult * avg {
+            return read(true, "breakout candle volume below average - thin fake move");
+        }
+    }
+    // 6. Regime: must be trending, not choppy.
+    if adx < adx_min {
+        return read(true, "ADX below minimum - choppy tape, no real trend");
+    }
+    if chop > chop_max {
+        return read(true, "Choppiness above maximum - range-bound, fake move");
+    }
+    FakeMoveRead { fake: false, reason: "", adx, chop, move_atr }
 }
 
 /// Process-wide registry of the constructed engines, keyed by engine id. The
@@ -5859,6 +6024,37 @@ impl RealtimeState {
         }
     }
 
+    /// Pre-order anti-fake gate. When "Ignore fake breakouts / reversals" is ON,
+    /// read the underlying's live candles and block the entry if the newest move
+    /// looks like a small fake breakout / reversal (`anti_fake_read`). A series
+    /// that cannot be read is fail-OPEN here (the trend gates already fail
+    /// closed), so this filter never turns a feed hiccup into a hard stop.
+    async fn anti_fake_entry_ok(
+        &self,
+        sid: i64,
+        seg: &str,
+        inst: &str,
+        tf: &str,
+        bull: bool,
+        s: &Settings,
+    ) -> Result<(), String> {
+        if !s.anti_fake_on {
+            return Ok(());
+        }
+        let read_tf = if tf.eq_ignore_ascii_case("both") { "1min" } else { tf };
+        let Ok(c) = self.live_candles(sid, seg, inst, read_tf).await else {
+            return Ok(());
+        };
+        let v = anti_fake_read(&c, bull, s);
+        if v.fake {
+            return Err(format!(
+                "fake move ignored ({}; ADX {:.1}, chop {:.1}, move {:.2} ATR) - entry blocked",
+                v.reason, v.adx, v.chop, v.move_atr
+            ));
+        }
+        Ok(())
+    }
+
     /// Final pre-order trend confirmation. The scan arms a side from a cached
     /// trend read; by the time the paper delay / LTP warm-up elapses the trend
     /// can have flipped. Re-read the LIVE trend immediately before the order and
@@ -5972,6 +6168,7 @@ impl RealtimeState {
                         nifty_dir_label(want)
                     ));
                 }
+                self.anti_fake_entry_ok(under.security_id, &under.exchange_segment, &under.instrument, &tf, want > 0, s).await?;
                 gated = Some(json!({ "source": "index", "side": want, "dir": dir, "underlying": under.trading_symbol, "checkedAt": checked_at }));
             }
             if self.allows_commodities() && s.comm_trend_on && s.commodity_list.contains(&under.security_id) {
@@ -5986,6 +6183,7 @@ impl RealtimeState {
                         nifty_dir_label(want)
                     ));
                 }
+                self.anti_fake_entry_ok(under.security_id, &under.exchange_segment, &under.instrument, &tf, want > 0, s).await?;
                 gated = Some(json!({ "source": "commodity", "side": want, "dir": dir, "underlying": under.trading_symbol, "checkedAt": checked_at }));
             }
             return Ok(gated);
@@ -5998,6 +6196,12 @@ impl RealtimeState {
             let line_ok = self.nifty_line_side_ok(s, want > 0);
             let sideways = s.no_trade_sideways && self.nifty_sideways.load(Ordering::Relaxed);
             nifty_trend_entry_gate(want, dir, pending, tied, line_ok, sideways)?;
+            // Anti-fake gate on the traded underlying's own candles: a stock leg
+            // riding a small fake breakout / reversal is blocked even though the
+            // NIFTY side itself still reads valid.
+            if let Some(u) = underlying_strategy(strat) {
+                self.anti_fake_entry_ok(u.security_id, &u.exchange_segment, &u.instrument, &tf, want > 0, s).await?;
+            }
             return Ok(Some(json!({
                 "source": "nifty",
                 "side": want,
@@ -18451,6 +18655,15 @@ pub async fn settings_post(State(rt): State<RealtimeState>, Json(v): Json<Value>
         // raw POST can never store a negative cost that would INCREASE P&L.
         d.settings.paper_bid_ask_rs = d.settings.paper_bid_ask_rs.max(0.0);
         d.settings.paper_bid_ask_pct = d.settings.paper_bid_ask_pct.clamp(0.0, 100.0);
+        // Anti-fake filter hygiene: keep every threshold inside a sane band so a
+        // hand-edited state file or a raw POST can never make the gate block
+        // every entry (e.g. bars = 0) or turn it into a no-op by accident.
+        d.settings.anti_fake_bars = d.settings.anti_fake_bars.clamp(1, 20);
+        d.settings.anti_fake_atr_mult = d.settings.anti_fake_atr_mult.clamp(0.0, 5.0);
+        d.settings.anti_fake_vol_mult = d.settings.anti_fake_vol_mult.clamp(0.0, 5.0);
+        d.settings.anti_fake_adx_min = d.settings.anti_fake_adx_min.clamp(0.0, 100.0);
+        d.settings.anti_fake_chop_max = d.settings.anti_fake_chop_max.clamp(0.0, 100.0);
+        d.settings.anti_fake_cooldown_bars = d.settings.anti_fake_cooldown_bars.clamp(0, 50);
         // PRIMARY "Entry indicator filter" hygiene: trim, drop blanks and
         // de-duplicate so a hand-edited file or repeated POST can never grow the
         // list with duplicates (which would be harmless but noisy in the UI).
@@ -22249,6 +22462,66 @@ mod gate_tests {
     }
 
     #[test]
+    fn anti_fake_read_accepts_a_real_trend_and_blocks_fake_moves() {
+        let candle = |i: usize, open: f64, close: f64, hi: f64, lo: f64, vol: f64| Candle {
+            time: i as i64 * 60,
+            open,
+            high: hi,
+            low: lo,
+            close,
+            volume: vol,
+        };
+        let mut s = Settings::default();
+        s.anti_fake_on = true;
+
+        // Genuine bullish trend: persistent green bodies, higher highs/lows, real
+        // displacement, healthy volume, ADX-rich, chop-low. Must pass.
+        let trend: Vec<Candle> = (0..80)
+            .map(|i| {
+                let base = 100.0 + i as f64 * 0.8;
+                candle(i, base - 0.45, base + 0.45, base + 0.6, base - 0.6, 2000.0)
+            })
+            .collect();
+        let ok = anti_fake_read(&trend, true, &s);
+        assert!(!ok.fake, "real trend wrongly flagged fake: {:?}", (ok.reason, ok.adx, ok.chop, ok.move_atr));
+
+        // Mirror: the same series read bearish must be fake (closes are up).
+        assert!(anti_fake_read(&trend, false, &s).fake);
+
+        // Fake breakout: newest bar pokes up with a tiny net move vs ATR, so the
+        // ATR/displacement check fails even though the last few closes are green.
+        let mut poke = trend[..78].to_vec();
+        let px = poke.last().unwrap().close;
+        poke.push(candle(78, px, px + 0.02, px + 0.05, px - 0.01, 500.0));
+        poke.push(candle(79, px + 0.02, px + 0.03, px + 0.04, px, 500.0));
+        let fake_poke = anti_fake_read(&poke, true, &s);
+        assert!(fake_poke.fake, "tiny ATR poke not flagged fake");
+
+        // Fake reversal: one bar flips against the persistent side inside the
+        // window -> persistence check must block it.
+        let mut flip = trend[..79].to_vec();
+        let b = flip.last().unwrap().close;
+        flip.push(candle(79, b, b - 0.5, b + 0.2, b - 0.7, 2000.0));
+        let fake_flip = anti_fake_read(&flip, true, &s);
+        assert!(fake_flip.fake, "one-bar flip not flagged fake");
+
+        // Automatic OFF-equivalence: with the switch disabled the caller skips
+        // the read entirely, but the pure function must still be honest about a
+        // fake so the guard is meaningful - a raised volume/threshold turns a
+        // thin move real only when the operator lowers the bar.
+        s.anti_fake_atr_mult = 0.0;
+        s.anti_fake_vol_mult = 0.0;
+        s.anti_fake_adx_min = 0.0;
+        s.anti_fake_chop_max = 100.0;
+        s.anti_fake_cooldown_bars = 0;
+        // With every threshold relaxed the same persistent uptrend still passes.
+        assert!(!anti_fake_read(&trend, true, &s).fake);
+
+        // Not enough candles = no verdict (fail-open, never blocks).
+        assert!(!anti_fake_read(&trend[..20], true, &s).fake);
+    }
+
+    #[test]
     fn nifty_timeframe_follows_the_chart_checkboxes() {
         // The NIFTY engine must run on the exact timeframe the operator ticked
         // for the charts: 1 min, 5 min, or both (both must agree before a flip).
@@ -22819,6 +23092,15 @@ mod gate_tests {
         // Scanner "remove" blacklist: the frontend posts `scannerExclude` (int
         // security ids removed from the Top Movers / NIFTY trend picks).
         s.scanner_exclude = vec![17818, 1234];
+        // Anti-fake filter: master + thresholds must round-trip camelCase so a
+        // generic settings save never drops them.
+        s.anti_fake_on = true;
+        s.anti_fake_bars = 3;
+        s.anti_fake_atr_mult = 0.4;
+        s.anti_fake_vol_mult = 0.6;
+        s.anti_fake_adx_min = 22.0;
+        s.anti_fake_chop_max = 55.0;
+        s.anti_fake_cooldown_bars = 4;
         let v = serde_json::to_value(&s).unwrap();
         assert_eq!(v["optionSide"], json!("CE"));
         assert_eq!(v["brainMode"], json!("auto"));
@@ -22831,11 +23113,20 @@ mod gate_tests {
         assert_eq!(v["aiPickBull"], json!(true));
         assert_eq!(v["aiPickBear"], json!(false));
         assert_eq!(v["scannerExclude"], json!([17818, 1234]));
+        assert_eq!(v["antiFakeOn"], json!(true));
+        assert_eq!(v["antiFakeBars"], json!(3));
+        assert_eq!(v["antiFakeAtrMult"], json!(0.4));
+        assert_eq!(v["antiFakeVolMult"], json!(0.6));
+        assert_eq!(v["antiFakeAdxMin"], json!(22.0));
+        assert_eq!(v["antiFakeChopMax"], json!(55.0));
+        assert_eq!(v["antiFakeCooldownBars"], json!(4));
         let back: Settings = serde_json::from_value(v).unwrap();
         assert_eq!(back.option_side, "CE");
         assert!(!back.call_manual && back.ai_pick && back.ai_pick_n == 3);
         assert!(back.filter_mode);
         assert_eq!(back.scanner_exclude, vec![17818, 1234]);
+        assert!(back.anti_fake_on && back.anti_fake_bars == 3);
+        assert_eq!(back.anti_fake_cooldown_bars, 4);
     }
 
     #[test]

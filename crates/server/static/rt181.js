@@ -1045,6 +1045,73 @@ function openPivotTrendSettings(kind) {
   };
 }
 
+// Advanced thresholds for the "Ignore fake breakouts / reversals" filter. The
+// master checkbox lives in every trend row; these knobs tune exactly how strict
+// the fake-move test is. Values persist as normal camelCase settings so the
+// backend `anti_fake_read` reads them straight off the saved Settings.
+const ANTI_FAKE_DEFAULTS = {
+  antiFakeBars: 2,
+  antiFakeAtrMult: 0.25,
+  antiFakeVolMult: 0.5,
+  antiFakeAdxMin: 18,
+  antiFakeChopMax: 61.8,
+  antiFakeCooldownBars: 2,
+};
+
+function openAntiFakeSettings() {
+  const s = (STATE && STATE.settings) || {};
+  const v = (k) => (s[k] == null || s[k] === "" ? ANTI_FAKE_DEFAULTS[k] : s[k]);
+  const backId = "rtAntiFakeBackdrop";
+  let back = document.getElementById(backId);
+  if (back) back.remove();
+  back = document.createElement("div");
+  back.id = backId;
+  back.style.cssText = "position:fixed;inset:0;background:rgba(0,0,0,.55);z-index:100000;display:flex;align-items:center;justify-content:center";
+  back.innerHTML =
+    '<div style="background:#12122a;border:1px solid #3d3d6b;border-radius:8px;padding:14px 16px;min-width:320px;color:#eaeaf5">' +
+    '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px"><span style="font-weight:700;color:#4fc3f7">Fake-move filter settings</span><span id="afClose" style="cursor:pointer;color:#888;font-size:14px;line-height:1">&#10005;</span></div>' +
+    '<div style="display:grid;grid-template-columns:1fr 100px;gap:6px;align-items:center;font-size:11px">' +
+    '<span>Persistence bars (same-side closes)</span><input type="number" id="afBars" min="1" max="20" step="1" value="' + v("antiFakeBars") + '">' +
+    '<span>Min move (ATR multiple)</span><input type="number" id="afAtrMult" min="0" max="5" step="0.05" value="' + v("antiFakeAtrMult") + '">' +
+    '<span>Min volume (fraction of avg)</span><input type="number" id="afVolMult" min="0" max="5" step="0.1" value="' + v("antiFakeVolMult") + '">' +
+    '<span>Min ADX (trend strength)</span><input type="number" id="afAdxMin" min="0" max="100" step="1" value="' + v("antiFakeAdxMin") + '">' +
+    '<span>Max Choppiness</span><input type="number" id="afChopMax" min="0" max="100" step="0.1" value="' + v("antiFakeChopMax") + '">' +
+    '<span>Cooldown bars after flip</span><input type="number" id="afCooldown" min="0" max="50" step="1" value="' + v("antiFakeCooldownBars") + '">' +
+    "</div>" +
+    '<div style="font-size:9px;color:#888;margin-top:8px">Stricter = zyada fake entries block, par kuch real moves late/miss ho sakte hain. Paper me test karke tuning karo.</div>' +
+    '<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:10px">' +
+    '<button class="btn-action" id="afReset">Reset</button>' +
+    '<button class="btn-action" id="afCancel">Cancel</button>' +
+    '<button class="btn-action" id="afSave" style="background:#4fc3f7;color:#0a0a18;font-weight:700">Save</button>' +
+    "</div></div>";
+  document.body.appendChild(back);
+  const close = () => back.remove();
+  const g = (id) => document.getElementById(id);
+  back.onclick = (e) => { if (e.target === back) close(); };
+  g("afClose").onclick = close;
+  g("afCancel").onclick = close;
+  g("afReset").onclick = () => {
+    g("afBars").value = ANTI_FAKE_DEFAULTS.antiFakeBars;
+    g("afAtrMult").value = ANTI_FAKE_DEFAULTS.antiFakeAtrMult;
+    g("afVolMult").value = ANTI_FAKE_DEFAULTS.antiFakeVolMult;
+    g("afAdxMin").value = ANTI_FAKE_DEFAULTS.antiFakeAdxMin;
+    g("afChopMax").value = ANTI_FAKE_DEFAULTS.antiFakeChopMax;
+    g("afCooldown").value = ANTI_FAKE_DEFAULTS.antiFakeCooldownBars;
+  };
+  g("afSave").onclick = () => {
+    const fields = {
+      antiFakeBars: Math.max(1, Math.min(20, Math.round(num(g("afBars").value) || 2))),
+      antiFakeAtrMult: Math.max(0, Math.min(5, num(g("afAtrMult").value))),
+      antiFakeVolMult: Math.max(0, Math.min(5, num(g("afVolMult").value))),
+      antiFakeAdxMin: Math.max(0, Math.min(100, num(g("afAdxMin").value))),
+      antiFakeChopMax: Math.max(0, Math.min(100, num(g("afChopMax").value))),
+      antiFakeCooldownBars: Math.max(0, Math.min(50, Math.round(num(g("afCooldown").value) || 0))),
+    };
+    close();
+    API.settings(Object.assign({}, (STATE && STATE.settings) || {}, fields)).then(refresh);
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Styles
 // ---------------------------------------------------------------------------
@@ -1531,6 +1598,10 @@ function shell() {
         <label class="rtom-f" style="color:#ffd700;font-weight:bold" title="All-lines-agree strict gate: jab ON ho, Top Gainers (CE) legs sirf tab banenge jab NIFTY ke assigned straight-line confirmation indicators me HAR line bullish (green) ho, aur Top Losers (PE) legs sirf tab jab HAR line bearish (red) ho. Ek bhi line ulti ya mixed = us leg ko strictly block. Yahi gate NIFTY-trend picks par bhi lagta hai. OFF = purana behaviour.">
           <input type="checkbox" data-set="niftyAllAgreeStrict" id="rtNiftyAllAgreeStrictCb" style="accent-color:#ffd700"> All-lines-agree strict gate (every line must confirm)
         </label>
+        <label class="rtom-f" style="color:#4fc3f7;font-weight:bold" title="ON: chhote fake breakout / fake reversal / temporary flip ko ignore karke sirf actual trend par nayi entry legi. Entry se pehle underlying candles check hoti hain - persistent same-side closes, structure (HH/HL ya LH/LL), ATR se bada move, decent volume, ADX upar + chop neeche, aur rejection wick. Koi bhi check fail = us fake move par trade block. Running trades par koi asar nahi - sirf nayi entries rukti hain. OFF = purana behaviour.">
+          <input type="checkbox" data-set="antiFakeOn" id="rtNiftyAntiFakeCb" class="rt-antifake-cb" style="accent-color:#4fc3f7"> Ignore fake breakouts/reversals (trade real trend only)
+        </label>
+        <button class="btn-action" id="rtAntiFakeSettingsBtn" style="width:auto;padding:3px 8px;margin:0;font-size:10px" title="Fake-move filter ke thresholds: persistence bars, ATR multiple, volume multiple, ADX min, chop max, cooldown bars.">&#9881; Fake filter</button>
       </div>
       <div id="rtNiftyTrendList" style="display:none;margin-top:4px;font-size:9px;color:#ccc;background:#12122a;border:1px solid #2d2d50;border-radius:4px;padding:6px 8px"></div>
 
@@ -1547,6 +1618,9 @@ function shell() {
         <span id="rtIndexTrendConfIndList" style="font-size:9px;color:#ccc;display:flex;flex-wrap:wrap;gap:4px;align-items:center"></span>
         <input type="hidden" data-list="indexTrendConfInds">
         <span style="font-size:8px;color:#666;flex-basis:100%">Har added index apne chart ke in confirmation indicators se trend tay karega: bullish = us index ka CE call leg, bearish = PE put leg.</span>
+        <label class="rtom-f" style="color:#4fc3f7;font-weight:bold" title="ON: chhote fake breakout / fake reversal / temporary flip ko ignore karke sirf actual trend par nayi entry legi. Entry se pehle underlying candles check hoti hain - persistent same-side closes, structure, ATR se bada move, volume, ADX/chop aur rejection wick. Running trades par koi asar nahi - sirf nayi entries rukti hain. OFF = purana behaviour.">
+          <input type="checkbox" data-set="antiFakeOn" id="rtIndexAntiFakeCb" class="rt-antifake-cb" style="accent-color:#4fc3f7"> Ignore fake breakouts/reversals (real trend only)
+        </label>
         <div id="rtIndexTrendStatus" style="flex-basis:100%;display:none;font-size:9px;color:#ccc;background:#12122a;border:1px solid #2d2d50;border-radius:4px;padding:4px 6px;margin-top:4px"></div>
       </div>
 
@@ -1563,6 +1637,9 @@ function shell() {
         <span id="rtCommTrendConfIndList" style="font-size:9px;color:#ccc;display:flex;flex-wrap:wrap;gap:4px;align-items:center"></span>
         <input type="hidden" data-list="commTrendConfInds">
         <span style="font-size:8px;color:#666;flex-basis:100%">Har added commodity apne chart ke in confirmation indicators se trend tay karega: bullish = CE call leg, bearish = PE put leg.</span>
+        <label class="rtom-f" style="color:#4fc3f7;font-weight:bold" title="ON: chhote fake breakout / fake reversal / temporary flip ko ignore karke sirf actual trend par nayi entry legi. Entry se pehle underlying candles check hoti hain - persistent same-side closes, structure, ATR se bada move, volume, ADX/chop aur rejection wick. Running trades par koi asar nahi - sirf nayi entries rukti hain. OFF = purana behaviour.">
+          <input type="checkbox" data-set="antiFakeOn" id="rtCommAntiFakeCb" class="rt-antifake-cb" style="accent-color:#4fc3f7"> Ignore fake breakouts/reversals (real trend only)
+        </label>
         <div id="rtCommTrendStatus" style="flex-basis:100%;display:none;font-size:9px;color:#ccc;background:#12122a;border:1px solid #2d2d50;border-radius:4px;padding:4px 6px;margin-top:4px"></div>
       </div>
 
@@ -2432,6 +2509,11 @@ function settingsFromDom() {
   // one that is always rendered) so a hidden duplicate can never win.
   const sidewaysCb = document.getElementById("rtNiftySidewaysCb");
   if (sidewaysCb) s.noTradeSideways = sidewaysCb.checked;
+  // "Ignore fake breakouts/reversals" is shown beside all trend engines but is a
+  // single persisted switch; read it from the NIFTY row (always rendered) so a
+  // hidden duplicate in a stripped tab can never win.
+  const antiFakeCb = document.getElementById("rtNiftyAntiFakeCb");
+  if (antiFakeCb) s.antiFakeOn = antiFakeCb.checked;
   document.querySelectorAll("#tab-realtime [data-list]").forEach((inp) => {
     const k = inp.getAttribute("data-list");
     const raw = String(inp.value || "").split(",").map((x) => x.trim()).filter(Boolean);
@@ -2889,6 +2971,11 @@ function wire() {
           c.checked = inp.checked;
         });
       }
+      if (k === "antiFakeOn") {
+        document.querySelectorAll('#tab-realtime [data-set="antiFakeOn"]').forEach((c) => {
+          c.checked = inp.checked;
+        });
+      }
       if (!PAPER2 && inp.type === "checkbox" && !inp.checked && STRIKE_BASE_GUARD[k]) {
         uiAlert(
           '"' + STRIKE_BASE_GUARD[k] + '" ON rakhna zaroori hai. "Execute Trade In" ke sare dropdown options isi +green base par kaam karte hain, isliye ise enable kar diya gaya hai.'
@@ -3139,6 +3226,9 @@ function wire() {
 
   // Commodity picker: add / clear MCX futures in the commodityList.
   const cAdd = $("rtCommodityAddBtn");
+  // Fake-move filter settings gear (thresholds for the anti-fake checkbox).
+  const afBtn = $("rtAntiFakeSettingsBtn");
+  if (afBtn) afBtn.onclick = () => openAntiFakeSettings();
   if (cAdd)
     cAdd.onclick = () => {
       const sel = $("rtCommodityAdd");
@@ -4233,6 +4323,19 @@ async function loadScanners() {
   // to its own cadence), so turning a master toggle on shows data immediately
   // instead of waiting for the next poll, and the commodity picker is always
   // populated regardless of the master toggle.
+  //
+  // Liquid F&O readout is fetched FIRST and isolated in its own try/catch: the
+  // Top Movers endpoint can be slow (or briefly fail) and used to sit ahead of
+  // this block in one shared try, which starved #rtLiquidList - the readout
+  // never rendered while movers was awaiting. Each scanner now stands alone.
+  if (!PAPER2) {
+    try {
+      await loadLiquidUniverse();
+      const lq = await API.liquid();
+      renderLiquidReadout(lq);
+    } catch (_e) { /* best-effort */ }
+    syncLiquidSelects(cfg);
+  }
   try {
     const m = await API.movers();
     if (ml && cfg.moversOn && !cfg.manualStrikesEnabled) {
@@ -4255,19 +4358,6 @@ async function loadScanners() {
       });
     } else if (ml) {
       ml.style.display = "none";
-    }
-
-    // Liquid F&O scanner readout + its dropdown universe. Fetched every poll so
-    // turning the master ON shows rows immediately; the server throttles the
-    // scan itself. Only the full engines (Realtime 1 / Paper 1) carry the
-    // scanner, so the others skip the fetch and its universe load entirely.
-    if (!PAPER2) {
-      await loadLiquidUniverse();
-      try {
-        const lq = await API.liquid();
-        renderLiquidReadout(lq);
-      } catch (_e) { /* best-effort */ }
-      syncLiquidSelects(cfg);
     }
 
     const t = await API.trend();
@@ -4966,7 +5056,7 @@ function sourceLabel(src) {
       ? "Option strikes the engine picked to execute for the Indices & Commodities section (auto-shown while it is ON)"
       : "Option strikes the engine picked to execute (auto-shown while Top Movers / NIFTY Trend Follow is ON)";
   }
-  if (!manualOn && !cfg.niftyTrendOn && !cfg.moversOn && !cfg.commodityOn) {
+  if (!manualOn && !cfg.niftyTrendOn && !cfg.moversOn && !cfg.commodityOn && !cfg.liquidOn) {
     host.style.display = "none";
     return;
   }
@@ -5834,16 +5924,19 @@ function syncInterlocks() {
   dimRow("rtNiftyNetStrictCb", !ntActive);
   dimRow("rtNiftyAllAgreeStrictCb", !ntActive);
   dimRow("rtNiftySidewaysCb", !ntActive);
+  dimRow("rtNiftyAntiFakeCb", !ntActive);
   // Paper Trade 2 per-instrument trend pickers follow their own toggle.
   if (PAPER2) {
     const idxTrendActive = !!s.indexTrendOn;
     dimRow("rtIndexTrendConfIndSelect", !idxTrendActive);
     dimRow("rtIndexTrendConfIndAdd", !idxTrendActive);
     dimRow("rtIndexSidewaysCb", !idxTrendActive);
+    dimRow("rtIndexAntiFakeCb", !idxTrendActive);
     const commTrendActive = !!s.commTrendOn;
     dimRow("rtCommTrendConfIndSelect", !commTrendActive);
     dimRow("rtCommTrendConfIndAdd", !commTrendActive);
     dimRow("rtCommSidewaysCb", !commTrendActive);
+    dimRow("rtCommAntiFakeCb", !commTrendActive);
   }
 
   // --- Top Movers: independent of NIFTY trend-following. Both masters can be
@@ -6271,6 +6364,7 @@ function renderRunning(s) {
     settings.moversOn ||
     settings.niftyTrendOn ||
     settings.commodityOn ||
+    settings.liquidOn ||
     manualMode
   );
   // "Running Strategies" list = the indicator-filter based strategies actually
