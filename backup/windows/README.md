@@ -3,6 +3,14 @@
 Pre-built Windows x86_64 binaries for this repo, built from the exact source in
 this commit. Everything needed to install and run on Windows is here.
 
+Build: cross-compiled from Linux with `x86_64-pc-windows-gnu` (mingw-w64), so
+the executables depend only on standard Windows system DLLs plus
+`WebView2Loader.dll` (bundled below) - no VC++ runtime or admin needed.
+
+This build includes the "Ignore fake breakouts / reversals" anti-fake entry
+gate (NIFTY + indices + commodities trend engines) and the liquid F&O scanner
+fix, on top of the bid/ask paper-fill feature.
+
 ## What is in this folder
 
 | File | Purpose |
