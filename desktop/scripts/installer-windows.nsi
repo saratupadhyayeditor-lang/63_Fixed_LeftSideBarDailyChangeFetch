@@ -18,7 +18,7 @@ Unicode True
 !define APP_NAME "Algo Trading"
 !define APP_EXE "algo-desktop.exe"
 !define PUBLISHER "Sarat Upadhyay"
-!define VERSION "0.1.30"
+!define VERSION "0.1.31"
 !define REGKEY "Software\Microsoft\Windows\CurrentVersion\Uninstall\AlgoTrading"
 
 Name "${APP_NAME}"

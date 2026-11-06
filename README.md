@@ -5,7 +5,7 @@ broker API. One Rust server serves the whole app (all tabs, REST API, live
 WebSocket feed) and a thin native shell wraps it in a desktop window
 (WebView2 on Windows).
 
-Version: **0.1.30**
+Version: **0.1.31**
 
 ## What is in this repo
 
@@ -82,6 +82,21 @@ Pre-built installers live in `backup/windows/<version>/` - see
   regenerate them** or browsers keep getting the old content (gzips win over the
   plain file when the client sends `Accept-Encoding: gzip`).
 - Runtime state (`data/`) and build output (`target/`, `dist*/`) are git-ignored.
+
+## Version 0.1.31 changes
+
+- **Run a strategy on every selected strike via that strike's own premium
+  chart.** In premium-only mode each selected strike now resolves its individual
+  option chart and must pass the indicator filters on its own; a failing strike
+  no longer drags a passing sibling. `strikeCount` is honoured (previously only
+  one strike resolved).
+- **Option type (CE / PE) now restricts the scanner universe** to that side
+  instead of being ignored. It is a filter, not a conversion: a bearish stock is
+  not turned into a call.
+- **One-side-per-underlying guard fixed:** it now blocks the opposite-side entry
+  instead of force-closing the running leg. The old `SIDE_FLIP` close path was
+  booking avoidable losses on every side wobble.
+- Option chain segment and scrip resolution fixes.
 
 ## Version 0.1.30 changes
 

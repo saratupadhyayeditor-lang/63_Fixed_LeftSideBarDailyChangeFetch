@@ -1,4 +1,4 @@
-# Windows build (v0.1.30)
+# Windows build (v0.1.31)
 
 Pre-built Windows x86_64 binaries for this repo, built from the exact source in
 this commit. Everything needed to install and run on Windows is here.
@@ -7,13 +7,24 @@ Build: cross-compiled from Linux with `x86_64-pc-windows-gnu` (mingw-w64), so
 the executables depend only on standard Windows system DLLs plus
 `WebView2Loader.dll` (bundled below) - no VC++ runtime or admin needed.
 
-This build includes the "Trend check before entry" gate (composite underlying
-spot-trend read: confirmation-indicator net + EMA20 slope + price vs EMA20,
-with a sideways/range regime veto; enforced both at scan time and again at the
-execution instant), the AI Trader (Paper + Live) autonomous brain engines, the
-Auto Experiment engine, and the Market Analysis refresh fix (concurrent bounded
-sections + quote-cache fast path, ~20ms instead of 120s+), on top of the
-anti-fake entry gate, liquid F&O scanner fix and bid/ask paper fills.
+Headline of this build: **run a strategy on all selected strikes via each
+strike's own premium chart.** In premium-only mode every selected strike
+resolves its individual option chart and must pass the indicator filters on its
+own; a failing strike no longer drags a passing sibling, and `strikeCount` is
+honoured (previously only one strike resolved). Also in this build:
+
+- Option type (CE / PE) now restricts the scanner universe to that side instead
+  of being ignored. It is a filter, not a conversion: a bearish stock is not
+  turned into a call.
+- One-side-per-underlying guard fixed: it now blocks the opposite-side entry
+  instead of force-closing the running leg. The old `SIDE_FLIP` close path was
+  booking avoidable losses on every side wobble.
+- Option chain segment and scrip resolution fixes.
+
+Still included from earlier versions: the "Trend check before entry" gate, the
+AI Trader (Paper + Live) autonomous brain engines, the Auto Experiment engine,
+the Market Analysis refresh fix, the anti-fake entry gate, the liquid F&O
+scanner and bid/ask paper fills.
 
 ## What is in this folder
 

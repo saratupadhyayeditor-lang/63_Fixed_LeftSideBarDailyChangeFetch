@@ -10,7 +10,7 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 
 [[package]]
 name = "algo-core"
-version = "0.1.30"
+version = "0.1.31"
 dependencies = [
  "serde",
  "serde_json",
@@ -18,7 +18,7 @@ dependencies = [
 
 [[package]]
 name = "algo-server"
-version = "0.1.30"
+version = "0.1.31"
 dependencies = [
  "algo-core",
  "axum",
@@ -41,7 +41,7 @@ dependencies = [
 
 [[package]]
 name = "algo-web"
-version = "0.1.30"
+version = "0.1.31"
 dependencies = [
  "algo-core",
  "console_error_panic_hook",
@@ -330,7 +330,7 @@ checksum = "4583a4551df46e2792f82ceeac45e850d2e2d5debba0b91f102385cda5b11f06"
 
 [[package]]
 name = "dhan-hq"
-version = "0.1.30"
+version = "0.1.31"
 dependencies = [
  "bytes",
  "futures-util",
