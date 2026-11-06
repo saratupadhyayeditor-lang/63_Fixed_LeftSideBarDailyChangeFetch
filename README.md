@@ -5,7 +5,7 @@ broker API. One Rust server serves the whole app (all tabs, REST API, live
 WebSocket feed) and a thin native shell wraps it in a desktop window
 (WebView2 on Windows).
 
-Version: **0.1.31**
+Version: **0.1.32**
 
 ## What is in this repo
 
@@ -82,6 +82,23 @@ Pre-built installers live in `backup/windows/<version>/` - see
   regenerate them** or browsers keep getting the old content (gzips win over the
   plain file when the client sends `Accept-Encoding: gzip`).
 - Runtime state (`data/`) and build output (`target/`, `dist*/`) are git-ignored.
+
+## Version 0.1.32 changes
+
+- **MCX commodities section stuck on `-` fixed.** The old bundled MCX list used
+  made-up ids (`500001..500015`) that are not Dhan contracts at all, so their
+  quotes never resolved and the sidebar showed no daily change. On a fresh
+  install the app also served that list during the scrip-master warm-up window
+  and the UI cached it permanently. The static fallback is gone: while the
+  master downloads the API now returns an empty list with `warming: true`, and
+  the sidebar retries and replaces the rows once real contract ids arrive
+  (CRUDEOIL/COPPER/... with their current expiry ids).
+- Scrip-master warm-up now retries with backoff instead of giving up forever
+  after three failed downloads.
+- Saved commodity picks survive a restart that starts before the master is
+  ready, then get reconciled (stale/rolled/futures-only ids dropped) once it is.
+- Every engine tab's commodity picker now repopulates when the real list
+  arrives instead of staying empty until the next reload.
 
 ## Version 0.1.31 changes
 

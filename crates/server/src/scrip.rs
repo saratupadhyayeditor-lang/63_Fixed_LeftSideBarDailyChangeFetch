@@ -195,6 +195,12 @@ pub fn warm_status() -> &'static str {
     }
 }
 
+/// True once the scrip master is loaded and authoritative. Callers that must not
+/// act on an incomplete view (e.g. purging saved contract ids) wait for this.
+pub fn is_ready() -> bool {
+    STATUS.load(Ordering::Relaxed) == READY
+}
+
 /// Number of resolved contracts in the loaded master (0 while loading/failed).
 pub fn contract_count() -> usize {
     get().map(|s| s.contract_ids().len()).unwrap_or(0)
@@ -956,24 +962,47 @@ async fn download_freeze() -> Option<Vec<u8>> {
 }
 
 /// Spawn the background warm task (idempotent). Safe to call at startup.
+///
+/// This never gives up for the life of the process. The old version stopped
+/// after 3 attempts (~90s) and pinned `STATUS` to FAILED forever; a single
+/// network blip at startup then left every instrument lookup dead for the whole
+/// session (commodities showed no quote, options could not resolve). It now
+/// keeps retrying with backoff, and after a run of failures it parks in FAILED
+/// for a few minutes and then flips back to `loading` so the UI keeps waiting
+/// for real contract ids instead of permanently showing an empty list.
 pub fn spawn_warm() {
     spawn_freeze_warm();
     if SCRIP.get().is_some() {
         return;
     }
     tokio::spawn(async move {
-        for attempt in 0..3 {
+        let mut failed_rounds: u32 = 0;
+        loop {
             if let Some(sc) = load().await {
                 let _ = SCRIP.set(Arc::new(sc));
                 STATUS.store(READY, Ordering::Relaxed);
                 tracing::info!("scrip master ready");
                 return;
             }
-            tracing::warn!("scrip master warm attempt {} failed", attempt + 1);
-            tokio::time::sleep(Duration::from_secs(30)).await;
+            failed_rounds += 1;
+            // Report a sustained outage, but do not stop trying: after a cool-off
+            // go back to "loading" and attempt again, so a transient DNS / TLS /
+            // firewall problem heals without an app restart.
+            if failed_rounds >= 3 {
+                STATUS.store(FAILED, Ordering::Relaxed);
+                tracing::warn!(
+                    "scrip master unavailable after {} attempts; retrying in 5 min",
+                    failed_rounds
+                );
+                tokio::time::sleep(Duration::from_secs(300)).await;
+                STATUS.store(PENDING, Ordering::Relaxed);
+                failed_rounds = 0;
+            } else {
+                STATUS.store(PENDING, Ordering::Relaxed);
+                tracing::warn!("scrip master warm attempt {} failed", failed_rounds);
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
         }
-        STATUS.store(FAILED, Ordering::Relaxed);
-        tracing::warn!("scrip master unavailable; instrument lookup will return no results");
     });
 }
 
@@ -993,10 +1022,29 @@ async fn load() -> Option<Scrip> {
         }
     }
     let p = path.clone();
-    tokio::task::spawn_blocking(move || parse_file(&p))
+    let parsed = tokio::task::spawn_blocking(move || parse_file(&p))
         .await
         .ok()
-        .flatten()
+        .flatten();
+    if parsed.is_some() {
+        return parsed;
+    }
+    // A "fresh" cache that fails to parse is corrupt (truncated download, partial
+    // write). Force one re-download rather than repeating the same broken parse
+    // until the TTL window expires.
+    if fresh {
+        if let Some(bytes) = download().await {
+            if let Err(e) = std::fs::write(&path, &bytes) {
+                tracing::warn!("scrip master cache write failed: {e}");
+            }
+            let p2 = path.clone();
+            return tokio::task::spawn_blocking(move || parse_file(&p2))
+                .await
+                .ok()
+                .flatten();
+        }
+    }
+    None
 }
 
 async fn download() -> Option<Vec<u8>> {

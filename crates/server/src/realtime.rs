@@ -2159,17 +2159,20 @@ fn sanitize_indices_commodities(s: &mut Settings) {
     // contract that trades (CE = bullish filters, PE = bearish filters). Drop
     // only legs whose index was removed so a stale leg can never linger.
     s.movers_index_legs.retain(|l| s.movers_indices.contains(&l.security_id));
-    // Commodities must list options; drop only ones KNOWN to be futures-only,
-    // and any leg whose commodity is gone. `commodity_has_options` returns
-    // `None` while the scrip master is still warming (or for an id it cannot
-    // see yet), so a `None` must be KEPT - otherwise a restart before the live
-    // master loads would wipe the operator's added commodities and (with the
-    // old empty-list default) silently arm the whole MCX set. An empty list
+    // Keep only commodities that are live MCX contracts AND that list options
+    // (this book builds CE/PE legs). Once the scrip master is ready this drops
+    // stale saved ids: the old bundled fallback ids (`500001..500015`) were never
+    // real MCX contracts, rolled/expired contract ids stop being tradeable, and
+    // futures-only names have no leg to trade. While the master is still warming
+    // both checks return `None` and everything is KEPT - a restart before the
+    // master loads must not wipe the operator's added commodities. An empty list
     // stays empty: the engine never invents a default set.
-    s.commodity_list
-        .retain(|id| crate::market::commodity_has_options(*id) != Some(false));
+    s.commodity_list.retain(|id| {
+        crate::market::commodity_is_live_contract(*id) != Some(false)
+            && crate::market::commodity_has_options(*id) != Some(false)
+    });
     // Keep the operator's chosen commodity leg, dropping any leg for a commodity
-    // that was just removed (e.g. a futures-only MCX name).
+    // that was just removed (e.g. a stale/futures-only MCX name).
     s.commodity_legs.retain(|l| s.commodity_list.contains(&l.security_id));
 }
 
@@ -3477,6 +3480,42 @@ impl RealtimeState {
 
     fn doc(&self) -> Option<std::sync::MutexGuard<'_, RtDoc>> {
         self.doc.lock().ok()
+    }
+
+    /// Drop saved commodity ids that are not live MCX contracts once the scrip
+    /// master is authoritative. Returns how many ids were removed.
+    ///
+    /// This repairs state that was persisted before the fix (the old bundled
+    /// fallback ids `500001..500015`) and any contract the exchange has since
+    /// rolled. It is intentionally a no-op while the master is still warming so
+    /// it can never delete the operator's picks from an incomplete view, and it
+    /// only writes the state file when something actually changed.
+    pub fn reconcile_commodity_contracts(&self) -> usize {
+        if crate::scrip::warm_status() != "ready" {
+            return 0;
+        }
+        let removed = {
+            let Ok(mut d) = self.doc.lock() else { return 0 };
+            let before = d.settings.commodity_list.len();
+            d.settings
+                .commodity_list
+                .retain(|id| crate::market::commodity_is_live_contract(*id) != Some(false));
+            let keep = d.settings.commodity_list.clone();
+            d.settings
+                .commodity_legs
+                .retain(|l| keep.contains(&l.security_id));
+            before.saturating_sub(d.settings.commodity_list.len())
+        };
+        if removed > 0 {
+            self.save();
+            self.log(
+                "warn",
+                &format!(
+                    "removed {removed} commodity id(s) that are not live MCX contracts"
+                ),
+            );
+        }
+        removed
     }
 
     /// Full durable engine state (`RtDoc`) as JSON for the Backup tab. This is
@@ -21215,6 +21254,7 @@ mod gate_tests {
         // Movers stock scan, the NIFTY trend-follow engine, the F&O-stock picks
         // and the NIFTY BB%b (Pane) are all removed, and futures-only
         // commodities are dropped so a stale save/import cannot arm them.
+        let _c = crate::market::CommodityFixtureGuard::install();
         let mut s = Settings::default();
         s.nifty_trend_on = true;
         s.nifty_trend_pct_on = true;
@@ -21273,6 +21313,7 @@ mod gate_tests {
         // resolve to targets (and therefore picks). An empty list arms nothing.
         let market = crate::market::MarketState::new();
         let dhan = crate::broker::DhanState::new(market);
+        let _c = crate::market::CommodityFixtureGuard::install();
         let rt = RealtimeState::new_paper(dhan);
         let mut s = Settings::default();
         s.commodity_on = true;
@@ -22280,8 +22321,9 @@ mod gate_tests {
         // Running list from the Picked-Strikes readout.
         let market = crate::market::MarketState::new();
         let dhan = crate::broker::DhanState::new(market);
+        let _c = crate::market::CommodityFixtureGuard::install();
         let rt = RealtimeState::new_paper3(dhan);
-        let sid = 500004; // NATURALGAS (static MCX_COMM row used by tests)
+        let sid = 500004; // NATURALGAS (test MCX fixture row)
         let mut s = Settings::default();
         s.filter_mode = true;
         s.commodity_on = true;
@@ -27040,12 +27082,13 @@ mod per_strike_premium_gate_tests {
     async fn option_type_narrows_the_scanner_universe() {
         let market = crate::market::MarketState::new();
         let dhan = crate::broker::DhanState::new(market);
+        let _c = crate::market::CommodityFixtureGuard::install();
         let rt = RealtimeState::new_paper(dhan);
         let mut s = Settings::default();
         s.commodity_on = true;
         s.filters.insert("BullSlEma5".into(), true);
         s.filters.insert("BearSlEma5".into(), true);
-        s.commodity_list = vec![500001]; // GOLD, unpinned -> both legs by default
+        s.commodity_list = vec![500001]; // GOLD (fixture), unpinned -> both legs by default
         let has = |out: &[Strategy], key: &str| out.iter().any(|t| t.id == key);
 
         let both = rt.scanner_targets(&s);

@@ -90,49 +90,100 @@ struct RawCatalog {
     watchlists: HashMap<String, Vec<Value>>,
 }
 
-/// MCX near-month futures. The old app derived these live from the Dhan scrip
-/// master (contract ids roll every expiry); we ship a representative static set
-/// with the identical payload shape.
-const COMMODITIES: &[(&str, &str, i64, f64, f64, &str, bool)] = &[
-    ("GOLD", "GOLD28AUG26", 500001, 100.0, 0.01, "2026-08-28", true),
-    ("SILVER", "SILVER05SEP26", 500002, 30.0, 1.0, "2026-09-05", true),
-    ("CRUDEOIL", "CRUDEOIL19AUG26", 500003, 100.0, 1.0, "2026-08-19", true),
-    ("NATURALGAS", "NATURALGAS26AUG26", 500004, 1250.0, 0.1, "2026-08-26", true),
-    ("COPPER", "COPPER28AUG26", 500005, 2500.0, 0.05, "2026-08-28", true),
-    ("ZINC", "ZINC28AUG26", 500006, 5000.0, 0.05, "2026-08-28", true),
-    ("ALUMINIUM", "ALUMINIUM28AUG26", 500007, 5000.0, 0.05, "2026-08-28", true),
-    ("LEAD", "LEAD28AUG26", 500008, 5000.0, 0.05, "2026-08-28", true),
-    ("NICKEL", "NICKEL28AUG26", 500009, 1500.0, 0.1, "2026-08-28", true),
-    ("SILVERM", "SILVERM30SEP26", 500010, 5.0, 1.0, "2026-09-30", false),
-    ("GOLDM", "GOLDM30SEP26", 500011, 10.0, 1.0, "2026-09-30", false),
-    ("GOLDPETAL", "GOLDPETAL30SEP26", 500012, 1.0, 1.0, "2026-09-30", false),
-    ("GOLDGUINEA", "GOLDGUINEA30SEP26", 500013, 1.0, 1.0, "2026-09-30", false),
-    ("MENTHAOIL", "MENTHAOIL28AUG26", 500014, 360.0, 0.1, "2026-08-28", true),
-    ("COTTONCANDY", "COTTONCANDY28AUG26", 500015, 25.0, 10.0, "2026-08-28", false),
-];
-
-/// Live near-month MCX futures resolved from the Dhan scrip master, falling back
-/// to the bundled representative set while the master is still warming. Dhan
-/// rolls MCX contract ids every expiry, so a static list can neither quote nor
-/// place real orders.
+/// Live near-month MCX futures resolved from the Dhan scrip master.
+///
+/// There is deliberately **no static fallback**. The old bundled list used
+/// made-up ids (`500001..500015`) that are not MCX contracts at all - several of
+/// them are unrelated BSE equities and the rest do not exist - so subscribing or
+/// backfilling them could never yield a quote. On a fresh install that list was
+/// served during the scrip-master warm-up window, the sidebar cached it forever,
+/// and the commodities section stayed stuck on `-` with no daily change. While
+/// the master is warming this now returns an empty list (and the API flags it as
+/// `warming`), so the UI waits for real contract ids instead of pinning fake
+/// ones. Dhan rolls MCX contract ids every expiry, so only the master is
+/// authoritative.
 pub fn commodity_rows() -> Vec<crate::scrip::CommodityRow> {
-    if let Some(sc) = crate::scrip::get() {
-        let live = sc.commodity_futures();
-        if !live.is_empty() {
-            return live;
-        }
+    #[cfg(test)]
+    if let Some(rows) = test_commodity_rows() {
+        return rows;
     }
-    COMMODITIES
-        .iter()
-        .map(|(name, symbol, sid, lot, _tick, exp, opts)| crate::scrip::CommodityRow {
-            name: (*name).to_string(),
-            trading_symbol: (*symbol).to_string(),
-            security_id: *sid,
-            lot: *lot,
-            expiry: (*exp).to_string(),
-            has_options: *opts,
-        })
-        .collect()
+    crate::scrip::get()
+        .map(|sc| sc.commodity_futures())
+        .unwrap_or_default()
+}
+
+/// Test-only commodity fixture. Production always derives the list from the
+/// scrip master (there is no static fallback any more), but scanner/resolver
+/// tests need a deterministic MCX set because the master is a network download.
+#[cfg(test)]
+thread_local! {
+    static TEST_COMMODITY_ROWS: std::cell::RefCell<Option<Vec<crate::scrip::CommodityRow>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn test_commodity_rows() -> Option<Vec<crate::scrip::CommodityRow>> {
+    TEST_COMMODITY_ROWS.with(|c| c.borrow().clone())
+}
+
+/// Install the deterministic MCX fixture for this thread's tests.
+#[cfg(test)]
+pub fn set_test_commodity_rows(rows: Vec<crate::scrip::CommodityRow>) {
+    TEST_COMMODITY_ROWS.with(|c| *c.borrow_mut() = Some(rows));
+}
+
+/// Clears the fixture. Tests get a guard instead of calling this directly so a
+/// panic cannot leak the fixture onto a reused harness thread.
+#[cfg(test)]
+pub fn clear_test_commodity_rows() {
+    TEST_COMMODITY_ROWS.with(|c| *c.borrow_mut() = None);
+}
+
+/// RAII install of [`test_commodity_fixture`] for the duration of a test.
+#[cfg(test)]
+pub struct CommodityFixtureGuard;
+
+#[cfg(test)]
+impl CommodityFixtureGuard {
+    pub fn install() -> Self {
+        set_test_commodity_rows(test_commodity_fixture());
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for CommodityFixtureGuard {
+    fn drop(&mut self) {
+        clear_test_commodity_rows();
+    }
+}
+
+/// The MCX fixture the scanner tests expect: GOLD/SILVER/CRUDEOIL/... with the
+/// same option coverage the removed bundled list had, using ids that are still
+/// clearly test-only. Kept in one place so every test shares it.
+#[cfg(test)]
+pub fn test_commodity_fixture() -> Vec<crate::scrip::CommodityRow> {
+    let mk = |name: &str, sid: i64, lot: f64, has_options: bool| crate::scrip::CommodityRow {
+        name: name.to_string(),
+        trading_symbol: format!("{name}-TEST-FUT"),
+        security_id: sid,
+        lot,
+        expiry: "2026-11-30".to_string(),
+        has_options,
+    };
+    vec![
+        mk("GOLD", 500001, 100.0, true),
+        mk("SILVER", 500002, 30.0, true),
+        mk("CRUDEOIL", 500003, 100.0, true),
+        mk("NATURALGAS", 500004, 1250.0, true),
+        mk("COPPER", 500005, 2500.0, true),
+        mk("ZINC", 500006, 5000.0, true),
+        mk("ALUMINIUM", 500007, 5000.0, true),
+        mk("LEAD", 500008, 5000.0, true),
+        mk("NICKEL", 500009, 1500.0, true),
+        mk("SILVERM", 500010, 5.0, false),
+        mk("GOLDM", 500011, 10.0, false),
+    ]
 }
 
 pub fn commodities_json() -> Value {
@@ -150,16 +201,48 @@ pub fn commodities_json() -> Value {
             })
         })
         .collect();
-    json!({ "commodities": list })
+    // `warming` tells the UI to keep retrying instead of caching an empty set:
+    // the contract master is still downloading/parsing (or failed), so there are
+    // no authoritative MCX ids yet. `failed` distinguishes a permanent miss
+    // (blocked download) from the normal warm-up window so the UI can say so.
+    let status = crate::scrip::warm_status();
+    json!({
+        "commodities": list,
+        "warming": status == "loading",
+        "failed": status == "failed",
+    })
 }
 
 /// `Some(false)` when the security is a known MCX commodity with no listed
-/// options (futures-only), `None` when unknown so callers can keep the default.
+/// options (futures-only), `None` when unknown so callers keep the default.
+///
+/// Never returns `Some(false)` for a non-commodity id (index/stock), because the
+/// option-chain and target paths call this for every underlying.
 pub fn commodity_has_options(sid: i64) -> Option<bool> {
     commodity_rows()
         .into_iter()
         .find(|c| c.security_id == sid)
         .map(|c| c.has_options)
+}
+
+/// Whether `sid` is a **live, tradeable MCX contract** in the authoritative
+/// scrip master.
+///
+/// Unlike [`commodity_has_options`] this is strict: once the master is `ready`,
+/// any id that is not one of the current MCX near-month futures is `Some(false)`.
+/// It exists to purge stale saved commodity lists (the old bundled fallback ids
+/// `500001..500015` were never real MCX contracts, and rolled/expired contract
+/// ids stop being tradeable), without making the option-chain lookup reject
+/// index/stock ids. Returns `None` while the master is warming so callers keep
+/// whatever they had.
+pub fn commodity_is_live_contract(sid: i64) -> Option<bool> {
+    if commodity_rows().iter().any(|c| c.security_id == sid) {
+        return Some(true);
+    }
+    match crate::scrip::warm_status() {
+        "ready" => Some(false),
+        _ => None,
+    }
 }
 
 /// Basket of the most liquid F&O underlyings: every stock that is a member of
@@ -711,7 +794,12 @@ pub async fn instruments() -> impl IntoResponse {
     }
     axum::Json(json!({
         "status": "success",
-        "data": { "indices": indices, "fno": fno, "commodities": commodities }
+        "data": {
+            "indices": indices,
+            "fno": fno,
+            "commodities": commodities,
+            "warming": crate::scrip::warm_status() == "loading",
+        }
     }))
 }
 
@@ -967,5 +1055,46 @@ mod tests {
         assert_eq!(n.last().unwrap().close, 22_930.0);
         // Never full "NSE_EQ" series; the public API returns None.
         assert!(m.live_bars_for(13, "NSE_EQ", "1min", Duration::from_secs(60)).is_none());
+    }
+
+    #[test]
+    fn commodities_never_serve_the_old_fake_fallback_ids() {
+        // Regression: the ships-a-static-list fallback used ids 500001..500015,
+        // which are not MCX contracts at all (some are unrelated BSE equities,
+        // most do not exist). Every commodity row must come from the scrip
+        // master; while it warms the list is empty rather than fake.
+        let rows = commodity_rows();
+        assert!(
+            rows.iter().all(|c| !(500001..=500015).contains(&c.security_id)),
+            "fake fallback ids must never be served: {:?}",
+            rows.iter().map(|c| c.security_id).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn commodities_json_flags_the_warm_state() {
+        // The UI relies on `warming` to retry instead of caching an empty list.
+        let payload = commodities_json();
+        assert!(payload.get("commodities").is_some());
+        assert!(payload.get("warming").is_some());
+        assert!(payload.get("failed").is_some());
+    }
+
+    #[test]
+    fn live_contract_check_is_conservative_while_warming() {
+        // While the master is loading the strict check must NOT declare a saved
+        // id dead - otherwise a restart would wipe the operator's commodity
+        // picks from an incomplete view.
+        assert_eq!(commodity_is_live_contract(500001), None);
+        assert_eq!(commodity_is_live_contract(573422), None);
+    }
+
+    #[test]
+    fn live_contract_check_does_not_reject_non_commodity_ids_when_ready() {
+        // `commodity_has_options` is called for every option underlying, so it
+        // must stay permissive for index/stock ids (regression guard for a
+        // stricter version that would have broken NIFTY/stock chains).
+        assert_eq!(commodity_has_options(13), None);
+        assert_eq!(commodity_has_options(2885), None);
     }
 }

@@ -3837,11 +3837,19 @@ function populateCommodityAdd(c) {
   // offers option-chain commodities only.
   const rows = PAPER2 ? all.filter((x) => x.has_options) : all;
   const sel = document.getElementById("rtCommodityAdd");
-  if (sel && !commodityPopulated && rows.length) {
-    sel.innerHTML =
-      `<option value="">-- pick commodity --</option>` +
-      rows.map((x) => `<option value="${esc(x.security_id)}">${esc(x.name)} · ${esc(x.symbol)}</option>`).join("");
-    commodityPopulated = true;
+  if (sel && rows.length) {
+    // Repopulate whenever the count changes, not just once: on a fresh install
+    // the first fetch can land while the server's contract master is still
+    // warming (empty list). Once the real contracts arrive the dropdown must
+    // fill in, otherwise it stays empty for the whole session.
+    const key = rows.map((x) => num(x.security_id)).join(",");
+    if (sel.dataset.commKey !== key) {
+      sel.innerHTML =
+        `<option value="">-- pick commodity --</option>` +
+        rows.map((x) => `<option value="${esc(x.security_id)}">${esc(x.name)} · ${esc(x.symbol)}</option>`).join("");
+      sel.dataset.commKey = key;
+      commodityPopulated = true;
+    }
   }
   renderChips("commodityList", "rtCommodityChips", "commodity");
 }

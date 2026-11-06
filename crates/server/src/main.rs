@@ -264,6 +264,38 @@ async fn main() {
     // the app itself, without the operator having to press anything.
     diagnostics::startup_self_check(&dhan, &rt);
     {
+        // Once the scrip master is authoritative, purge saved commodity ids that
+        // are not live MCX contracts. The master downloads/parses in the
+        // background (~25-30s on a fresh install), so this waits for it instead
+        // of running against an empty view. Every engine tab is repaired; each
+        // call is a no-op that writes nothing when the saved set is already
+        // valid (so a normal install never rewrites its state files).
+        let engines = vec![
+            rt.clone(),
+            realtime2_rt.clone(),
+            realtime3_rt.clone(),
+            paper_rt.clone(),
+            paper2_rt.clone(),
+            paper3_rt.clone(),
+            autoexp_rt.clone(),
+            aitrader_rt.clone(),
+            aitraderlive_rt.clone(),
+        ];
+        tokio::spawn(async move {
+            let mut waited = 0u64;
+            while !crate::scrip::is_ready() && waited < 180 {
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                waited += 1;
+            }
+            if !crate::scrip::is_ready() {
+                return;
+            }
+            for e in engines {
+                e.reconcile_commodity_contracts();
+            }
+        });
+    }
+    {
         let dhan = dhan.clone();
         let rt = rt.clone();
         tokio::spawn(async move {
