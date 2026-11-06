@@ -1,4 +1,4 @@
-# Windows build (v0.1.31)
+# Windows build (v0.1.32)
 
 Pre-built Windows x86_64 binaries for this repo, built from the exact source in
 this commit. Everything needed to install and run on Windows is here.
@@ -7,19 +7,27 @@ Build: cross-compiled from Linux with `x86_64-pc-windows-gnu` (mingw-w64), so
 the executables depend only on standard Windows system DLLs plus
 `WebView2Loader.dll` (bundled below) - no VC++ runtime or admin needed.
 
-Headline of this build: **run a strategy on all selected strikes via each
-strike's own premium chart.** In premium-only mode every selected strike
-resolves its individual option chart and must pass the indicator filters on its
-own; a failing strike no longer drags a passing sibling, and `strikeCount` is
-honoured (previously only one strike resolved). Also in this build:
+Headline of this build: **the MCX commodities section no longer stuck on `-`.**
+The old bundled MCX list used made-up ids (`500001..500015`) that are not Dhan
+contracts at all, so their quotes never resolved and the sidebar showed no
+daily change. On a fresh install that list was also served during the
+scrip-master warm-up window and the UI cached it forever. The static fallback is
+gone: while the master downloads the API returns an empty list with
+`warming: true`, and the sidebar retries and replaces the rows once real
+contract ids arrive (CRUDEOIL/COPPER/... with their current expiry ids). Also in
+this build:
 
-- Option type (CE / PE) now restricts the scanner universe to that side instead
-  of being ignored. It is a filter, not a conversion: a bearish stock is not
-  turned into a call.
-- One-side-per-underlying guard fixed: it now blocks the opposite-side entry
-  instead of force-closing the running leg. The old `SIDE_FLIP` close path was
-  booking avoidable losses on every side wobble.
-- Option chain segment and scrip resolution fixes.
+- Scrip-master warm-up now retries with backoff instead of giving up forever
+  after three failed downloads.
+- Saved commodity picks survive a restart that starts before the master is ready,
+  then get reconciled (stale/rolled/futures-only ids dropped) once it is.
+- Every engine tab's commodity picker repopulates when the real list arrives.
+
+Still included from v0.1.31: run a strategy on all selected strikes via each
+strike's own premium chart; option type (CE/PE) restricts the scanner universe
+instead of being ignored; the one-side-per-underlying guard now blocks the
+opposite-side entry instead of force-closing the running leg; and the option
+chain segment / scrip resolution fixes.
 
 Still included from earlier versions: the "Trend check before entry" gate, the
 AI Trader (Paper + Live) autonomous brain engines, the Auto Experiment engine,

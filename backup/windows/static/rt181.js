@@ -4643,11 +4643,19 @@ function populateCommodityAdd(c) {
   // offers option-chain commodities only.
   const rows = PAPER2 ? all.filter((x) => x.has_options) : all;
   const sel = document.getElementById("rtCommodityAdd");
-  if (sel && !commodityPopulated && rows.length) {
-    sel.innerHTML =
-      `<option value="">-- pick commodity --</option>` +
-      rows.map((x) => `<option value="${esc(x.security_id)}">${esc(x.name)} · ${esc(x.symbol)}</option>`).join("");
-    commodityPopulated = true;
+  if (sel && rows.length) {
+    // Repopulate whenever the count changes, not just once: on a fresh install
+    // the first fetch can land while the server's contract master is still
+    // warming (empty list). Once the real contracts arrive the dropdown must
+    // fill in, otherwise it stays empty for the whole session.
+    const key = rows.map((x) => num(x.security_id)).join(",");
+    if (sel.dataset.commKey !== key) {
+      sel.innerHTML =
+        `<option value="">-- pick commodity --</option>` +
+        rows.map((x) => `<option value="${esc(x.security_id)}">${esc(x.name)} · ${esc(x.symbol)}</option>`).join("");
+      sel.dataset.commKey = key;
+      commodityPopulated = true;
+    }
   }
   renderChips("commodityList", "rtCommodityChips", "commodity");
 }
@@ -4863,6 +4871,8 @@ function renderAllChips() {
 // normal setting, so the real and paper tabs keep independent lists.
 // ---------------------------------------------------------------------------
 let MANUAL_INSTRUMENTS = null;
+let manualInstrumentsRetry = null;
+let manualLoadedOk = false;
 let MANUAL_CHAIN = null;
 let MANUAL_LOADING = false;
 
@@ -4910,6 +4920,20 @@ async function manualLoadInstruments(force) {
   }
   MANUAL_LOADING = false;
   manualFillInstruments();
+  // Fresh install: the contract master may still be warming, so the commodity
+  // section of this picker can be empty. Retry in the background until it fills
+  // instead of caching the empty response for the whole session.
+  const d = (MANUAL_INSTRUMENTS && MANUAL_INSTRUMENTS.data) || {};
+  if ((d.commodities || []).length === 0 && (d.warming === true || (d.indices || []).length === 0)) {
+    if (!manualInstrumentsRetry) {
+      manualInstrumentsRetry = setTimeout(() => {
+        manualInstrumentsRetry = null;
+        if (MANUAL_INSTRUMENTS && !manualLoadedOk) manualLoadInstruments(true);
+      }, 3000);
+    }
+  } else if ((d.indices || []).length || (d.commodities || []).length) {
+    manualLoadedOk = true;
+  }
 }
 
 function manualFillStrikes() {

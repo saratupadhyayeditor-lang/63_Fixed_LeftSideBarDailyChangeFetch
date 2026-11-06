@@ -75,15 +75,11 @@ export function bootSidebar(api) {
     } catch (e) {
       console.error("symbols load failed", e);
     }
-    try {
-      const d = await fetchJson("/api/commodities");
-      const list = (d.data && d.data.commodities) || [];
-      inductCommodities(list);
-    } catch (e) {
-      console.error("commodities load failed", e);
-    }
     computeGroups();
     buildSymbolOptions();
+    // Kick the commodity load off without blocking the initial paint; the master
+    // may still be warming, in which case it retries and refreshes in place.
+    loadCommodities();
     buildWatchlist();
     renderCommodityRows();
     if (!catalogOk) showCatalogError();
@@ -91,25 +87,69 @@ export function bootSidebar(api) {
     startFeed();
   }
 
-  function inductCommodities(list) {
-    if (!list.length) return;
-    const existing = new Set(state.symbols.map((s) => String(s[1]) + "|" + s[2]));
+  // Load the MCX commodity list, retrying while the server's contract master is
+  // still warming. On a fresh install the master needs ~25-30s to download and
+  // parse; the old code fetched once at boot, so the window before that returned
+  // an empty/placeholder list which then stuck forever and every row showed `-`.
+  // Now we wait for real contract ids and, when they arrive, replace the rows.
+  let commodityRetry = 0;
+  let commoditiesLoading = false;
+  async function loadCommodities() {
+    if (commoditiesLoading) return;
+    commoditiesLoading = true;
+    try {
+      for (;;) {
+        let d = null;
+        try {
+          d = await fetchJson("/api/commodities", 2);
+        } catch (e) {
+          console.error("commodities load failed", e);
+        }
+        const payload = (d && d.data) || {};
+        const list = payload.commodities || [];
+        const warming = payload.warming === true;
+        if (list.length) {
+          applyCommodities(list);
+          return;
+        }
+        if (!warming || commodityRetry >= 40) {
+          // Not warming (permanent failure) or we waited long enough: show the
+          // empty state honestly instead of a spiral of retries.
+          return;
+        }
+        commodityRetry += 1;
+        await new Promise((r) => setTimeout(r, 1000));
+      }
+    } finally {
+      commoditiesLoading = false;
+    }
+  }
+
+  // Replace the MCX block with an authoritative list. Any MCX symbols/rows from
+  // a previous (possibly placeholder or rolled-expiry) response are dropped, so
+  // the picker, watchlist and feed subscription all switch to real ids at once.
+  function applyCommodities(list) {
     const rows = [];
+    const seen = new Set();
     for (const c of list) {
       const sid = Number(c.security_id);
-      if (!sid || existing.has(String(sid) + "|MCX_COMM")) continue;
-      state.symbols.push([
-        c.name,
-        sid,
-        "MCX_COMM",
-        "FUTCOM",
-        sid,
-        "MCX_COMM",
-        "Commodities (MCX)",
-      ]);
+      if (!sid || seen.has(sid)) continue;
+      seen.add(sid);
       rows.push([c.name, sid]);
     }
-    if (rows.length) state.watchlists["Commodities (MCX)"] = rows;
+    if (!rows.length) return;
+    state.symbols = state.symbols.filter((s) => s[2] !== "MCX_COMM");
+    for (const [name, sid] of rows) {
+      state.symbols.push([name, sid, "MCX_COMM", "FUTCOM", sid, "MCX_COMM", "Commodities (MCX)"]);
+    }
+    state.watchlists["Commodities (MCX)"] = rows;
+    computeGroups();
+    buildSymbolOptions();
+    buildWatchlist();
+    renderCommodityRows();
+    // Force a subscription resend so the new commodity ids start streaming even
+    // though the socket is already open.
+    if (typeof sendSubscription === "function") sendSubscription(true);
   }
 
   function computeGroups() {
