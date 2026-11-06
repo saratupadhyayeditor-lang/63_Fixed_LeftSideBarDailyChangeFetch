@@ -19,11 +19,14 @@ const ENGINE_LABEL = {
   paper: "Paper Trade",
   paper2: "Paper Trade 2",
   paper3: "Paper Trade 3",
+  autoexp: "Auto Experiment",
+  aitrader: "AI Trader (Paper)",
+  aitraderlive: "AI Trader (Live)",
   equitypaper: "Equity Paper Engine",
   equitylive: "Realtime Equity Engine",
 };
 
-const PAPER_ENGINES = ["paper", "paper2", "paper3", "equitypaper"];
+const PAPER_ENGINES = ["paper", "paper2", "paper3", "autoexp", "aitrader", "equitypaper"];
 
 let styleInjected = false;
 let mounted = {};
@@ -110,8 +113,8 @@ export function mountSharedMarginHeader(host) {
   el.className = "sm-head";
   el.innerHTML = `
     <b class="sm-h-title">Shared margin</b>
-    <span class="sm-h-grp paper" title="Poori PAPER family ke liye ek hi shared margin: Paper Trade 1/2/3 + Equity Paper Engine. Har paper tab ke andar sirf iska allotment (%) ya rupee set hota hai.">
-      <b>Paper 1+2+3 pool ₹</b>
+    <span class="sm-h-grp paper" title="Poori PAPER family ke liye ek hi shared margin: Paper Trade 1/2/3 + Auto Experiment + Equity Paper Engine. Har paper tab ke andar sirf iska allotment (%) ya rupee set hota hai.">
+      <b>Paper 1+2+3+AE pool ₹</b>
       <input type="number" class="sm-paper-total" min="0" step="10000">
       <span class="sm-h-used sm-paper-used">--</span>
     </span>
@@ -390,9 +393,13 @@ export function realtimeEngineId() {
     const rb = window.__RT_BASE__ || "";
     if (rb.indexOf("/api/realtime2") === 0) return "realtime2";
     if (rb.indexOf("/api/realtime3") === 0) return "realtime3";
+    if (rb.indexOf("/api/aitraderlive") === 0) return "aitraderlive";
     const pb = window.__PAPER_BASE__ || "";
     if (pb.indexOf("/api/paper2") === 0) return "paper2";
     if (pb.indexOf("/api/paper3") === 0) return "paper3";
+    if (pb.indexOf("/api/autoexp") === 0) return "autoexp";
+    if (pb.indexOf("/api/aitraderlive") === 0) return "aitraderlive";
+    if (pb.indexOf("/api/aitrader") === 0) return "aitrader";
     return window.__PAPER__ ? "paper" : "realtime";
   } catch (_) {
     return "realtime";

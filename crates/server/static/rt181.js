@@ -12,7 +12,7 @@
 // button is the master switch: ON starts + arms + force-ticks, OFF stops.
 
 import { istTime } from "./ist.js?v=1";
-import { mountSharedMargin, realtimeEngineId } from "./sharedmargin.js?v=7";
+import { mountSharedMargin, realtimeEngineId } from "./sharedmargin.js?v=8";
 
 const API = {
   snapshot: () => get("/api/rt/snapshot"),
@@ -93,6 +93,21 @@ const COMMODITIES_ONLY = (() => {
 // backend `/api/paper2/*` engine enforces the same at its layer.
 const PAPER2 = (() => {
   try { return !!window.__PAPER2__; } catch (_) { return false; }
+})();
+
+// Auto Experiment is an independent Paper Trade clone, but the "Auto Trading
+// (trend + SL + trail + target)" preset is removed from that tab only. This flag
+// hides the control in the shared pane so no other engine is affected.
+const AUTO_TRADE_REMOVED = (() => {
+  try { return !!window.__AUTO_TRADE_REMOVED__; } catch (_) { return false; }
+})();
+
+// AI Trader tabs (paper + live) are autonomous: the brain is always in charge,
+// so the "Auto Trading" preset toggle is hidden (the engine pins it ON in the
+// backend). The pane still shows the brain readout (regime, ranked filters,
+// stop/trail/target) so the operator can see exactly what the AI is doing.
+const AI_TRADER = (() => {
+  try { return !!window.__AITRADER__; } catch (_) { return false; }
 })();
 
 async function get(url) {
@@ -1713,7 +1728,8 @@ function shell() {
           <label class="rtom-f">AI Brain
             <select data-set="brainMode" style="width:170px"><option value="off">OFF</option><option value="auto">Auto (score)</option></select></label>
           <label class="rtom-f">threshold <input type="number" data-set="brainThreshold" min="5" max="100" step="1" style="width:56px"> %</label>
-          <label class="rtom-f" style="color:#26a69a;font-weight:bold" title="Spot candle colour gate: ON karne par spot chart par chalne wali trade (strategy mode ya Indicator-filters mode) sirf tab execute hogi jab spot chart ki live FORMING candle trade ki direction me ho - Top Gainer (bullish / CE) ke liye GREEN candle, Top Loser (bearish / PE) ke liye RED candle. Galat colour par signal skip / held rehta hai (consume nahi hota), aur candle colour badalne par condition meet hone par trade execute ho jati hai. Doji (close = open) par bhi rukta hai. Execution ke exact waqt bhi dobara check hota hai. Manual orders par lagu nahi. Default OFF."><input type="checkbox" data-set="spotCandleGate" style="accent-color:#26a69a"> Spot candle gate (Gainer = green, Loser = red)</label>
+           <label class="rtom-f" style="color:#26a69a;font-weight:bold" title="Spot candle colour gate: ON karne par spot chart par chalne wali trade (strategy mode ya Indicator-filters mode) sirf tab execute hogi jab spot chart ki live FORMING candle trade ki direction me ho - Top Gainer (bullish / CE) ke liye GREEN candle, Top Loser (bearish / PE) ke liye RED candle. Galat colour par signal skip / held rehta hai (consume nahi hota), aur candle colour badalne par condition meet hone par trade execute ho jati hai. Doji (close = open) par bhi rukta hai. Execution ke exact waqt bhi dobara check hota hai. Manual orders par lagu nahi. Default OFF."><input type="checkbox" data-set="spotCandleGate" style="accent-color:#26a69a"> Spot candle gate (Gainer = green, Loser = red)</label>
+           <label class="rtom-f" style="color:#ce93d8;font-weight:bold" title="Trend check before entry: ON karne par indicator-filter condition meet hone ke BAAD, trade place karne se pehle underlying (spot) chart ka CURRENT trend check hota hai. CE leg ke liye bullish trend, PE leg ke liye bearish trend zaroori hai - trend opposite ya sideways ho to entry SKIP (signal held rehta hai, consume nahi hota). Trend read teen independent votes ka composite hai (aapke chune hue trend confirmation indicators ka net + EMA20 slope + price vs EMA20) aur range-regime veto (ADX / choppiness / squeeze) ke saath - yani flat market me koi side enter nahi hoti. Trend-following master switch ON ho ya OFF, yeh pure pre-order filter hamesha chalta hai. Execution ke exact waqt bhi dobara check hota hai. Manual orders par lagu nahi. Default OFF."><input type="checkbox" data-set="entryTrendCheckOn" style="accent-color:#ce93d8"> Trend check before entry (opposite/sideways = skip)</label>
           <label class="rtom-f" style="color:#4fc3f7;font-weight:bold" title="Formed candle only (Closed Bar Compute): ON karne par indicator filters live FORMING candle ki jagah aakhri CLOSED (band ho chuki) candle par padhe jaate hain. Isse forming candle ke andar filter value badalne se aane wala repaint khatam ho jata hai - yani jo filter abhi pass ho raha tha wo next tick par gayab ho kar trade ko galat entry nahi dega. Har chart type (Candles / Heikin Ashi / Line / Renko) par lagu. OFF (default) par pehle jaisa hi live forming bar padha jata hai. Execution ke exact waqt bhi wahi closed/forming read dobara check hota hai. Chart tab me iska display counterpart 'Formed candle only' checkbox hai."><input type="checkbox" data-set="closedBarCompute" style="accent-color:#4fc3f7"> Formed candle only (closed bar)</label>
           <label class="rtom-f" style="color:#ffd54f;font-weight:bold" title="Flip Trigger: ON karne par normal indicator-filter gate (All together strict AND / AI Brain / majority) band ho jata hai aur entry SIRF isi vote se hoti hai. Vote saari straight-line lines (Straight Line Indicators + Visible Straight Line Filter) ke saath OI Trend aur Trend Core ki direction par hota hai - jitni lines is leg ki direction me ho rahi hain (bullish => CE leg, bearish => PE leg) unka % jab diye threshold tak pahunche to entry. Flat ya abhi warm-up line vote me count nahi hoti (na numerator na denominator). Forming candle aur 'Formed candle only' dono mode, aur har chart type (Candles / Heikin Ashi / Line / Renko) par chalta hai. Execution ke exact waqt bhi dobara check hota hai. Default OFF."><input type="checkbox" data-set="flipTriggerOn" style="accent-color:#ffd54f"> Flip Trigger (line flip vote)</label>
           <label class="rtom-f" style="color:#ffd54f;font-weight:bold" title="Flip Trigger threshold: is % ya usse zyada lines jab leg ki direction me ho jaayein tabhi entry hoti hai. Example: 10 lines compute ho rahi hain aur 50 set hai to 5 lines on-side hote hi entry. 0-100. Default 50.">Flip vote <input type="number" data-set="flipTriggerPct" min="0" max="100" step="5" style="width:56px"> %</label>
@@ -1981,6 +1997,29 @@ function shell() {
     hideSet("runComm");
     hideSet("tradeInIndex");
     hideSet("tradeInComm");
+  }
+
+  // Auto Experiment: the "Auto Trading (trend + SL + trail + target)" preset is
+  // removed from that tab only. Hide the control (the shared refresh/render code
+  // that reads the node keeps working) and force the engine's stored value off
+  // so a leftover saved file can never arm it. Every other engine is untouched.
+  if (AUTO_TRADE_REMOVED) {
+    const wrap = rt.querySelector("#rtAutoTradeWrap");
+    if (wrap) wrap.style.display = "none";
+  }
+  // AI Trader tabs: hide the Auto Trading toggle (the brain is always on in the
+  // backend) and show a small note explaining the engine is autonomous.
+  if (AI_TRADER) {
+    const wrap = rt.querySelector("#rtAutoTradeWrap");
+    if (wrap) {
+      wrap.style.display = "none";
+      wrap.insertAdjacentHTML(
+        "afterend",
+        '<span class="rt-pill" style="color:#7c4dff;border:1px solid #4527a0;background:#160f2e;border-radius:4px;padding:3px 9px;font-weight:700" ' +
+          'title="AI Trader autonomous engine: multi-factor brain har cycle me regime + filter ranking + volatility gate recompute karta hai aur khud entry/exit leta hai. Auto Trading preset hamesha ON rehta hai.">' +
+          "AI Brain: always ON · autonomous</span>"
+      );
+    }
   }
 
   // NIFTY BB%b (Pane): shown on EVERY engine tab (Realtime Trading Engine,

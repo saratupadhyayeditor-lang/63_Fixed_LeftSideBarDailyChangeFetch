@@ -69,10 +69,44 @@ fn cache_get(key: &str, ttl: Duration) -> Option<Value> {
     }
 }
 
+/// Last cached value for `key` regardless of age. Used as a stale fallback so a
+/// slow/dead upstream (or a Dhan rate-limit hold) never blanks a section that
+/// had rendered before.
+fn cache_get_stale(key: &str) -> Option<Value> {
+    let g = cache().lock().ok()?;
+    g.get(key).map(|e| e.data.clone())
+}
+
 fn cache_put(key: &'static str, data: Value) {
     if let Ok(mut g) = cache().lock() {
         g.insert(key, Entry { at: Instant::now(), data });
     }
+}
+
+/// Run one section future with a hard deadline. A slow/dead upstream (NSE bot
+/// wall, Yahoo 429, or a Dhan rate-limit hold) must never hold the whole
+/// payload back: on timeout the section reports `ok:false` and the tab still
+/// renders every other block. The same applies to a cancelled-but-still-running
+/// request, so the operator's Refresh always gets an answer quickly.
+async fn bounded<F>(label: &'static str, secs: u64, fut: F) -> Value
+where
+    F: std::future::Future<Output = Value>,
+{
+    match tokio::time::timeout(Duration::from_secs(secs), fut).await {
+        Ok(v) => v,
+        Err(_) => json!({ "ok": false, "error": format!("{label} timed out") }),
+    }
+}
+
+/// Fall back to the last cached copy of a section when the fresh attempt
+/// failed or timed out, so a rendered tab never blanks out during an upstream
+/// hiccup / Dhan rate-limit hold. Stale data is clearly better than an empty
+/// section, and the section keeps its previous `ok` flag.
+fn or_stale(key: &str, v: Value) -> Value {
+    if v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false) {
+        return v;
+    }
+    cache_get_stale(key).unwrap_or(v)
 }
 
 /// Return the cached section when fresh, otherwise run `f` and cache an
@@ -397,7 +431,7 @@ async fn fetch_global(cl: reqwest::Client) -> Value {
 // 4. India indices (live Dhan feed)
 // ---------------------------------------------------------------------------
 
-const INDIA: &[(i64, &str, &str)] = &[
+pub(crate) const INDIA: &[(i64, &str, &str)] = &[
     (13, "NIFTY 50", "IDX_I"),
     (25, "BANK NIFTY", "IDX_I"),
     (27, "FINNIFTY", "IDX_I"),
@@ -406,10 +440,67 @@ const INDIA: &[(i64, &str, &str)] = &[
     (51, "SENSEX", "IDX_I"),
 ];
 
+/// Build the India rows from rows already present in the live websocket quote
+/// cache (`ltp` + `close`/`change_pct`). This is the fast path: while the feed
+/// is up every one of these indices is streamed, so the block renders without
+/// touching Dhan's shared REST data gate at all.
+fn india_from_quote_cache(dhan: &DhanState) -> Option<Vec<Value>> {
+    let Ok(q) = dhan.market.quotes.lock() else { return None };
+    let mut rows: Vec<Value> = Vec::with_capacity(INDIA.len());
+    let mut hits = 0;
+    for (id, name, seg) in INDIA {
+        let Some(v) = q.get(&crate::market::quote_key(*id, seg)) else { continue };
+        let ltp = v.get("ltp").and_then(|x| x.as_f64()).unwrap_or(0.0);
+        if ltp <= 0.0 {
+            continue;
+        }
+        hits += 1;
+        let prev = v
+            .get("close")
+            .and_then(|x| x.as_f64())
+            .filter(|p| *p > 0.0)
+            .unwrap_or(0.0);
+        let change = if prev > 0.0 { ltp - prev } else {
+            v.get("change").and_then(|x| x.as_f64()).unwrap_or(0.0)
+        };
+        let pct = if prev > 0.0 {
+            change / prev * 100.0
+        } else {
+            v.get("change_pct").and_then(|x| x.as_f64()).unwrap_or(0.0)
+        };
+        rows.push(json!({
+            "name": name,
+            "securityId": id,
+            "ok": true,
+            "price": ltp,
+            "change": change,
+            "changePct": pct,
+        }));
+    }
+    // Require most of the universe from the cache; a partially warmed feed
+    // falls through to REST so the block is not shown half-empty.
+    if hits >= (INDIA.len() * 2 / 3).max(2) {
+        Some(rows)
+    } else {
+        None
+    }
+}
+
 async fn fetch_india(dhan: &DhanState) -> Value {
+    // Fast path: the live websocket cache already has every index while the
+    // feed is up. Use it so the tab (and its Refresh button) answers instantly
+    // instead of queueing behind Dhan's shared ~1.2s REST data gate.
+    if let Some(rows) = india_from_quote_cache(dhan) {
+        return json!({ "ok": true, "rows": rows, "source": "feed" });
+    }
     let Some(cl) = dhan.session_client().await else {
         return json!({ "ok": false, "error": "Dhan session not connected" });
     };
+    // While Dhan's adaptive data gate is holding, a REST call would just sleep
+    // up to two minutes; report it plainly so the caller can use a stale copy.
+    if dhan.rate_limited() {
+        return json!({ "ok": false, "error": "Dhan data gate holding (rate limit)" });
+    }
     dhan.dhan_throttle().await;
     let mut req: BTreeMap<String, Vec<i64>> = BTreeMap::new();
     for (sid, _name, seg) in INDIA {
@@ -427,33 +518,56 @@ async fn fetch_india(dhan: &DhanState) -> Value {
             }
             // Dhan's quote feed is frozen for the GIFT NIFTY index (its candle
             // series is correct), so mirror the latest candle close below.
-            let gift_ltp = dhan
-                .fetch_candles(5024, "IDX_I", "INDEX", "1min")
-                .await
-                .ok()
-                .and_then(|c| c.last().map(|x| x.close))
-                .filter(|v| *v > 0.0);
+            // Best-effort: its own deadline, because the shared data gate can be
+            // held for a long time and this must not eat the whole section.
+            let gift_ltp = match tokio::time::timeout(
+                Duration::from_secs(4),
+                dhan.fetch_candles(5024, "IDX_I", "INDEX", "1min"),
+            )
+            .await
+            {
+                Ok(Ok(c)) => c.last().map(|x| x.close).filter(|v| *v > 0.0),
+                _ => None,
+            };
             // The REST snapshot reports no previous close outside market hours
             // (and GIFT NIFTY's is frozen), so seed the prior-session close from
             // the daily candle series for every index that lacks one.
-            let mut daily_prev: HashMap<i64, f64> = HashMap::new();
-            for (id, _name, _seg) in INDIA {
-                let needs = map
-                    .get(id)
-                    .map(|e| e.previous_close_price <= 0.0)
-                    .unwrap_or(true);
-                if !needs {
-                    continue;
-                }
-                if let Ok(c) = dhan.fetch_candles(*id, "IDX_I", "INDEX", "1day").await {
-                    if c.len() >= 2 {
-                        let v = c[c.len() - 2].close;
-                        if v > 0.0 {
-                            daily_prev.insert(*id, v);
-                        }
+            //
+            // Only the indices that ACTUALLY need it are fetched, concurrently,
+            // and each under its own short deadline. Sequential fetches at
+            // Dhan's ~1.2s shared data gate would add >7s here and make the whole
+            // tab time out after hours.
+            let needs_backfill: Vec<i64> = INDIA
+                .iter()
+                .filter(|(id, _name, _seg)| {
+                    map.get(id).map(|e| e.previous_close_price <= 0.0).unwrap_or(true)
+                })
+                .map(|(id, _name, _seg)| *id)
+                .collect();
+            let daily_prev: HashMap<i64, f64> = if needs_backfill.is_empty() {
+                HashMap::new()
+            } else {
+                let futs = needs_backfill.into_iter().map(|id| {
+                    let d = dhan.clone();
+                    async move {
+                        let prev = match tokio::time::timeout(
+                            Duration::from_secs(4),
+                            d.fetch_candles(id, "IDX_I", "INDEX", "1day"),
+                        )
+                        .await
+                        {
+                            Ok(Ok(c)) if c.len() >= 2 => c[c.len() - 2].close,
+                            _ => 0.0,
+                        };
+                        (id, prev)
                     }
-                }
-            }
+                });
+                join_all(futs)
+                    .await
+                    .into_iter()
+                    .filter(|(_id, v)| *v > 0.0)
+                    .collect()
+            };
             let rows: Vec<Value> = INDIA
                 .iter()
                 .map(|(id, name, _seg)| {
@@ -1247,23 +1361,56 @@ pub async fn gap_stats(
 
 
 /// `GET /api/market/analysis` - every section in one payload.
+///
+/// The five upstream sections are independent, so they run CONCURRENTLY and
+/// each one carries its own hard deadline. A single slow upstream (NSE bot
+/// wall, Yahoo 429, or a Dhan data-gate hold that can last up to two minutes)
+/// therefore can never stall the whole response - which is what used to leave
+/// the tab's Refresh button spinning forever, because the client kept its
+/// in-flight guard set and silently dropped every later click.
 pub async fn analysis(State(dhan): State<DhanState>) -> impl IntoResponse {
     let cl = client();
-    let fiidii = cached_or("fiidii", Duration::from_secs(300), &cl, fetch_fiidii).await;
-    let participant =
-        cached_or("participant", Duration::from_secs(3600), &cl, fetch_participant).await;
-    let global = cached_or("global", Duration::from_secs(60), &cl, fetch_global).await;
-    let india = if let Some(v) = cache_get("india", Duration::from_secs(20)) {
-        v
-    } else {
-        let v = fetch_india(&dhan).await;
+    let india_fut = async {
+        if let Some(v) = cache_get("india", Duration::from_secs(60)) {
+            return v;
+        }
+        // While Dhan's adaptive data gate is holding (a rate-limit penalty that
+        // can last up to two minutes), skip the REST call entirely and serve the
+        // last good copy. Waiting out the hold would make Refresh feel dead.
+        if dhan.rate_limited() {
+            if let Some(v) = cache_get_stale("india") {
+                return v;
+            }
+        }
+        // Short deadline for the same reason: the India block rides on Dhan's
+        // shared data gate, which a busy engine can keep shut for a long time.
+        // 15s covers the a warm session's 6 index quote + backfill calls at
+        // Dhan's ~1-2/s data budget without letting a dead gate hang the tab.
+        let v = bounded("India indices", 15, fetch_india(&dhan)).await;
+        let v = or_stale("india", v);
         if v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false) {
             cache_put("india", v.clone());
         }
         v
     };
+    let (fiidii, participant, global, india, news) = tokio::join!(
+        async { or_stale("fiidii", bounded("FII/DII", 12, cached_or("fiidii", Duration::from_secs(300), &cl, fetch_fiidii)).await) },
+        async {
+            or_stale(
+                "participant",
+                bounded(
+                    "Participant OI",
+                    12,
+                    cached_or("participant", Duration::from_secs(3600), &cl, fetch_participant),
+                )
+                .await,
+            )
+        },
+        async { or_stale("global", bounded("Global indices", 12, cached_or("global", Duration::from_secs(60), &cl, fetch_global)).await) },
+        india_fut,
+        async { or_stale("news", bounded("News", 12, cached_or("news", Duration::from_secs(600), &cl, fetch_news)).await) },
+    );
     let prediction = predict(&fiidii, &participant, &global, &india);
-    let news = cached_or("news", Duration::from_secs(600), &cl, fetch_news).await;
     let news_prediction = news_prediction(&news);
     let overall = overall_prediction(&prediction, &news_prediction, &news, &global);
     Json(json!({

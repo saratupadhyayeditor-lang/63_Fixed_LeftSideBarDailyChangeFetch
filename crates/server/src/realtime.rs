@@ -836,6 +836,19 @@ pub struct Settings {
     /// The colour is re-checked at the actual execution instant as well, so a
     /// candle that flips between the scan and the fill still blocks the trade.
     pub spot_candle_gate: bool,
+    /// "Trend check before entry": when ON, AFTER the indicator-filter condition
+    /// has been met the engine performs one more check on the underlying (spot)
+    /// chart before placing the order: the current trend must agree with the
+    /// trade's side, otherwise the entry is SKIPPED. A bullish (CE) leg needs a
+    /// bullish read, a bearish (PE) leg a bearish read. The trend is a composite
+    /// read of the SAME confirmation-indicator set the operator selected for the
+    /// trend-following sections (falling back to a built-in EMA/Supertrend/ADX
+    /// set when none is configured), combined with the range-regime read and the
+    /// fake-move guards, so a genuine directional move is required - a flat /
+    /// sideways / opposite tape blocks the entry. This is a pure filter that
+    /// works whether or not any trend-following master is switched ON, and it is
+    /// re-checked at the exact execution instant as well. Default OFF.
+    pub entry_trend_check_on: bool,
     /// "Closed Bar Compute" toggle for the indicator filter gate. When ON the
     /// indicator filters are read on the last CLOSED candle (one bar back)
     /// instead of the live FORMING candle, which removes intrabar repaint: a
@@ -1202,6 +1215,7 @@ impl Default for Settings {
             all_in_one: false,
             overall_dir: true,
             spot_candle_gate: false,
+            entry_trend_check_on: false,
             closed_bar_compute: false,
             flip_trigger_on: false,
             flip_trigger_pct: 50.0,
@@ -1938,6 +1952,19 @@ const STATE_FILE_REAL3: &str = "algodhan_realtime3_state.json";
 const STATE_FILE_PAPER: &str = "algodhan_paper_state.json";
 const STATE_FILE_PAPER2: &str = "algodhan_paper2_state.json";
 const STATE_FILE_PAPER3: &str = "algodhan_paper3_state.json";
+/// Auto Experiment: a complete, fully independent clone of Paper Trade (all
+/// universes: stocks + indices + option-chain commodities) that shares NO data
+/// with any other engine - its own durable state file and in-memory book.
+const STATE_FILE_AUTOEXP: &str = "algodhan_autoexp_state.json";
+/// AI Trader (Paper): an autonomous, brain-driven engine that deep-analyses the
+/// operator's selected universe (indices / commodities / F&O stocks) with the
+/// multi-factor decision layer and places/cuts trades on its own - simulated
+/// execution, its own durable state file, shares NO data with any other engine.
+const STATE_FILE_AITRADER: &str = "algodhan_aitrader_state.json";
+/// AI Trader (Live): the same autonomous brain-driven engine, but places REAL
+/// Dhan orders. Its own durable state file and in-memory book, so it can never
+/// disturb another engine's positions.
+const STATE_FILE_AITRADERLIVE: &str = "algodhan_aitraderlive_state.json";
 
 /// Universal saved-template pool shared by every engine tab. Templates are
 /// stored once here (with the engine they were saved from) instead of inside a
@@ -2018,6 +2045,9 @@ pub fn shared_template_pool() -> TemplatePool {
             (STATE_FILE_PAPER, "paper", "Paper Trade"),
             (STATE_FILE_PAPER2, "paper2", "Paper Trade 2"),
             (STATE_FILE_PAPER3, "paper3", "Paper Trade 3"),
+            (STATE_FILE_AUTOEXP, "autoexp", "Auto Experiment"),
+            (STATE_FILE_AITRADER, "aitrader", "AI Trader (Paper)"),
+            (STATE_FILE_AITRADERLIVE, "aitraderlive", "AI Trader (Live)"),
         ];
         for (file, id, label) in engines {
             let Ok(s) = std::fs::read_to_string(state_path(file)) else {
@@ -2043,7 +2073,7 @@ pub fn shared_template_pool() -> TemplatePool {
     Arc::new(Mutex::new(pool))
 }
 
-fn persist_template_pool(pool: &TemplatePool) {
+pub(crate) fn persist_template_pool(pool: &TemplatePool) {
     let bytes = {
         let Ok(p) = pool.lock() else {
             return;
@@ -2870,6 +2900,9 @@ fn register_engine(state_file: &'static str, st: &RealtimeState) {
         STATE_FILE_PAPER => "paper",
         STATE_FILE_PAPER2 => "paper2",
         STATE_FILE_PAPER3 => "paper3",
+        STATE_FILE_AUTOEXP => "autoexp",
+        STATE_FILE_AITRADER => "aitrader",
+        STATE_FILE_AITRADERLIVE => "aitraderlive",
         _ => return,
     };
     if let Ok(mut m) = engine_registry().lock() {
@@ -2879,7 +2912,7 @@ fn register_engine(state_file: &'static str, st: &RealtimeState) {
 
 /// Every registered engine id, in tab order.
 pub fn rt_engine_ids() -> Vec<&'static str> {
-    vec!["realtime", "realtime2", "realtime3", "paper", "paper2", "paper3"]
+    vec!["realtime", "realtime2", "realtime3", "paper", "paper2", "paper3", "autoexp", "aitrader", "aitraderlive"]
 }
 
 impl RealtimeState {
@@ -2908,6 +2941,30 @@ impl RealtimeState {
     /// own simulated trades and shares NO data with any other engine.
     pub fn new_paper3(dhan: DhanState) -> Self {
         Self::new_mode(dhan, true, STATE_FILE_PAPER3)
+    }
+
+    /// Auto Experiment engine (`/api/autoexp/*`): a complete, fully independent
+    /// clone of Paper Trade. It runs the same AI Smart engine on the live Dhan
+    /// feed with simulated execution over the full universe (stocks + indices +
+    /// option-chain commodities), but has its own durable state file and
+    /// in-memory book, so it shares NO data with any other engine.
+    pub fn new_autoexp(dhan: DhanState) -> Self {
+        Self::new_mode(dhan, true, STATE_FILE_AUTOEXP)
+    }
+
+    /// AI Trader (Paper) engine (`/api/aitrader/*`): an autonomous, deep-analysis
+    /// engine. It runs the multi-factor brain over the operator's selected
+    /// universe and places/cuts trades on its own with simulated execution. Own
+    /// durable state file and in-memory book - shares NO data with any engine.
+    pub fn new_aitrader(dhan: DhanState) -> Self {
+        Self::new_mode(dhan, true, STATE_FILE_AITRADER)
+    }
+
+    /// AI Trader (Live) engine (`/api/aitraderlive/*`): the same autonomous,
+    /// deep-analysis brain, but places REAL Dhan orders. Own durable state file
+    /// and in-memory book - shares NO data with any engine.
+    pub fn new_aitraderlive(dhan: DhanState) -> Self {
+        Self::new_mode(dhan, false, STATE_FILE_AITRADERLIVE)
     }
 
     /// Second independent LIVE engine (`/api/realtime2/*`): places REAL Dhan
@@ -2942,6 +2999,9 @@ impl RealtimeState {
             STATE_FILE_PAPER => "paper",
             STATE_FILE_PAPER2 => "paper2",
             STATE_FILE_PAPER3 => "paper3",
+            STATE_FILE_AUTOEXP => "autoexp",
+            STATE_FILE_AITRADER => "aitrader",
+            STATE_FILE_AITRADERLIVE => "aitraderlive",
             _ => "engine",
         }
     }
@@ -2955,6 +3015,9 @@ impl RealtimeState {
             STATE_FILE_PAPER => "Paper Trade",
             STATE_FILE_PAPER2 => "Paper Trade 2",
             STATE_FILE_PAPER3 => "Paper Trade 3",
+            STATE_FILE_AUTOEXP => "Auto Experiment",
+            STATE_FILE_AITRADER => "AI Trader (Paper)",
+            STATE_FILE_AITRADERLIVE => "AI Trader (Live)",
             _ => "Engine",
         }
     }
@@ -2983,6 +3046,23 @@ impl RealtimeState {
     /// trade on that tab.
     fn commodities_only(&self) -> bool {
         matches!(self.state_file, STATE_FILE_PAPER3)
+    }
+
+    /// True for the Auto Experiment engine: the "Auto Trading (trend + SL +
+    /// trail + target)" preset is removed from this tab only. A saved file or a
+    /// settings POST can never arm it here; every other engine keeps the feature.
+    fn auto_trade_removed(&self) -> bool {
+        matches!(self.state_file, STATE_FILE_AUTOEXP)
+    }
+
+    /// True for the two AI Trader engines (paper + live). These tabs are
+    /// autonomous: the multi-factor brain is always in charge, so the "Auto
+    /// Trading (trend + filters + SL + trail + target)" preset is pinned ON and
+    /// the operator sets only the universe (indices / commodities / F&O) and
+    /// risk. The brain then ranks the filters, picks the side, sizes the trade
+    /// and drives the adaptive exit on its own.
+    fn ai_trader(&self) -> bool {
+        matches!(self.state_file, STATE_FILE_AITRADER | STATE_FILE_AITRADERLIVE)
     }
 
     /// Whether the operator's index universe is part of this engine's scan.
@@ -3042,6 +3122,21 @@ impl RealtimeState {
     /// stock / NIFTY-trend / BB%b features; every other engine is pinned to the
     /// Indicator-filters run mode and keeps only the F&O-stock routing.
     fn enforce_constraints(&self, s: &mut Settings) {
+        if self.auto_trade_removed() {
+            // Auto Experiment tab: the Auto Trading preset feature is removed.
+            // A saved file or a raw POST can never re-arm it here; open trades
+            // keep their existing SL / trail / target protection untouched.
+            s.auto_trade_on = false;
+        }
+        if self.ai_trader() {
+            // AI Trader tabs are autonomous: the brain must stay in charge of the
+            // filter ranking / side / exits. Pinning Auto Trading ON here means a
+            // raw settings POST or a restored file can never switch the brain
+            // off and leave the engine trading stale filters. The universe and
+            // risk fields the operator set are preserved.
+            s.auto_trade_on = true;
+            s.filter_mode = true;
+        }
         if self.indices_commodities_only() {
             sanitize_indices_commodities(s);
             if self.indices_only() {
@@ -3117,6 +3212,22 @@ impl RealtimeState {
                 strip_realtime_pt1_extras(&mut doc.settings);
                 doc.settings.filter_mode = true;
             }
+        }
+        // Auto Experiment tab: the Auto Trading preset feature is removed from
+        // this engine only, so a saved file can never re-arm it.
+        if state_file == STATE_FILE_AUTOEXP {
+            doc.settings.auto_trade_on = false;
+        }
+        // AI Trader engines are autonomous: the brain is always in charge, so the
+        // Auto Trading preset is pinned ON. The universe + risk knobs stay the
+        // operator's; the brain recomputes the filter ranking / side / exits on
+        // every cycle. Pinning here means a saved file can never leave the AI tab
+        // "on" with the brain switched off (which would trade stale filters).
+        if matches!(state_file, STATE_FILE_AITRADER | STATE_FILE_AITRADERLIVE) {
+            if !doc.settings.auto_trade_on {
+                apply_auto_trade_preset(&mut doc.settings);
+            }
+            doc.settings.auto_trade_on = true;
         }
         // A stored `pointTrailBrokerOnly` from the old rule is cleared ONLY when
         // the position carries no broker-owned trail. A position routed to a
@@ -7990,6 +8101,28 @@ impl RealtimeState {
                 }
                 continue;
             }
+            // Trend check before entry: after the filter condition is met, the
+            // underlying spot chart's current trend must agree with the leg's
+            // side (bullish for a CE, bearish for a PE). A sideways / opposite
+            // tape skips the entry; the signal is HELD so a later scan can enter
+            // once the trend lines up. Pure pre-order filter - independent of
+            // whether any trend-following master is switched ON.
+            if let Some(reason) = self.entry_trend_check_skip(&settings, &strat).await {
+                self.note_blocker("info", "entry-trend", &strat.name, &format!("{} - {reason}", strat.name));
+                self.log_throttled(
+                    &format!("entrytrend:{}", strat.id),
+                    10_000,
+                    "info",
+                    &format!("skip entry {}: {reason}", strat.name),
+                );
+                if self.end_signal_if_due(&strat.id) {
+                    self.clear_signal_edge(&strat.id);
+                }
+                if settings.entry_latch_on {
+                    self.latch_note_gate_off(&strat.id, settings.entry_latch_secs);
+                }
+                continue;
+            }
             // Multi-TF confirm: the higher ticked timeframe must also satisfy the
             // same gate (old `evalEntryMtfLive` trend leg) before the entry fires.
             if let Some((_, trend_tf)) = &mtf_tfs {
@@ -11235,6 +11368,68 @@ impl RealtimeState {
         None
     }
 
+    /// "Trend check before entry": after the indicator-filter condition is met,
+    /// read the CURRENT trend on the underlying (spot) chart and refuse the entry
+    /// unless it agrees with the leg's side. This is a pure pre-order filter - it
+    /// runs whether or not any trend-following master is switched ON, so a
+    /// bullish filter can never buy a CE (or a bearish filter a PE) into an
+    /// opposite / flat tape. Returns `Some(reason)` when the entry must be
+    /// skipped, `None` when it may proceed (or the switch is off / manual order).
+    ///
+    /// The read is a composite of three independent votes on the same candles the
+    /// chart draws:
+    ///   * the operator's confirmation-indicator net direction (the trend engines'
+    ///     own set, with a built-in EMA/Supertrend fallback when none is set),
+    ///   * the EMA20 slope over the last 10 bars,
+    ///   * price vs EMA20,
+    /// gated by the composite range-regime read (ADX / choppiness / slope / range
+    /// compression). A range-bound or neutral tape blocks BOTH sides, so only a
+    /// genuine move in the leg's direction lets the trade through.
+    async fn entry_trend_check_skip(&self, settings: &Settings, strat: &Strategy) -> Option<String> {
+        if !settings.entry_trend_check_on || strat.manual {
+            return None;
+        }
+        // The trend that matters is the one on the trade's UNDERLYING spot chart;
+        // a resolved option contract's own premium chart is not the trend.
+        let source = if is_option_leg(strat) {
+            match underlying_strategy(strat) {
+                Some(u) => u,
+                None => strat.clone(),
+            }
+        } else {
+            strat.clone()
+        };
+        let tf = engine_tf(settings, &source);
+        let candles = match self
+            .live_candles(source.security_id, &source.exchange_segment, &source.instrument, &tf)
+            .await
+        {
+            Ok(c) if c.len() >= 35 => c,
+            Ok(_) => return Some("trend check: not enough candles to read the trend yet".into()),
+            Err(e) => return Some(format!("trend check: candle series unavailable ({e})")),
+        };
+        let cat = strat_category(strat);
+        let conf = entry_trend_conf_inds(settings, cat);
+        let bull = strategy_is_bull(strat);
+        let read = entry_trend_read(&candles, &conf, settings);
+        if !read.ok {
+            return Some(format!(
+                "trend check: {} (need {} trend)",
+                read.reason,
+                if bull { "bullish" } else { "bearish" }
+            ));
+        }
+        let want = if bull { 1 } else { -1 };
+        if read.dir != want {
+            return Some(format!(
+                "trend check: {} trend vs {} entry - opposite-side trade skipped",
+                if read.dir > 0 { "bullish" } else { "bearish" },
+                if bull { "bullish(CE)" } else { "bearish(PE)" }
+            ));
+        }
+        None
+    }
+
     /// Execution-instant re-check of the ticked Indicator-filter set (plus any
     /// saved strategy conditions). The scan decides an entry on the live forming
     /// bar, but the order is only booked AFTER two asynchronous latency windows -
@@ -11536,6 +11731,14 @@ impl RealtimeState {
         // signal and retries on a later scan instead of consuming it.
         if let Some(reason) = self.spot_candle_gate_skip(&settings, &strat).await {
             return Err(format!("candle gate: {reason}"));
+        }
+        // Execution-instant trend re-check: the tape can roll over between the
+        // scan and the fill, so the "trend check before entry" rule is enforced
+        // here too. Returns an error so the caller releases the fresh-signal edge
+        // and retries on a later scan instead of executing into a flat/opposite
+        // trend.
+        if let Some(reason) = self.entry_trend_check_skip(&settings, &strat).await {
+            return Err(format!("trend check: {reason}"));
         }
         // Execution-instant Indicator-filter re-check: the scan's gate ran on the
         // forming bar, but the paper execution delay and the option-feed LTP
@@ -16628,7 +16831,7 @@ fn primary_keys_for_side(settings: &Settings, bull_side: bool) -> Vec<&String> {
 ///     the threshold.
 /// Without strict AND the gate falls back to a majority of the enabled filters
 /// (subject to Brain when it is enabled).
-fn filter_gate(settings: &Settings, strat: &Strategy, candles: &[Candle], offset: usize) -> bool {
+pub(crate) fn filter_gate(settings: &Settings, strat: &Strategy, candles: &[Candle], offset: usize) -> bool {
     filter_gate_facts(settings, strat, candles, offset).0
 }
 
@@ -16878,6 +17081,117 @@ fn premium_only_for_cat(cat: StratCat, s: &Settings) -> bool {
 /// Per-strategy form of [`premium_only_for_cat`] (uses the strategy's category).
 fn premium_only_for(strat: &Strategy, s: &Settings) -> bool {
     premium_only_for_cat(strat_category(strat), s)
+}
+
+/// Confirmation-indicator set the "Trend check before entry" reads for a
+/// category. It reuses the operator's own trend-following selection for that
+/// category (so the entry check agrees with the section the operator configured)
+/// and falls back to the built-in EMA/Supertrend pair when none is set - the
+/// check must always have at least one measurable confirmation.
+fn entry_trend_conf_inds(s: &Settings, cat: StratCat) -> Vec<String> {
+    let own: &Vec<String> = match cat {
+        StratCat::Index => &s.index_trend_conf_inds,
+        StratCat::Comm => &s.comm_trend_conf_inds,
+        StratCat::Fno => &s.nifty_trend_conf_inds,
+    };
+    if !own.is_empty() {
+        return own.clone();
+    }
+    ENTRY_TREND_DEFAULT_CONF.iter().map(|x| x.to_string()).collect()
+}
+
+/// Built-in fallback confirmation set for the "Trend check before entry" gate:
+/// two independent held-side reads (fast/slow EMA + the classic 9/21 EMA pair).
+/// Same ids the Auto Trading preset uses, so the read is one the engine already
+/// understands.
+const ENTRY_TREND_DEFAULT_CONF: &[&str] = &["BullMeetEma1_9", "BullMeetEma9_21"];
+
+/// Verdict of the "Trend check before entry" composite read.
+#[derive(Debug)]
+struct EntryTrendRead {
+    /// `true` when a directional trend was resolved (not sideways / not neutral).
+    ok: bool,
+    /// +1 bullish, -1 bearish, 0 unresolved.
+    dir: i64,
+    /// Human-readable explanation shown in the entry-blocker log.
+    reason: String,
+}
+
+/// Composite current-trend read on the underlying candles for the pre-entry
+/// trend gate. Three independent votes are combined with the range-regime read:
+///   * the confirmation-indicator net direction,
+///   * the EMA20 slope over the last 10 bars,
+///   * price vs EMA20.
+/// The regime read (ADX / choppiness / EMA slope / range compression) vetoes a
+/// range-bound tape outright, so a flat market can never pass in either
+/// direction. A net of zero (a tie) is also treated as "no direction". Fails
+/// closed with `ok = false` when the series cannot be measured - an unreadable
+/// trend must never silently allow an opposite-side entry.
+fn entry_trend_read(candles: &[Candle], conf: &[String], s: &Settings) -> EntryTrendRead {
+    if candles.len() < 35 {
+        return EntryTrendRead { ok: false, dir: 0, reason: "not enough candles".into() };
+    }
+    let Some(regime) = sideways_read(candles) else {
+        return EntryTrendRead { ok: false, dir: 0, reason: "regime unreadable".into() };
+    };
+    if regime.sideways {
+        return EntryTrendRead { ok: false, dir: 0, reason: format!("sideways - {}", regime.reason()) };
+    }
+    let (_, _, net, _) = nifty_indicator_read(candles, conf, 5, s.nifty_trend_color, s);
+    let vote_conf = net.signum();
+    let vote_slope = ema_slope_vote(candles);
+    let vote_price = price_vs_ema_vote(candles);
+    let sum = vote_conf + vote_slope + vote_price;
+    let dir = sum.signum();
+    if dir == 0 {
+        return EntryTrendRead {
+            ok: false,
+            dir: 0,
+            reason: format!(
+                "trend neutral (conf {vote_conf:+}, slope {vote_slope:+}, price {vote_price:+})"
+            ),
+        };
+    }
+    let label = if dir > 0 { "bullish" } else { "bearish" };
+    EntryTrendRead {
+        ok: true,
+        dir,
+        reason: format!(
+            "{label} (conf {vote_conf:+}, slope {vote_slope:+}, price {vote_price:+})"
+        ),
+    }
+}
+
+/// EMA20 slope vote over the last 10 bars: +1 rising, -1 falling, 0 flat. Uses a
+/// small ATR-relative dead-band so sub-noise drift does not fake a trend.
+fn ema_slope_vote(c: &[Candle]) -> i64 {
+    let Some(ema) = ema_value(c, 20) else { return 0 };
+    let Some(ema_prev) = ema_value(&c[..c.len().saturating_sub(10)], 20) else { return 0 };
+    let Some(atr) = regime_atr(c, 14) else { return 0 };
+    let delta = ema - ema_prev;
+    let band = atr * 0.15;
+    if delta > band {
+        1
+    } else if delta < -band {
+        -1
+    } else {
+        0
+    }
+}
+
+/// Price vs EMA20 vote: +1 above, -1 below, 0 inside a small ATR band.
+fn price_vs_ema_vote(c: &[Candle]) -> i64 {
+    let Some(ema) = ema_value(c, 20) else { return 0 };
+    let Some(atr) = regime_atr(c, 14) else { return 0 };
+    let close = c[c.len() - 1].close;
+    let band = atr * 0.1;
+    if close > ema + band {
+        1
+    } else if close < ema - band {
+        -1
+    } else {
+        0
+    }
 }
 
 /// Chart the strategy conditions are evaluated on: `spot` | `premium` | `both`.
@@ -19656,6 +19970,28 @@ pub async fn template_post(State(rt): State<RealtimeState>, Json(v): Json<Value>
                         rt.enforce_constraints(&mut d.settings);
                     }
                 }
+                // Templates saved by the Auto Experiment engine embed their own
+                // strategy rows. Restore (upsert) them on apply/run so the entry
+                // indicator-filter rule the backtest used is actually present in
+                // this engine's strategy book - otherwise applying the template
+                // would only import settings and the trade could never fire.
+                let mut embedded: Vec<String> = Vec::new();
+                if let Some(arr) = t.get("strategies").and_then(|x| x.as_array()) {
+                    for sv in arr {
+                        let Ok(mut s) = serde_json::from_value::<Strategy>(sv.clone()) else {
+                            continue;
+                        };
+                        if s.id.is_empty() {
+                            s.id = gen_id("rtstrat");
+                        }
+                        if let Some(e) = d.strategies.iter_mut().find(|x| x.id == s.id) {
+                            *e = s.clone();
+                        } else {
+                            d.strategies.push(s.clone());
+                        }
+                        embedded.push(s.id);
+                    }
+                }
                 if action == "run" {
                     let mut restored = 0usize;
                     if let Some(arr) = t.get("selected").and_then(|x| x.as_array()) {
@@ -19672,6 +20008,13 @@ pub async fn template_post(State(rt): State<RealtimeState>, Json(v): Json<Value>
                                 }
                             }
                         }
+                    }
+                    // Auto Experiment templates list their strategies under
+                    // `strategies`, not `selected`. Tick the ones just restored so
+                    // "Run" actually starts trading the backtested rule.
+                    for id in &embedded {
+                        d.selected.insert(id.clone(), true);
+                        restored += 1;
                     }
                     d.engine_on = true;
                     let armed = master_armed(true, &d.last_square_off_day, &ist_day_key());
@@ -20186,6 +20529,24 @@ pub fn paper3_router() -> Router<RealtimeState> {
     rt_routes!("/api/paper3")
 }
 
+/// Auto Experiment API (`/api/autoexp/*`), routed to a complete, fully
+/// independent clone of the Paper Trade engine with its own durable state file.
+pub fn autoexp_router() -> Router<RealtimeState> {
+    rt_routes!("/api/autoexp")
+}
+
+/// AI Trader (Paper) API (`/api/aitrader/*`), routed to the autonomous
+/// brain-driven paper engine with its own durable state file.
+pub fn aitrader_router() -> Router<RealtimeState> {
+    rt_routes!("/api/aitrader")
+}
+
+/// AI Trader (Live) API (`/api/aitraderlive/*`), routed to the autonomous
+/// brain-driven LIVE engine with its own durable state file.
+pub fn aitraderlive_router() -> Router<RealtimeState> {
+    rt_routes!("/api/aitraderlive")
+}
+
 // Keep an unused import from warning in some build profiles.
 #[allow(dead_code)]
 fn _touch(_: LegName, _: ModifyOrderRequest, _: MarketState) {}
@@ -20266,6 +20627,9 @@ mod gate_tests {
             STATE_FILE_PAPER,
             STATE_FILE_PAPER2,
             STATE_FILE_PAPER3,
+            STATE_FILE_AUTOEXP,
+            STATE_FILE_AITRADER,
+            STATE_FILE_AITRADERLIVE,
         ];
         for (i, a) in files.iter().enumerate() {
             for b in &files[i + 1..] {
@@ -22459,6 +22823,60 @@ mod gate_tests {
         // Not enough candles = no verdict (the trend read itself is also not
         // warm at this point).
         assert!(sideways_read(&trend[..20]).is_none());
+    }
+
+    #[test]
+    fn entry_trend_read_passes_only_a_genuine_directional_move() {
+        let candle = |i: usize, open: f64, close: f64, hi: f64, lo: f64| Candle {
+            time: i as i64 * 60,
+            open,
+            high: hi,
+            low: lo,
+            close,
+            volume: 1_000.0,
+        };
+        let s = Settings::default();
+        let conf = entry_trend_conf_inds(&s, StratCat::Index);
+
+        // Steady rising series: a clear bullish read (dir +1). A CE leg may enter
+        // and a PE leg must be blocked by the opposite-side comparison.
+        let bull: Vec<Candle> = (0..80)
+            .map(|i| {
+                let base = 100.0 + i as f64 * 0.6;
+                candle(i, base - 0.3, base + 0.3, base + 0.5, base - 0.5)
+            })
+            .collect();
+        let rb = entry_trend_read(&bull, &conf, &s);
+        assert!(rb.ok, "bullish trend not resolved: {rb:?}");
+        assert_eq!(rb.dir, 1, "bullish trend read wrong dir: {rb:?}");
+
+        // Steady falling series: a clear bearish read (dir -1).
+        let bear: Vec<Candle> = (0..80)
+            .map(|i| {
+                let base = 200.0 - i as f64 * 0.6;
+                candle(i, base + 0.3, base - 0.3, base + 0.5, base - 0.5)
+            })
+            .collect();
+        let rr = entry_trend_read(&bear, &conf, &s);
+        assert!(rr.ok, "bearish trend not resolved: {rr:?}");
+        assert_eq!(rr.dir, -1, "bearish trend read wrong dir: {rr:?}");
+
+        // Oscillation around a fixed mean: the range veto blocks BOTH sides, so
+        // `ok` must be false and no direction is resolved.
+        let range: Vec<Candle> = (0..80)
+            .map(|i| {
+                let prev = 100.0 + ((i as f64 - 1.0) * 0.9).sin();
+                let base = 100.0 + (i as f64 * 0.9).sin();
+                candle(i, prev, base, prev.max(base) + 0.6, prev.min(base) - 0.6)
+            })
+            .collect();
+        let rg = entry_trend_read(&range, &conf, &s);
+        assert!(!rg.ok, "sideways tape wrongly resolved: {rg:?}");
+        assert_eq!(rg.dir, 0, "sideways tape resolved a dir: {rg:?}");
+
+        // Too few candles fails closed.
+        let short = entry_trend_read(&bull[..20], &conf, &s);
+        assert!(!short.ok && short.dir == 0);
     }
 
     #[test]

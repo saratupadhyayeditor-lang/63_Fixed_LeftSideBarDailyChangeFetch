@@ -1,4 +1,4 @@
-import { mountSharedMargin } from "./sharedmargin.js?v=7";
+import { mountSharedMargin } from "./sharedmargin.js?v=8";
 
 const MODE = new URLSearchParams(location.search).get("mode") === "live" ? "live" : "paper";
 const API = "/api/equity/engines";

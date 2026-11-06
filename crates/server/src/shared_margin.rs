@@ -23,18 +23,21 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 /// Paper-family engine tabs, sharing one pool.
-pub const PAPER_ENGINES: [&str; 4] = ["paper", "paper2", "paper3", "equitypaper"];
+pub const PAPER_ENGINES: [&str; 6] = ["paper", "paper2", "paper3", "autoexp", "aitrader", "equitypaper"];
 /// Real/Dhan-family engine tabs, sharing one pool.
-pub const REALTIME_ENGINES: [&str; 4] = ["realtime", "realtime2", "realtime3", "equitylive"];
+pub const REALTIME_ENGINES: [&str; 5] = ["realtime", "realtime2", "realtime3", "aitraderlive", "equitylive"];
 
 /// Every engine tab that participates in a shared pool.
-pub const ENGINE_IDS: [&str; 8] = [
+pub const ENGINE_IDS: [&str; 11] = [
     "realtime",
     "realtime2",
     "realtime3",
     "paper",
     "paper2",
     "paper3",
+    "autoexp",
+    "aitrader",
+    "aitraderlive",
     "equitypaper",
     "equitylive",
 ];
@@ -301,14 +304,29 @@ fn seed_paper_defaults(s: &mut SharedMargin) {
     if s.paper_total <= 0.0 {
         s.paper_total = DEFAULT_PAPER_TOTAL;
     }
-    let share = 100.0 / PAPER_ENGINES.len() as f64;
+    // How much of the pool the operator (or a previous seed) has ALREADY
+    // promised, as a fraction of the total. A tab counts as "seeded" only when
+    // it is enabled AND its promise is positive.
+    let mut promised_frac = 0.0;
+    let mut need: Vec<&str> = Vec::new();
     for id in PAPER_ENGINES {
-        let needs_allotment = s
-            .engines
-            .get(id)
-            .map(|a| !a.enabled || promised_rupees(s.paper_total, a) <= 0.0)
-            .unwrap_or(true);
-        if needs_allotment {
+        match s.engines.get(id) {
+            Some(a) if a.enabled && promised_rupees(s.paper_total, a) > 0.0 => {
+                promised_frac += promised_rupees(s.paper_total, a) / s.paper_total;
+            }
+            _ => need.push(id),
+        }
+    }
+    // Split whatever is LEFT of the pool equally across the tabs that still need
+    // an allotment. Dividing the FULL pool by the tab count instead would
+    // over-commit whenever an operator already set a manual rupee amount on one
+    // tab - `fit_family_to_pool` would then shrink that manual amount, silently
+    // changing a value the operator chose. Seeding only the remainder keeps every
+    // operator-set allotment exactly as entered.
+    if !need.is_empty() {
+        let remaining_frac = (1.0 - promised_frac).max(0.0);
+        let share = 100.0 * remaining_frac / need.len() as f64;
+        for id in need {
             s.engines.insert(
                 id.to_string(),
                 Allot { enabled: true, mode: "pct".into(), pct: share, amount: 0.0 },
@@ -321,13 +339,16 @@ fn seed_paper_defaults(s: &mut SharedMargin) {
 /// Engine id -> the durable state file that used to hold its manual margin.
 /// Only read ONCE (guarded by `legacy_migrated`) so a later edit is never
 /// overwritten.
-const LEGACY_FILES: [(&str, &str); 8] = [
+const LEGACY_FILES: [(&str, &str); 11] = [
     ("realtime", "algodhan_realtime_state.json"),
     ("realtime2", "algodhan_realtime2_state.json"),
     ("realtime3", "algodhan_realtime3_state.json"),
     ("paper", "algodhan_paper_state.json"),
     ("paper2", "algodhan_paper2_state.json"),
     ("paper3", "algodhan_paper3_state.json"),
+    ("autoexp", "algodhan_autoexp_state.json"),
+    ("aitrader", "algodhan_aitrader_state.json"),
+    ("aitraderlive", "algodhan_aitraderlive_state.json"),
     ("equitylive", "equity_live_engine.json"),
     ("equitypaper", "equity_paper_engine.json"),
 ];
@@ -730,10 +751,13 @@ mod tests {
         assert_eq!(group_of("paper"), "paper");
         assert_eq!(group_of("paper2"), "paper");
         assert_eq!(group_of("paper3"), "paper");
+        assert_eq!(group_of("autoexp"), "paper");
+        assert_eq!(group_of("aitrader"), "paper");
         assert_eq!(group_of("equitypaper"), "paper");
         assert_eq!(group_of("realtime"), "realtime");
         assert_eq!(group_of("realtime2"), "realtime");
         assert_eq!(group_of("realtime3"), "realtime");
+        assert_eq!(group_of("aitraderlive"), "realtime");
         assert_eq!(group_of("equitylive"), "realtime");
     }
 

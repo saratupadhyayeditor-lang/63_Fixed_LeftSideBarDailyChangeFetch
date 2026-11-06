@@ -19,6 +19,7 @@ use tower_http::set_header::SetResponseHeaderLayer;
 use algo_core::model::TIMEFRAMES;
 
 mod adapters;
+mod autoexp;
 mod backup;
 mod brain;
 mod broker;
@@ -187,6 +188,29 @@ async fn health() -> impl IntoResponse {
     Json(json!({ "ok": true }))
 }
 
+async fn autoexp_status() -> impl IntoResponse {
+    Json(autoexp::status_json())
+}
+
+async fn autoexp_start(
+    State(st): State<DhanState>,
+    Json(v): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    Json(autoexp::start(st, &v))
+}
+
+async fn autoexp_stop() -> impl IntoResponse {
+    Json(autoexp::stop())
+}
+
+async fn autoexp_clear() -> impl IntoResponse {
+    Json(autoexp::clear())
+}
+
+async fn autoexp_save(Json(v): Json<serde_json::Value>) -> impl IntoResponse {
+    Json(autoexp::save(&v))
+}
+
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt().with_target(false).init();
@@ -222,12 +246,17 @@ async fn main() {
     equity_engine::spawn_engine(dhan.clone());
     scrip::spawn_warm();
     let template_pool = shared_template_pool();
+    autoexp::init(template_pool.clone());
+    autoexp::boot();
     let rt = RealtimeState::new(dhan.clone()).with_template_pool(template_pool.clone());
     let realtime2_rt = RealtimeState::new_realtime2(dhan.clone()).with_template_pool(template_pool.clone());
     let realtime3_rt = RealtimeState::new_realtime3(dhan.clone()).with_template_pool(template_pool.clone());
     let paper_rt = RealtimeState::new_paper(dhan.clone()).with_template_pool(template_pool.clone());
     let paper2_rt = RealtimeState::new_paper2(dhan.clone()).with_template_pool(template_pool.clone());
-    let paper3_rt = RealtimeState::new_paper3(dhan.clone()).with_template_pool(template_pool);
+    let paper3_rt = RealtimeState::new_paper3(dhan.clone()).with_template_pool(template_pool.clone());
+    let autoexp_rt = RealtimeState::new_autoexp(dhan.clone()).with_template_pool(template_pool.clone());
+    let aitrader_rt = RealtimeState::new_aitrader(dhan.clone()).with_template_pool(template_pool.clone());
+    let aitraderlive_rt = RealtimeState::new_aitraderlive(dhan.clone()).with_template_pool(template_pool.clone());
     // Startup self-check + the auto-capture driver. Both only READ state and
     // write local files, so they can never interfere with trading. The capture
     // task is what makes a bug on an installed Windows machine debuggable: the
@@ -250,6 +279,11 @@ async fn main() {
 
     let app = Router::new()
         .route("/api/health", get(health))
+        .route("/api/experiment/status", get(autoexp_status))
+        .route("/api/experiment/start", post(autoexp_start))
+        .route("/api/experiment/stop", post(autoexp_stop))
+        .route("/api/experiment/clear", post(autoexp_clear))
+        .route("/api/experiment/save", post(autoexp_save))
         .route("/api/indicators", get(indicators))
         .route("/api/timeframes", get(timeframes))
         .route("/api/candles", get(candles_get).post(candles_post))
@@ -319,6 +353,9 @@ async fn main() {
         .merge(realtime::paper_router().with_state(paper_rt))
         .merge(realtime::paper2_router().with_state(paper2_rt))
         .merge(realtime::paper3_router().with_state(paper3_rt))
+        .merge(realtime::autoexp_router().with_state(autoexp_rt))
+        .merge(realtime::aitrader_router().with_state(aitrader_rt))
+        .merge(realtime::aitraderlive_router().with_state(aitraderlive_rt))
         .fallback_service(
             ServeDir::new(static_dir)
                 .precompressed_gzip()

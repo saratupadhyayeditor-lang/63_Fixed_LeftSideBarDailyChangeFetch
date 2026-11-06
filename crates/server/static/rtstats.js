@@ -84,6 +84,7 @@ function fmtDT(ms) {
 function engineFriendly(k) {
   if (k === "papertrade") return "AI Smart (base)";
   if (k === "realtime") return "Realtime";
+  if (k === "autoexp") return "Auto Experiment";
   return k || "?";
 }
 

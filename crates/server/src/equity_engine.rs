@@ -234,8 +234,14 @@ fn ist_weekday_minutes(now: i64) -> Option<i64> {
 
 /// Should the daily square-off fire right now? It is due once per IST day,
 /// after the configured clock time, and only while the NSE session is open so
-/// the broker will actually accept the sell orders. Kept pure for tests.
-fn daily_exit_due(now: i64, time: &str, last_day: i64, session_open: bool) -> bool {
+/// the broker will actually accept the sell orders. The `enabled` switch is the
+/// operator's "Daily square-off all positions" checkbox: when it is OFF the
+/// schedule must never fire, no matter what time/day the engine is ticking.
+/// Kept pure for tests.
+fn daily_exit_due(now: i64, enabled: bool, time: &str, last_day: i64, session_open: bool) -> bool {
+    if !enabled {
+        return false;
+    }
     if !session_open {
         return false;
     }
@@ -1379,6 +1385,7 @@ async fn run_cycle_inner(st: &DhanState, mode: &str) {
     // on the next 45-second tick instead of being silently skipped.
     let daily_due = daily_exit_due(
         now_secs(),
+        settings.daily_exit_on,
         &settings.daily_exit_time,
         settings.daily_exit_day,
         matches!(ist_weekday_minutes(now_secs()), Some(m) if (9 * 60 + 15..=15 * 60 + 30).contains(&m)),
@@ -1753,21 +1760,34 @@ mod tests {
         // Mon 2026-11-02, IST midnight, as epoch seconds.
         let at = |h: i64, m: i64| 1_793_557_800i64 + h * 3_600 + m * 60;
         // Before the clock: not due.
-        assert!(!daily_exit_due(at(15, 19), "15:20", 0, true));
+        assert!(!daily_exit_due(at(15, 19), true, "15:20", 0, true));
         // At/after the clock, first time today: due.
-        assert!(daily_exit_due(at(15, 20), "15:20", 0, true));
-        assert!(daily_exit_due(at(15, 29), "15:20", 0, true));
+        assert!(daily_exit_due(at(15, 20), true, "15:20", 0, true));
+        assert!(daily_exit_due(at(15, 29), true, "15:20", 0, true));
         // Already ran today: never twice.
         let ran = today_ist_at(at(15, 20));
-        assert!(!daily_exit_due(at(15, 25), "15:20", ran, true));
+        assert!(!daily_exit_due(at(15, 25), true, "15:20", ran, true));
         // Next day at the same clock: due again.
-        assert!(daily_exit_due(at(24, 0) + 15 * 3_600 + 20 * 60, "15:20", ran, true));
+        assert!(daily_exit_due(at(24, 0) + 15 * 3_600 + 20 * 60, true, "15:20", ran, true));
         // Market shut: nothing is sold.
-        assert!(!daily_exit_due(at(15, 20), "15:20", 0, false));
+        assert!(!daily_exit_due(at(15, 20), true, "15:20", 0, false));
         // Weekend never fires.
-        assert!(!daily_exit_due(at(15, 20) + 5 * 86_400, "15:20", 0, true));
+        assert!(!daily_exit_due(at(15, 20) + 5 * 86_400, true, "15:20", 0, true));
         // Bad clock string never arms.
-        assert!(!daily_exit_due(at(15, 20), "abc", 0, true));
+        assert!(!daily_exit_due(at(15, 20), true, "abc", 0, true));
+    }
+
+    #[test]
+    fn daily_square_off_never_fires_when_the_switch_is_off() {
+        // The operator's "Daily square-off all positions" checkbox is the only
+        // arming switch. An UNCHECKED box must leave every open position alone -
+        // no matter the clock, the day mark, or whether the session is open.
+        let at = |h: i64, m: i64| 1_793_557_800i64 + h * 3_600 + m * 60;
+        assert!(!daily_exit_due(at(15, 20), false, "15:20", 0, true));
+        assert!(!daily_exit_due(at(15, 29), false, "15:20", 0, true));
+        assert!(!daily_exit_due(at(24, 0) + 15 * 3_600 + 20 * 60, false, "15:20", 0, true));
+        // Off must stay off even when it never ran today.
+        assert!(!daily_exit_due(at(15, 25), false, "15:20", today_ist_at(at(15, 20)), true));
     }
 
     #[test]

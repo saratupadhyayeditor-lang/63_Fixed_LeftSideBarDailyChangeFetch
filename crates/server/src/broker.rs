@@ -1307,6 +1307,59 @@ impl DhanState {
         }
     }
 
+    /// Long multi-year daily history for the Auto Experiment backtester.
+    ///
+    /// Unlike the chart path this deliberately asks Dhan for a wide window
+    /// (`years` back) in a single `/charts/historical` call, so a strategy can
+    /// be simulated over ~3 years of daily bars. Timestamps are shifted to the
+    /// IST wall clock the rest of the app uses and rows are sorted oldest->
+    /// newest. Returns an error when the session is not connected or Dhan
+    /// rejects the request - the caller reports that to the operator.
+    pub async fn fetch_daily_history(
+        &self,
+        sec_id: i64,
+        exch: &str,
+        inst: &str,
+        years: i64,
+    ) -> Result<Vec<Candle>, String> {
+        let client = self
+            .client()
+            .await
+            .ok_or_else(|| "Dhan session not connected".to_string())?;
+        let segment = exchange_segment(exch)
+            .ok_or_else(|| format!("unknown exchange segment: {exch}"))?;
+        let instrument = instrument_type(inst);
+        let years = years.clamp(1, 8);
+        let ist_now = now_secs() + 19800;
+        // Dhan caps a daily request at ~5 years; a couple of days of slack on
+        // each side keeps a full `years` worth of sessions.
+        let span_days = years * 366 + 3;
+        self.hist_throttle().await;
+        let req = HistoricalRequest {
+            security_id: sec_id.to_string(),
+            exchange_segment: segment,
+            instrument,
+            expiry_code: 0,
+            oi: false,
+            from_date: fmt_date(ist_now - span_days * 86400),
+            to_date: fmt_date(ist_now),
+        };
+        match client.historical(&req).await {
+            Ok(d) => {
+                let mut rows = d.rows();
+                if rows.is_empty() {
+                    return Err("Dhan returned no daily candles".into());
+                }
+                for r in &mut rows {
+                    r.time += 19800;
+                }
+                rows.sort_by_key(|r| r.time);
+                Ok(to_candles(rows))
+            }
+            Err(e) => Err(format!("daily historical failed: {e}")),
+        }
+    }
+
     /// Raw daily candles (no IST shift - the caller shifts) from Dhan's
     /// `/charts/historical`, with a resample fallback. Dhan's daily endpoint
     /// answers DH-905 for several instruments (INDIA VIX, GIFT NIFTY, SENSEX) and
