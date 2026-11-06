@@ -333,13 +333,14 @@ fn option_seg(exch: &str) -> &'static str {
 async fn register_chain(
     st: &DhanState,
     rows: &[bs::ChainRow],
-    exch: &str,
+    under_exch: &str,
+    opt_seg: &str,
     under: i64,
     expiry: &str,
     spot: f64,
     lot: f64,
 ) {
-    let seg = option_seg(exch);
+    let seg = opt_seg;
     let mut secs: Vec<(i64, String)> = Vec::with_capacity(rows.len() * 2);
     for r in rows {
         if r.ce.sid != 0 {
@@ -361,7 +362,7 @@ async fn register_chain(
     // Dhan rate-limit cooldown so it cannot deepen the limit.
     if !cooldown_active() {
         let seed_st = st.clone();
-        let under_exch = exch.to_string();
+        let under_exch = under_exch.to_string();
         tokio::spawn(async move {
             seed_st.seed_chain_quotes(secs, under, &under_exch).await;
         });
@@ -614,7 +615,7 @@ pub fn chain_expiries(security_id: i64, exch: &str, name: &str) -> Vec<String> {
         return Vec::new();
     };
     let prefix = scrip::fno_underlying(name);
-    let e = scrip::scrip_exch(exch);
+    let e = sc.fno_exch(exch, &prefix);
     let today = (market::now_secs() + 19800) / 86400;
     sc.expiries_for(&prefix, e)
         .unwrap_or_default()
@@ -702,7 +703,7 @@ pub async fn expiries(State(st): State<DhanState>, Json(req): Json<OcReq>) -> im
     // `_scrip_expiries` on a cold cache and never blocks the dropdown).
     if let Some(sc) = scrip::get() {
         let prefix = scrip::fno_underlying(&name);
-        let exch = scrip::scrip_exch(&req.exchange_segment);
+        let exch = sc.fno_exch(&req.exchange_segment, &prefix);
         if let Some(list) = sc.expiries_for(&prefix, exch) {
             let today = (market::now_secs() + 19800) / 86400;
             let list: Vec<String> = list
@@ -899,7 +900,7 @@ pub async fn option_chain(
     // expiry ladder and contract lookup still use REST.
     if let Some(sc) = scrip::get() {
         let prefix = scrip::fno_underlying(&name);
-        let exch = scrip::scrip_exch(&req.exchange_segment);
+        let exch = sc.fno_exch(&req.exchange_segment, &prefix);
         let spot_in = known_spot(&st, req.security_id, &req.exchange_segment, req.spot);
         if let Some((rows, spot)) = scrip_partial_chain(
             &sc,
@@ -907,13 +908,14 @@ pub async fn option_chain(
             exch,
             &req.expiry,
             spot_in,
-            option_seg(&req.exchange_segment),
+            option_seg(exch),
             &st.market,
         ) {
             register_chain(
                 &st,
                 &rows,
                 &req.exchange_segment,
+                option_seg(exch),
                 req.security_id,
                 &req.expiry,
                 spot,
@@ -984,7 +986,7 @@ pub async fn manual_strike_chain(
             .into_response();
     };
     let prefix = scrip::fno_underlying(&name);
-    let exch = scrip::scrip_exch(&req.exchange_segment);
+    let exch = sc.fno_exch(&req.exchange_segment, &prefix);
     let expiries: Vec<String> = sc.expiries_for(&prefix, exch).unwrap_or_default();
     // Honour an explicit, still-listed expiry; otherwise take the nearest one.
     let expiry = if !req.expiry.trim().is_empty() && expiries.iter().any(|e| e == req.expiry.trim()) {
@@ -1020,7 +1022,7 @@ pub async fn manual_strike_chain(
     let w = if req.window <= 0 { 30 } else { req.window.clamp(1, 60) } as usize;
     let lo = atm.saturating_sub(w);
     let hi = (atm + w + 1).min(strikes.len());
-    let seg = option_seg(&req.exchange_segment);
+    let seg = option_seg(exch);
     let mut rows: Vec<bs::ChainRow> = Vec::with_capacity(hi - lo);
     for sk in &strikes[lo..hi] {
         let Some(ent) = bucket.get(sk) else { continue };
@@ -1039,7 +1041,7 @@ pub async fn manual_strike_chain(
         });
     }
     // Arm the live feed + seed previous close / LTP / OI for the whole window.
-    register_chain(&st, &rows, &req.exchange_segment, req.security_id, &expiry, spot, lot).await;
+    register_chain(&st, &rows, &req.exchange_segment, seg, req.security_id, &expiry, spot, lot).await;
     let data: Vec<Value> = rows.iter().map(|r| r.to_json()).collect();
     Json(json!({
         "status": "success",
@@ -1068,7 +1070,7 @@ pub async fn option_chain_all(
     }
     let scrip_ctx = scrip::get().map(|sc| {
         let prefix = scrip::fno_underlying(&name);
-        let exch = scrip::scrip_exch(&req.exchange_segment).to_string();
+        let exch = sc.fno_exch(&req.exchange_segment, &prefix).to_string();
         (sc, prefix, exch)
     });
     let expiries = match scrip_ctx.as_ref().and_then(|(sc, prefix, exch)| {
@@ -1106,13 +1108,14 @@ pub async fn option_chain_all(
                 exch,
                 expiry,
                 spot_in,
-                option_seg(&req.exchange_segment),
+                option_seg(exch),
                 &st.market,
             ) {
                 register_chain(
                     &st,
                     &rows,
                     &req.exchange_segment,
+                    option_seg(exch),
                     req.security_id,
                     expiry,
                     spot,
@@ -1330,11 +1333,18 @@ pub async fn option_security(
             &req.option_type,
             &req.exchange_segment,
         ) {
+            // The option contract trades on its F&O exchange, not on the cash
+            // index segment the operator passed in (`IDX_I`). Echoing `IDX_I`
+            // hands the caller a segment Dhan refuses for an OPTIDX order, so
+            // return the segment the bucket actually resolved on (SENSEX/BANKEX
+            // -> BSE_FNO, NIFTY etc -> NSE_FNO, commodities -> MCX_COMM).
+            let prefix = scrip::fno_underlying(&req.symbol_name);
+            let fno_seg = option_seg(sc.fno_exch(&req.exchange_segment, &prefix));
             return Json(json!({
                 "status": "success",
                 "data": {
                     "security_id": r.security_id,
-                    "exchange_segment": req.exchange_segment,
+                    "exchange_segment": fno_seg,
                     "instrument_type": inst,
                     "trading_symbol": r.trading_symbol,
                     "lot_size": r.lot,
@@ -1432,4 +1442,33 @@ pub async fn lot_sizes() -> impl IntoResponse {
 #[allow(dead_code)]
 pub fn rows_to_oi(rows: &[bs::ChainRow]) -> Vec<OiRecord> {
     rows.iter().map(|r| r.oi_record()).collect()
+}
+
+#[cfg(test)]
+mod chain_segment_tests {
+    use super::*;
+
+    /// Regression: the strike/seed segment must follow the exchange that
+    /// actually lists the options, not the underlying's cash segment.
+    ///
+    /// `option_seg` only sees the request's `IDX_I` and maps it to `NSE_FNO`.
+    /// SENSEX/BANKEX options are BSE-only, so seeding/subscribing them under
+    /// NSE_FNO returned nothing: no prev-close, `change` stayed 0, and the
+    /// +green / onlyPositive filter then blocked every strike ("no CE option
+    /// premium"). The chain code must compose `fno_exch` BEFORE `option_seg`.
+    #[test]
+    fn strike_segment_uses_resolved_listing_exchange() {
+        // The request only carries the UNDERLYING cash segment. Mapping that
+        // directly would put SENSEX strikes on NSE_FNO (empty for BSE-only
+        // derivatives), zero their prev-close and trip the +green filter.
+        assert_eq!(option_seg("IDX_I"), "NSE_FNO");
+        // The chain resolves the listing exchange first (`fno_exch`) and maps
+        // THAT, so BSE-only index derivatives seed on BSE_FNO.
+        assert_eq!(option_seg("BSE"), "BSE_FNO");
+        assert_eq!(option_seg("NSE"), "NSE_FNO");
+        assert_eq!(option_seg("MCX"), "MCX_COMM");
+        // Already-explicit F&O segments must be idempotent.
+        assert_eq!(option_seg("BSE_FNO"), "BSE_FNO");
+        assert_eq!(option_seg("NSE_FNO"), "NSE_FNO");
+    }
 }

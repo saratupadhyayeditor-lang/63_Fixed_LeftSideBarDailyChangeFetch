@@ -260,6 +260,42 @@ pub fn fno_underlying(symbol_name: &str) -> String {
 }
 
 impl Scrip {
+    /// Exchange whose scrip-master option ladder actually holds `prefix`,
+    /// starting from the segment's default exchange. A cash index (`IDX_I`) maps
+    /// to NSE by default, but BSE-only index derivatives (SENSEX, BANKEX, ...)
+    /// list their options exclusively on BSE. Binding such a lookup to NSE finds
+    /// no bucket and silently resolves no option ("no PE option premium"), so
+    /// re-home the prefix onto the exchange that demonstrably lists it. Explicit
+    /// derivative segments (BSE_FNO / MCX_COMM / NCD_FNO) always win.
+    pub fn fno_exch(&self, segment: &str, prefix: &str) -> &'static str {
+        let base = scrip_exch(segment);
+        let seg = segment.to_uppercase();
+        if seg.contains("BSE") || seg.contains("MCX") || seg.contains("NCDEX") {
+            return base;
+        }
+        let p = prefix.to_uppercase();
+        if p.is_empty() {
+            return base;
+        }
+        // Direct ladder lookups (O(1)) instead of `has_options`' full key scan:
+        // this runs inside the 100 ms scan loop, once per strategy per tick.
+        let lists_options = |x: &str| {
+            self.expiries
+                .get(&(x.to_string(), p.clone()))
+                .map(|v| !v.is_empty())
+                .unwrap_or(false)
+        };
+        if lists_options(base) {
+            return base;
+        }
+        for cand in ["NSE", "BSE", "MCX", "NCDEX"] {
+            if cand != base && lists_options(cand) {
+                return cand;
+            }
+        }
+        base
+    }
+
     pub fn bucket(&self, exch: &str, prefix: &str, expiry: &str) -> Option<&BTreeMap<i64, StrikeEntry>> {
         let key = (
             exch.to_uppercase(),
@@ -438,7 +474,7 @@ impl Scrip {
             return None;
         }
         let exp = normalize_expiry(expiry);
-        let exch = scrip_exch(segment);
+        let exch = self.fno_exch(segment, &prefix);
 
         if let Some((sid, sym, lot)) = self.leg_of(exch, &prefix, &exp, strike, &ot) {
             return Some(Resolved { security_id: sid, lot, trading_symbol: sym, expiry: exp });
@@ -1322,6 +1358,60 @@ mod stock_expiry_day_tests {
             vec!["2026-10-27".to_string()],
             "commodity OPTFUT must not appear in the stock expiry ladder"
         );
+        let _ = std::fs::remove_file(&path);
+    }
+}
+
+#[cfg(test)]
+mod fno_exch_tests {
+    use super::*;
+    use std::io::Write;
+
+    const HEADER: &str = "SEM_EXM_EXCH_ID,SEM_SEGMENT,SEM_SMST_SECURITY_ID,SEM_INSTRUMENT_NAME,SEM_EXPIRY_CODE,SEM_TRADING_SYMBOL,SEM_LOT_UNITS,SEM_CUSTOM_SYMBOL,SEM_EXPIRY_DATE,SEM_STRIKE_PRICE,SEM_OPTION_TYPE";
+
+    fn write_master(tag: &str) -> std::path::PathBuf {
+        let path = std::env::temp_dir().join(format!("scrip_fnoexch_{tag}_{}.csv", std::process::id()));
+        {
+            let mut f = std::fs::File::create(&path).unwrap();
+            writeln!(f, "{HEADER}").unwrap();
+            // SENSEX options live ONLY on BSE (real master: 4230 BSE OPTIDX rows).
+            writeln!(f, "BSE,D,910001,OPTIDX,0,SENSEX-Nov2026-80000-CE,20.0,SENSEX 80000 CALL,2026-11-12 15:30:00,80000.00000,CE").unwrap();
+            writeln!(f, "BSE,D,910002,OPTIDX,0,SENSEX-Nov2026-80000-PE,20.0,SENSEX 80000 PUT,2026-11-12 15:30:00,80000.00000,PE").unwrap();
+            // NIFTY options live ONLY on NSE.
+            writeln!(f, "NSE,D,910003,OPTIDX,0,NIFTY-Nov2026-24500-CE,75.0,NIFTY 24500 CALL,2026-11-12 15:30:00,24500.00000,CE").unwrap();
+            writeln!(f, "NSE,D,910004,OPTIDX,0,NIFTY-Nov2026-24500-PE,75.0,NIFTY 24500 PUT,2026-11-12 15:30:00,24500.00000,PE").unwrap();
+            // MCX commodity options stay on MCX.
+            writeln!(f, "MCX,M,910005,OPTFUT,0,CRUDEOIL-Nov2026-5000-CE,100.0,CRUDEOIL 5000 CALL,2026-11-19 23:30:00,5000.00000,CE").unwrap();
+        }
+        path
+    }
+
+    #[test]
+    fn sensx_idx_i_rehomes_to_bse_but_nifty_stays_nse() {
+        let path = write_master("rehome");
+        let sc = parse_file(&path).expect("scrip parses");
+        assert_eq!(sc.fno_exch("IDX_I", "SENSEX"), "BSE", "SENSEX options are BSE-only");
+        assert_eq!(sc.fno_exch("IDX_I", "NIFTY"), "NSE");
+        assert_eq!(sc.fno_exch("IDX_I", "BANKNIFTY"), "NSE", "unknown prefix keeps default");
+        assert_eq!(sc.fno_exch("MCX_COMM", "CRUDEOIL"), "MCX");
+        assert_eq!(sc.fno_exch("BSE_FNO", "SENSEX"), "BSE", "explicit segment wins");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn sensx_option_resolves_on_bse_through_idx_i_segment() {
+        let path = write_master("resolve");
+        let sc = parse_file(&path).expect("scrip parses");
+        let r = sc
+            .resolve("SENSEX", "2026-11-12", 80000.0, "PE", "IDX_I")
+            .expect("SENSEX PE must resolve even though the spot segment is IDX_I");
+        assert_eq!(r.security_id, 910002);
+        assert_eq!(r.expiry, "2026-11-12");
+        // And a NIFTY option under the same IDX_I segment resolves on NSE.
+        let n = sc
+            .resolve("NIFTY 50", "2026-11-12", 24500.0, "CE", "IDX_I")
+            .expect("NIFTY CE must resolve on NSE");
+        assert_eq!(n.security_id, 910003);
         let _ = std::fs::remove_file(&path);
     }
 }

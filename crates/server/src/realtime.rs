@@ -883,6 +883,18 @@ pub struct Settings {
     /// position on every scan cycle (no wait for a reset). Unlimited concurrent
     /// positions; the orders/sec cap still bounds the fill rate.
     pub multi_always_on: bool,
+    /// "One side per underlying": an underlying may hold positions on only ONE
+    /// direction at a time. When a new entry would open the OPPOSITE side of a
+    /// direction already running on the same underlying, the new entry is simply
+    /// BLOCKED until the running side exits on its own plan (target / stop /
+    /// regime flip). The running position is never force-closed - doing so booked
+    /// a `SIDE_FLIP` loss on every wobble and churned on the next flip. Without
+    /// this guard the bullish CE leg and the bearish PE leg are separate
+    /// strategies with separate one-position guards, so a trend flip opened the
+    /// opposite leg while the old one was still live and the two cancelled each
+    /// other's profit. Same-side entries (additional strikes / stacking) are
+    /// unaffected. Default ON.
+    pub one_side_per_underlying: bool,
     /// "Repeat-entry latch" (one signal = one entry). After an entry has been
     /// placed for a strategy, a further entry on that strategy is blocked until
     /// its entry gate has been continuously OFF for `entry_latch_secs`, then
@@ -1221,6 +1233,7 @@ impl Default for Settings {
             flip_trigger_pct: 50.0,
             multi_fresh_on: true,
             multi_always_on: false,
+            one_side_per_underlying: true,
             entry_latch_on: true,
             entry_latch_secs: 60.0,
             entry_cooldown_on: true,
@@ -4434,6 +4447,72 @@ impl RealtimeState {
         guard && !settings.multi_always_on && !settings.multi_fresh_on && self.contract_running(security_id)
     }
 
+    /// Open positions whose exposure sits on the OPPOSITE direction of `dir` for
+    /// the canonical `underlying`. `dir` is +1 for a bullish exposure (a long
+    /// call / long future) and -1 for a bearish one (a long put / short future),
+    /// as computed by [`option_exposure_dir`]. Returns `(position id, side)` for
+    /// every conflicting row so the caller can close exactly those.
+    ///
+    /// This is the "one side per underlying" guard. The bullish CE leg and the
+    /// bearish PE leg are two separate synthetic strategies, so the legacy
+    /// one-position-per-strategy rule never saw them as a pair: a trend flip
+    /// opened the opposite leg while the old one was still live and the two legs
+    /// cancelled each other's profit. Underlying (not contract) granularity is
+    /// what makes the pair visible.
+    fn opposite_side_positions(&self, underlying: &str, dir: i32) -> Vec<(String, String)> {
+        if underlying.trim().is_empty() || dir == 0 {
+            return Vec::new();
+        }
+        let want = underlying.trim().to_uppercase();
+        self.doc()
+            .map(|d| {
+                d.positions
+                    .iter()
+                    .filter(|p| {
+                        js(p, "underlying").trim().to_uppercase() == want
+                            && option_exposure_dir(&js(p, "side"), &js(p, "tradingSymbol")) != dir
+                    })
+                    .map(|p| (js(p, "id"), js(p, "side")))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Enforce "one side per underlying" for a pending entry on `leg`. When the
+    /// guard is off or the leg has no opposite-side conflict it returns
+    /// `Ok(None)`. On a conflict it leaves the running position completely
+    /// untouched and returns `Ok(Some(reason))` so the caller blocks THIS entry.
+    ///
+    /// It deliberately does NOT close the opposite leg: force-closing it booked a
+    /// `SIDE_FLIP` loss every time a trend wobbled, then re-opened the new side
+    /// and churned again on the next flip - the exact self-inflicted bleeding the
+    /// guard was supposed to stop. The running position must exit on its own plan
+    /// (target / stop / regime flip); the guard's only job is to refuse to add an
+    /// opposite exposure underneath it.
+    async fn enforce_one_side_per_underlying(
+        &self,
+        settings: &Settings,
+        leg: &Strategy,
+        entry_side: &str,
+    ) -> Result<Option<String>, String> {
+        if !settings.one_side_per_underlying {
+            return Ok(None);
+        }
+        let underlying = underlying_of(&leg.trading_symbol, &leg.exchange_segment);
+        let dir = option_exposure_dir(entry_side, &leg.trading_symbol);
+        let conflicts = self.opposite_side_positions(&underlying, dir);
+        if conflicts.is_empty() {
+            return Ok(None);
+        }
+        let sides: Vec<String> = conflicts.iter().map(|(_, s)| s.clone()).collect();
+        Ok(Some(format!(
+            "{} - {:?} already running on {underlying}; opposite {} entry blocked until it exits",
+            leg.name,
+            sides,
+            if dir > 0 { "bullish" } else { "bearish" }
+        )))
+    }
+
     /// Margin bar readout for the Running Trades section. Takes the already
     /// cloned settings/positions plus the caller-resolved available funds so a
     /// caller holding the doc lock never re-locks it (the paper wallet is derived
@@ -7087,7 +7166,7 @@ impl RealtimeState {
         if prefix.is_empty() {
             return None;
         }
-        let exch = scrip::scrip_exch(seg);
+        let exch = sc.fno_exch(seg, &prefix);
         sc.expiries_for(&prefix, exch)?.first().cloned()
     }
 
@@ -7253,9 +7332,9 @@ impl RealtimeState {
             return None;
         }
         let res = sc.resolve(&m.symbol_name, &m.expiry, m.strike, &ot, &m.exchange_segment)?;
-        let exch = scrip::scrip_exch(&m.exchange_segment);
-        let seg = fno_segment(exch).to_string();
         let prefix = scrip::fno_underlying(&m.symbol_name);
+        let exch = sc.fno_exch(&m.exchange_segment, &prefix);
+        let seg = fno_segment(exch).to_string();
         let inst = if scrip::is_index_prefix(&prefix) { "OPTIDX" } else { "OPTSTK" }.to_string();
         Some((res.security_id, res.trading_symbol, seg, inst))
     }
@@ -7409,7 +7488,30 @@ impl RealtimeState {
             // filters' own side / Top-Movers pin. With no fresh plan
             // (disconnected, cold or stale) `force` is used normally; confidence
             // never weakens a fresh plan's leg (it only gates auto-cut/exit).
-            let force = target_plan_side_for(settings, &name).or(force);
+            let plan_force = target_plan_side_for(settings, &name);
+            let force = plan_force.or(force);
+            // "Strike: Option Type" (Both CE & PE / Call / Put) RESTRICTS which
+            // legs the automatic universe may build on top of every scanner pin:
+            // "Call (CE)" arms only call legs and "Put (PE)" only put legs, while
+            // "Both" leaves the pin unchanged. A pin that points at the excluded
+            // side builds NOTHING (a bearish stock is never silently converted
+            // into a call). Strict Target Lab plans and manual-strike overrides
+            // own their leg and are never restricted.
+            let force = if plan_force.is_none() && !settings.manual_strikes_enabled {
+                match settings.option_side.to_ascii_uppercase().as_str() {
+                    // Bearish pin excluded outright; an unpinned underlying builds
+                    // only the call leg.
+                    "CE" if force == Some(false) => return,
+                    // Bullish pin excluded outright; an unpinned underlying builds
+                    // only the put leg.
+                    "PE" if force == Some(true) => return,
+                    "CE" => Some(true),
+                    "PE" => Some(false),
+                    _ => force,
+                }
+            } else {
+                force
+            };
             let lot = crate::scrip::get()
                 .and_then(|s| s.lot_for(&name, &seg).map(|(l, _)| l))
                 .unwrap_or(0.0);
@@ -7899,6 +8001,13 @@ impl RealtimeState {
             // chart (old app maps futures -> spot), never the option premium.
             let want_premium = run_mode != "spot" && run_mode != "futures";
             let mut eval: Vec<(Strategy, Vec<Candle>)> = Vec::new();
+            // Premium-only per-strike analysis: the individual selected strike
+            // charts are collected HERE (never into `eval`, which stays the
+            // strategy-level SPOT confirmation set). Each strike is then gated on
+            // its OWN premium chart below, so one failing strike can never veto
+            // (or force) the others - the whole "Execute Trade In" ladder is
+            // analysed strike by strike and only the passing strikes fire.
+            let mut premium_strikes: Vec<(Strategy, Vec<Candle>)> = Vec::new();
             if want_spot {
                 // "Run Strategy In: Spot chart" for an option-instrument strategy
                 // must analyse the UNDERLYING spot chart, not the option's own
@@ -7933,49 +8042,52 @@ impl RealtimeState {
                         );
                         continue;
                     }
-                } else if let Some(pair) = self.premium_candles(&strat, &settings).await {
-                    self.clear_no_premium(strat.security_id, &side);
-                    eval.push(pair);
                 } else {
-                    self.mark_no_premium(strat.security_id, &side);
-                    if run_mode == "premium" {
-                        self.note_blocker(
-                            "warn",
-                            "no-premium",
-                            &strat.name,
-                            &format!("{} - no {side} option contracts available (premium leg missing)", strat.name),
-                        );
-                        self.log_throttled(
-                            &format!("skip-premium:{}:{side}", strat.id),
-                            60_000,
-                            "warn",
-                            &format!(
-                                "No {side} option contracts for {} - skipping ({side} leg)",
-                                strat.name
-                            ),
-                        );
-                        continue;
-                    }
-                    if run_mode == "both" {
-                        self.note_blocker(
-                            "warn",
-                            "no-premium",
-                            &strat.name,
-                            &format!("{} - dual run needs spot + premium, {side} option leg missing", strat.name),
-                        );
-                        self.log_throttled(
-                            &format!("skip-both:{}:{side}", strat.id),
-                            60_000,
-                            "warn",
-                            &format!(
-                                "No {side} option contracts for {} - skipping (dual run needs spot + premium)",
-                                strat.name
-                            ),
-                        );
+                    let pairs = self.premium_candles_all(&strat, &settings).await;
+                    if pairs.is_empty() {
+                        self.mark_no_premium(strat.security_id, &side);
+                        if run_mode == "premium" {
+                            self.note_blocker(
+                                "warn",
+                                "no-premium",
+                                &strat.name,
+                                &format!("{} - no {side} option contracts available (premium leg missing)", strat.name),
+                            );
+                            self.log_throttled(
+                                &format!("skip-premium:{}:{side}", strat.id),
+                                60_000,
+                                "warn",
+                                &format!(
+                                    "No {side} option contracts for {} - skipping ({side} leg)",
+                                    strat.name
+                                ),
+                            );
+                            continue;
+                        }
+                        if run_mode == "both" {
+                            self.note_blocker(
+                                "warn",
+                                "no-premium",
+                                &strat.name,
+                                &format!("{} - dual run needs spot + premium, {side} option leg missing", strat.name),
+                            );
+                            self.log_throttled(
+                                &format!("skip-both:{}:{side}", strat.id),
+                                60_000,
+                                "warn",
+                                &format!(
+                                    "No {side} option contracts for {} - skipping (dual run needs spot + premium)",
+                                    strat.name
+                                ),
+                            );
+                        }
+                    } else {
+                        self.clear_no_premium(strat.security_id, &side);
+                        premium_strikes = pairs;
                     }
                 }
             }
-            if eval.is_empty() {
+            if eval.is_empty() && premium_strikes.is_empty() {
                 self.note_blocker(
                     "warn",
                     "no-premium",
@@ -7986,6 +8098,14 @@ impl RealtimeState {
             }
             let mut all_pass = true;
             let synth = strat.synthetic;
+            // When the strategy also runs on the spot chart (`both` mode), every
+            // spot leg must pass exactly as before (the `eval` loop below). In
+            // premium-only mode `eval` is empty and the per-strike premium ladder
+            // owns the gate.
+            // Strikes whose OWN premium chart passed the indicator gate. Only
+            // these are eligible to fire; a strike with no chart or a failing
+            // gate is skipped THIS scan (it keeps its place in the ladder).
+            let mut passing_strikes: Vec<Strategy> = Vec::new();
             let mut gate_settings = self.template_for_direction(&settings, &strat).unwrap_or_else(|| settings.clone());
             // The live "Premium chart only" switch AND the live run-in routing
             // (Indices / F&O stocks / Commodities) must win over a direction
@@ -8068,6 +8188,48 @@ impl RealtimeState {
                     }
                     all_pass = false;
                     break;
+                }
+            }
+            // Per-strike premium gate. Every selected strike is analysed on its
+            // OWN premium chart; the ones that pass become the fire set. This is
+            // the premium-only equivalent of the spot gate above: instead of one
+            // chart deciding for the whole ladder, each strike decides for itself.
+            if !premium_strikes.is_empty() {
+                for (s, c) in &premium_strikes {
+                    let _gate_scope = IndScope::enter();
+                    let flip_on = gate_settings.flip_trigger_on;
+                    let cond_ok = flip_on || synth || conditions_met(&s.conditions, c, offset);
+                    let fg = if flip_on {
+                        flip_trigger_pass(&gate_settings, s, c, offset)
+                    } else {
+                        filter_gate(&gate_settings, s, c, offset)
+                    };
+                    if cond_ok && fg {
+                        passing_strikes.push(s.clone());
+                        self.log_throttled(
+                            &format!("strike-pass:{}:{}", strat.id, s.security_id),
+                            30_000,
+                            "info",
+                            &format!("premium strike PASS {} -> {}", strat.name, s.trading_symbol),
+                        );
+                    } else {
+                        let gate_expl = filter_gate_explain(&gate_settings, s, c, offset);
+                        self.log_throttled(
+                            &format!("strike-fail:{}:{}", strat.id, s.security_id),
+                            60_000,
+                            "info",
+                            &format!("premium strike FAIL {} -> {}: cond={cond_ok} filter={fg} gate=[{gate_expl}]", strat.name, s.trading_symbol),
+                        );
+                    }
+                }
+                if passing_strikes.is_empty() {
+                    self.note_blocker(
+                        "info",
+                        "gate",
+                        &strat.name,
+                        &format!("{} - no selected strike passed the indicator filter on its own premium chart", strat.name),
+                    );
+                    all_pass = false;
                 }
             }
             if !all_pass {
@@ -8259,12 +8421,13 @@ impl RealtimeState {
                 .rev()
                 .find(|(s, _)| s.instrument.eq_ignore_ascii_case("OPTIDX") || s.exchange_segment.eq_ignore_ascii_case("NSE_FNO"))
                 .map(|(s, _)| s.clone());
-            // The strike ladder this signal fires on. "Number of Strikes" makes a
-            // spot-chart condition execute EVERY selected strike of the assigned
-            // leg (CE for a bullish filter / Top Gainer, PE for a bearish filter /
-            // Top Loser) at once instead of one strike at a time; a real premium
-            // leg and a spot execution stay exactly as before.
-            let exec_legs: Vec<Strategy> = if trade_mode == "spot" && strat_category(&strat) != StratCat::Index {
+            // The strike ladder this signal fires on. When the selected strike
+            // ladder was analysed per-strike on the premium charts, the fire set
+            // is EXACTLY the strikes that passed their own gate - a failing strike
+            // is never carried along by a passing sibling.
+            let exec_legs: Vec<Strategy> = if !passing_strikes.is_empty() {
+                passing_strikes.clone()
+            } else if trade_mode == "spot" && strat_category(&strat) != StratCat::Index {
                 vec![strat.clone()]
             } else if let Some(p) = premium_leg {
                 vec![p]
@@ -8355,6 +8518,37 @@ impl RealtimeState {
                     self.dhan
                         .subscribe_options(&[(leg.security_id, leg.exchange_segment.clone())])
                         .await;
+                }
+                // "One side per underlying": never hold a bullish and a bearish
+                // exposure on the same underlying at once. When the opposite side
+                // is already running this entry is blocked (the running leg exits
+                // on its own plan); we never force-close it to flip, which only
+                // booked SIDE_FLIP losses and churned.
+                match self
+                    .enforce_one_side_per_underlying(&settings, leg, &leg.side)
+                    .await
+                {
+                    Ok(None) => {}
+                    Ok(Some(reason)) => {
+                        self.note_blocker("info", "side-flip", &strat.name, &format!("{reason}"));
+                        self.log_throttled(
+                            &format!("sideflip:{}", strat.id),
+                            10_000,
+                            "info",
+                            &format!("skip entry {} -> {}: {reason}", strat.name, leg.trading_symbol),
+                        );
+                        continue;
+                    }
+                    Err(reason) => {
+                        self.note_blocker("warn", "side-flip", &strat.name, &format!("{reason}"));
+                        self.log_throttled(
+                            &format!("sideflip:{}", strat.id),
+                            10_000,
+                            "warn",
+                            &format!("skip entry {} -> {}: {reason}", strat.name, leg.trading_symbol),
+                        );
+                        continue;
+                    }
                 }
                 // "Skip when margin unavailable": decide BEFORE the signal is queued.
                 // The margin gate is pure in-memory arithmetic (microseconds), so when
@@ -9952,7 +10146,7 @@ impl RealtimeState {
         }?;
         let ot = pick.option_type.to_uppercase();
         let res = sc.resolve(&pick.symbol_name, &pick.expiry, pick.strike, &ot, &pick.exchange_segment)?;
-        let exch = scrip::scrip_exch(&pick.exchange_segment);
+        let exch = sc.fno_exch(&pick.exchange_segment, &prefix);
         let seg = fno_segment(exch);
         let mut out = strat.clone();
         out.security_id = res.security_id;
@@ -9990,7 +10184,7 @@ impl RealtimeState {
         if prefix.is_empty() {
             return None;
         }
-        let exch = scrip::scrip_exch(&strat.exchange_segment);
+        let exch = sc.fno_exch(&strat.exchange_segment, &prefix);
         let expiries = sc.expiries_for(&prefix, exch)?;
         // Paper Trade 2's indices / commodities must trade the SAME expiry and
         // strikes the option-chain screen shows. The engine previously always took
@@ -10108,7 +10302,8 @@ impl RealtimeState {
         order: &[usize],
     ) -> Vec<(usize, f64, f64)> {
         let Some(sc) = scrip::get() else { return Vec::new() };
-        let seg = fno_segment(scrip::scrip_exch(&strat.exchange_segment));
+        let prefix = scrip::fno_underlying(&strat.trading_symbol);
+        let seg = fno_segment(sc.fno_exch(&strat.exchange_segment, &prefix));
         let mut cands: Vec<(usize, i64)> = Vec::with_capacity(order.len());
         for i in order {
             if let Some(r) = sc.resolve(&strat.trading_symbol, expiry, strikes[*i], ot, &strat.exchange_segment) {
@@ -10171,7 +10366,7 @@ impl RealtimeState {
         if prefix.is_empty() {
             return vec![base];
         }
-        let exch = scrip::scrip_exch(&strat.exchange_segment);
+        let exch = sc.fno_exch(&strat.exchange_segment, &prefix);
         let Some(expiries) = sc.expiries_for(&prefix, exch) else { return vec![base] };
         let Some(expiry) = expiries.first().cloned() else { return vec![base] };
         let Some(bucket) = sc.bucket(exch, &prefix, &expiry) else { return vec![base] };
@@ -10325,7 +10520,7 @@ impl RealtimeState {
         if prefix.is_empty() {
             return Vec::new();
         }
-        let exch = scrip::scrip_exch(&strat.exchange_segment);
+        let exch = sc.fno_exch(&strat.exchange_segment, &prefix);
         let Some(expiries) = sc.expiries_for(&prefix, exch) else { return Vec::new() };
         let Some(expiry) = expiries.first().cloned() else { return Vec::new() };
         let Some(bucket) = sc.bucket(exch, &prefix, &expiry) else { return Vec::new() };
@@ -10915,6 +11110,64 @@ impl RealtimeState {
             return None;
         }
         Some((res, c))
+    }
+
+    /// Premium-only multi-strike analysis. Resolves EVERY strike the operator's
+    /// "Execute Trade In" + "Number of Strikes" selection covers and returns each
+    /// one's premium chart, so the indicator filters can be evaluated per strike.
+    ///
+    /// `premium_candles` only ever resolves the single picked strike, yet in
+    /// "Premium chart only (run + trade)" mode the whole strike ladder used to
+    /// execute off that one strike's chart. Here every selected strike gets its
+    /// own chart; the scan loop then fires only the strikes whose own filters
+    /// pass. No selected strike is ever dropped from the resolution - a failing
+    /// strike is skipped for that scan, not removed from the ladder.
+    async fn premium_candles_all(&self, strat: &Strategy, settings: &Settings) -> Vec<(Strategy, Vec<Candle>)> {
+        let (spot_sid, spot_seg) = match underlying_strategy(strat) {
+            Some(u) => (u.security_id, u.exchange_segment),
+            None => (strat.security_id, strat.exchange_segment.clone()),
+        };
+        let mut spot = self.ltp_of(spot_sid, &spot_seg);
+        if spot <= 0.0 {
+            self.dhan
+                .subscribe_options(&[(spot_sid, spot_seg.clone())])
+                .await;
+            spot = self.wait_feed_ltp(spot_sid, &spot_seg, 1500).await;
+        }
+        if spot <= 0.0 && !self.paper && !self.dhan.rate_limited() {
+            spot = self.fetch_ltp(spot_sid, &spot_seg).await;
+        }
+        if spot <= 0.0 {
+            return Vec::new();
+        }
+        let legs = match underlying_strategy(strat) {
+            Some(u) => self.resolve_option_strategies(&u, spot, settings, false, false),
+            None => self.resolve_option_strategies(strat, spot, settings, false, false),
+        };
+        if self.paper {
+            let subs: Vec<(i64, String)> = legs
+                .iter()
+                .map(|l| (l.security_id, l.exchange_segment.clone()))
+                .collect();
+            if !subs.is_empty() {
+                self.dhan.subscribe_options(&subs).await;
+            }
+        }
+        let mut out: Vec<(Strategy, Vec<Candle>)> = Vec::with_capacity(legs.len());
+        for leg in legs {
+            let c = match self
+                .live_candles(leg.security_id, &leg.exchange_segment, &leg.instrument, &leg.timeframe)
+                .await
+            {
+                Ok(c) if c.len() >= 3 => c,
+                _ => continue,
+            };
+            out.push((leg, c));
+        }
+        if let Some((first, _)) = out.first() {
+            self.record_strat_leg(&strat.id, "run", first);
+        }
+        out
     }
 
     /// Single-instrument LTP straight from Dhan's `/marketfeed/ltp`.
@@ -21335,6 +21588,30 @@ mod gate_tests {
     }
 
     #[tokio::test]
+    async fn one_side_guard_detects_the_opposite_leg_of_the_same_underlying() {
+        let market = crate::market::MarketState::new();
+        let dhan = crate::broker::DhanState::new(market);
+        let rt = RealtimeState::new_paper(dhan);
+        // A bullish CE is running on CRUDEOIL.
+        if let Some(mut d) = rt.doc() {
+            d.positions.push(json!({
+                "id": "bull1", "side": "BUY", "underlying": "CRUDEOIL",
+                "tradingSymbol": "CRUDEOIL-17Nov2026-8600-CE",
+            }));
+        }
+        // A bearish PE entry on the SAME underlying conflicts (+1 vs -1).
+        let conflict = rt.opposite_side_positions("CRUDEOIL", -1);
+        assert_eq!(conflict.len(), 1, "the running call is the opposite side of a put");
+        assert_eq!(conflict[0].0, "bull1");
+        // A bullish entry agrees with the running call: no conflict.
+        assert!(rt.opposite_side_positions("CRUDEOIL", 1).is_empty());
+        // A different underlying is never a conflict.
+        assert!(rt.opposite_side_positions("NATURALGAS", -1).is_empty());
+        // Case/`fno_underlying` normalisation: the stored name is canonical.
+        assert_eq!(rt.opposite_side_positions("crudeoil", -1).len(), 1);
+    }
+
+    #[tokio::test]
     async fn duplicate_entry_on_the_same_contract_is_blocked() {
         let market = crate::market::MarketState::new();
         let dhan = crate::broker::DhanState::new(market);
@@ -26592,5 +26869,196 @@ mod no_premium_cache_tests {
         assert!(rt.no_premium_cached(13, "CE"));
         rt.clear_no_premium(13, "CE");
         assert!(!rt.no_premium_cached(13, "ce"));
+    }
+}
+
+#[cfg(test)]
+mod one_side_guard_tests {
+    use super::*;
+
+    /// The guard's whole premise: a long call and a long put on the SAME
+    /// underlying are opposite exposures (+1 / -1). Without this distinction the
+    /// bullish CE strategy and the bearish PE strategy looked unrelated and a
+    /// trend flip left both legs live, cancelling each other's profit.
+    #[test]
+    fn long_call_and_long_put_are_opposite_exposures() {
+        assert_eq!(option_exposure_dir("BUY", "CRUDEOIL-17Nov2026-8600-CE"), 1);
+        assert_eq!(option_exposure_dir("BUY", "CRUDEOIL-17Nov2026-8500-PE"), -1);
+        assert_eq!(option_exposure_dir("BUY", "SENSEX-Nov2026-80000-CE"), 1);
+        assert_eq!(option_exposure_dir("BUY", "SENSEX-Nov2026-80000-PE"), -1);
+        // The two commodity legs of the same underlying map to the same key, so
+        // the pair is visible to the guard.
+        assert_eq!(
+            underlying_of("CRUDEOIL-17Nov2026-8600-CE", "MCX_COMM"),
+            underlying_of("CRUDEOIL-17Nov2026-8500-PE", "MCX_COMM")
+        );
+    }
+
+    /// A bullish CE and a bearish PE on different underlyings must never be
+    /// treated as a conflict - the guard is per underlying, not global.
+    #[test]
+    fn different_underlyings_are_not_a_conflict() {
+        let ce = "CRUDEOIL-17Nov2026-8600-CE";
+        let pe = "NATURALGAS-20Nov2026-275-PE";
+        assert_ne!(underlying_of(ce, "MCX_COMM"), underlying_of(pe, "MCX_COMM"));
+        assert_eq!(option_exposure_dir("BUY", ce), 1);
+        assert_eq!(option_exposure_dir("BUY", pe), -1);
+    }
+
+    /// Default ON so the protection is active on every tab without the operator
+    /// having to discover a new switch.
+    #[test]
+    fn guard_is_on_by_default() {
+        assert!(Settings::default().one_side_per_underlying);
+    }
+
+    /// The guard must BLOCK the opposite entry, never force-close the running
+    /// leg. Force-closing booked a SIDE_FLIP loss on every wobble and churned
+    /// again on the next flip - self-inflicted bleeding. Here the running CE is
+    /// left completely intact and the conflicting PE entry is refused.
+    #[tokio::test]
+    async fn guard_blocks_the_flip_without_closing_the_running_leg() {
+        let market = crate::market::MarketState::new();
+        let dhan = crate::broker::DhanState::new(market);
+        let rt = RealtimeState::new_paper(dhan);
+        if let Some(mut d) = rt.doc() {
+            d.positions.push(json!({
+                "id": "ce1", "side": "BUY", "status": "running",
+                "underlying": "CRUDEOIL",
+                "tradingSymbol": "CRUDEOIL-17Nov2026-8600-CE",
+            }));
+        }
+        let s = Settings::default();
+        // A PE leg on the same underlying is the opposite exposure and is blocked.
+        let pe_leg = Strategy {
+            trading_symbol: "CRUDEOIL-17Nov2026-8500-PE".into(),
+            exchange_segment: "MCX_COMM".into(),
+            side: "BUY".into(),
+            ..Strategy::default()
+        };
+        let res = rt.enforce_one_side_per_underlying(&s, &pe_leg, &pe_leg.side).await;
+        assert!(matches!(res, Ok(Some(_))), "opposite PE entry must be blocked");
+        // The running CE is untouched: still open, never force-closed.
+        let still_open = rt
+            .doc()
+            .map(|d| d.positions.iter().any(|p| js(p, "id") == "ce1" && js(p, "status") == "running"))
+            .unwrap_or(false);
+        assert!(still_open, "guard must NOT close the running leg");
+        // A same-side CE leg is not a conflict and proceeds.
+        let ce_leg = Strategy {
+            trading_symbol: "CRUDEOIL-17Nov2026-8700-CE".into(),
+            exchange_segment: "MCX_COMM".into(),
+            side: "BUY".into(),
+            ..Strategy::default()
+        };
+        assert!(matches!(
+            rt.enforce_one_side_per_underlying(&s, &ce_leg, &ce_leg.side).await,
+            Ok(None)
+        ));
+    }
+}
+
+#[cfg(test)]
+mod per_strike_premium_gate_tests {
+    use super::*;
+
+    /// A simple N-candle ramp with the given per-bar step. Mirrors the helper the
+    /// other gate tests use, kept local so this module compiles standalone.
+    fn ramp(n: usize, start: f64, step: f64) -> Vec<Candle> {
+        (0..n)
+            .map(|i| {
+                let c = start + step * i as f64;
+                Candle {
+                    time: i as i64 * 300_000,
+                    open: c - step,
+                    high: c + step.abs(),
+                    low: c - step.abs(),
+                    close: c,
+                    volume: 1000.0,
+                }
+            })
+            .collect()
+    }
+
+    /// The whole point of per-strike analysis: the SAME indicator filters must
+    /// pass on a rising strike's premium chart and fail on a falling one, so a
+    /// strike is only ever fired on the strength of its OWN chart - never on a
+    /// sibling strike's chart. This is the exact `filter_gate` the scan calls per
+    /// premium strike.
+    #[test]
+    fn filters_pass_a_rising_strike_and_fail_a_falling_one() {
+        let mut s = Settings::default();
+        s.filters.insert("BullIncUp".into(), true);
+        let bull = Strategy {
+            category: "BULLISH".into(),
+            side: "BUY".into(),
+            ..Strategy::default()
+        };
+        let rising = ramp(60, 100.0, 1.0);
+        let falling = ramp(60, 200.0, -1.0);
+        assert!(
+            filter_gate(&s, &bull, &rising, 0),
+            "a rising premium strike must pass the bullish filter"
+        );
+        assert!(
+            !filter_gate(&s, &bull, &falling, 0),
+            "a falling premium strike must fail the bullish filter"
+        );
+    }
+
+    /// Different strikes of the same leg are independent: one passing chart must
+    /// never force a failing strike through. Mirrors the scan's PASS collection -
+    /// only charts whose own gate returns true end up in the fire set.
+    #[test]
+    fn only_passing_strike_charts_enter_the_fire_set() {
+        let mut s = Settings::default();
+        s.filters.insert("BullIncUp".into(), true);
+        let bull = Strategy {
+            category: "BULLISH".into(),
+            side: "BUY".into(),
+            ..Strategy::default()
+        };
+        let charts = vec![
+            ("CE-ATM", ramp(60, 100.0, 1.0)),
+            ("CE-OTM1", ramp(60, 120.0, -1.0)),
+            ("CE-OTM2", ramp(60, 90.0, 0.5)),
+        ];
+        let fire: Vec<&str> = charts
+            .iter()
+            .filter(|(_, c)| filter_gate(&s, &bull, c, 0))
+            .map(|(name, _)| *name)
+            .collect();
+        assert_eq!(fire, vec!["CE-ATM", "CE-OTM2"], "only rising strike charts fire");
+        assert!(!fire.contains(&"CE-OTM1"), "a falling strike is never carried along");
+    }
+
+    /// "Strike: Option Type" must narrow the universe, not just label it: Call
+    /// (CE) arms only the call leg, Put (PE) only the put leg, and an unpinned
+    /// commodity follows the choice. A pin pointing at the excluded side builds
+    /// nothing rather than flipping the side.
+    #[tokio::test]
+    async fn option_type_narrows_the_scanner_universe() {
+        let market = crate::market::MarketState::new();
+        let dhan = crate::broker::DhanState::new(market);
+        let rt = RealtimeState::new_paper(dhan);
+        let mut s = Settings::default();
+        s.commodity_on = true;
+        s.filters.insert("BullSlEma5".into(), true);
+        s.filters.insert("BearSlEma5".into(), true);
+        s.commodity_list = vec![500001]; // GOLD, unpinned -> both legs by default
+        let has = |out: &[Strategy], key: &str| out.iter().any(|t| t.id == key);
+
+        let both = rt.scanner_targets(&s);
+        assert!(has(&both, "scan:500001:CE") && has(&both, "scan:500001:PE"));
+
+        s.option_side = "CE".into();
+        let ce_only = rt.scanner_targets(&s);
+        assert!(has(&ce_only, "scan:500001:CE"), "Call keeps the call leg");
+        assert!(!has(&ce_only, "scan:500001:PE"), "Call drops the put leg");
+
+        s.option_side = "PE".into();
+        let pe_only = rt.scanner_targets(&s);
+        assert!(!has(&pe_only, "scan:500001:CE"), "Put drops the call leg");
+        assert!(has(&pe_only, "scan:500001:PE"), "Put keeps the put leg");
     }
 }

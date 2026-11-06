@@ -670,7 +670,7 @@ pub async fn instruments() -> impl IntoResponse {
         match sc.as_ref() {
             Some(s) => {
                 let prefix = crate::scrip::fno_underlying(name);
-                !prefix.is_empty() && s.has_options(&prefix, crate::scrip::scrip_exch(seg)) != Some(false)
+                !prefix.is_empty() && s.has_options(&prefix, s.fno_exch(seg, &prefix)) != Some(false)
             }
             // Master still warming: list everything and let the chain endpoint
             // answer "no options" for the rare non-derivative index.
