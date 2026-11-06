@@ -664,13 +664,27 @@ export function bootMarketAnalysis() {
 
   let timer = null;
   let loading = false;
+  let inflight = null;
+  let gen = 0;
 
-  async function load() {
-    if (loading) return;
+  async function load(force) {
+    // A manual Refresh must always win. Claim the new generation FIRST, then
+    // abort the older request: the aborted request is superseded, so its
+    // rejection must never overwrite the fresh "Updated" status with
+    // "Load failed: timed out" (that race is exactly what made a successful
+    // Refresh show a timeout).
+    if (loading && !force) return;
+    const my = ++gen;
+    try { inflight && inflight.abort(); } catch (_) {}
     loading = true;
+    const ctrl = new AbortController();
+    inflight = ctrl;
+    const timerId = setTimeout(() => { try { ctrl.abort(); } catch (_) {} }, 45000);
     try {
-      const resp = await fetch("/api/market/analysis", { cache: "no-store" });
+      const resp = await fetch("/api/market/analysis", { cache: "no-store", signal: ctrl.signal });
+      if (!resp.ok) throw new Error("HTTP " + resp.status);
       const d = await resp.json();
+      if (my !== gen) return;
       maRenderPrediction(d.prediction);
       maRenderFiidii(d.fiidii);
       maRenderParticipant(d.participant);
@@ -680,9 +694,17 @@ export function bootMarketAnalysis() {
       maRenderOverall(d.overall);
       statusEl.textContent = "Updated " + new Date().toLocaleTimeString("en-IN");
     } catch (e) {
-      statusEl.textContent = "Load failed: " + e;
+      // Only the newest request may report failure. An AbortError caused by a
+      // newer Refresh (my !== gen) is expected and must stay silent.
+      if (my === gen) {
+        statusEl.textContent = "Load failed: " + (e && e.name === "AbortError" ? "timed out" : e);
+      }
     } finally {
-      loading = false;
+      clearTimeout(timerId);
+      if (my === gen) {
+        inflight = null;
+        loading = false;
+      }
     }
   }
 
@@ -698,7 +720,7 @@ export function bootMarketAnalysis() {
     }
   }
 
-  refreshBtn.addEventListener("click", load);
+  refreshBtn.addEventListener("click", () => load(true));
 
   // Gap-up statistics controls: calendar range, month/year shortcuts and the
   // graph grouping (daily / weekly / monthly / yearly).

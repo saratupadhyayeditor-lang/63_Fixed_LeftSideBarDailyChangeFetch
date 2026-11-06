@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Dhan Algo Trading System - Rust</title>
-    <link rel="stylesheet" href="./app.css?v=19">
+    <link rel="stylesheet" href="./app.css?v=20">
 </head>
 <body>
 <div class="app">
@@ -41,6 +41,9 @@
       <button class="tab-btn" data-tab="account" title="Broker account - available balance, used margin, collateral, day P&amp;L, open positions and holdings (live Dhan account)">Account</button>
       <button class="tab-btn" data-tab="marketanalysis" title="Market Analysis - FII/DII cash flows, participant-wise F&amp;O open interest, global indices and live India indices (NIFTY, BANK NIFTY, INDIA VIX, GIFT NIFTY)">Market Analysis</button>
       <button class="tab-btn" data-tab="targetlab" title="Target Lab - multi-factor trend target research for indices and MCX commodities (trend, support/resistance, candle patterns, OI, PCR, max pain, IV) with per-engine auto-cut at the underlying target">Target Lab</button>
+      <button class="tab-btn" data-tab="autoexp" title="Auto Experiment - independent Paper Trade clone engine (own simulated book, shares no data)">Auto Experiment</button>
+      <button class="tab-btn" data-tab="aitrader" title="AI Trader - autonomous deep-analysis engine: multi-factor brain (regime + walk-forward filter ranking + volatility gates + adaptive stops) selected universe (indices / commodities / F&amp;O) par khud trade karta hai. Paper + Live subtabs.">AI Trader</button>
+      <button class="tab-btn" data-tab="autoexpstats" title="Auto Experiment Stats - executed-trades report for the Auto Experiment engine only (simulated fills)">Auto Experiment Stats</button>
       <button class="tab-btn" data-tab="equityresearch" title="Equity Research - free-source multibagger screener: NSE bhavcopy, delivery, Yahoo fundamentals, shareholding and F&amp;O option metrics with a momentum backtest">Equity Research</button>
       <button class="tab-btn" data-tab="equitypaper" title="Equity Paper Engine - simulated delivery trades from Equity Research Buy calls with live stats; no real orders">Equity Paper Engine</button>
       <button class="tab-btn" data-tab="equitylive" title="Realtime Equity Engine - places REAL Dhan CNC delivery orders from Equity Research Buy calls, exit on target/stop/Avoid; live stats">Realtime Equity Engine</button>
@@ -192,6 +195,33 @@
       <iframe class="paper-frame" data-src="./rt3v181.html" title="Realtime Trading Engine 3 (independent LIVE engine)"></iframe>
     </div>
     <div class="tab-content" id="tab-targetlab"><div id="rtTargetLab"></div></div>
+    <div class="tab-content" id="tab-autoexp">
+      <div class="ae-subtabs">
+        <button class="ae-subtab active" data-aesub="experiment" title="Run Auto Strategy - indicator-filter combinations ko backtest karke bullish/bearish best strategies ki list dikhata hai">Experiment</button>
+        <button class="ae-subtab" data-aesub="engine" title="Auto Experiment paper clone engine (simulated, shares no data)">Paper Engine</button>
+      </div>
+      <div class="ae-subpane active" id="ae-sub-experiment">
+        <iframe class="paper-frame" data-src="./autoexp.html?v=1" title="Auto Experiment - Run Auto Strategy backtest"></iframe>
+      </div>
+      <div class="ae-subpane" id="ae-sub-engine">
+        <iframe class="paper-frame" data-src="./autoexpv181.html?v=1" title="Auto Experiment - independent Paper Trade clone engine (simulated)"></iframe>
+      </div>
+    </div>
+    <div class="tab-content" id="tab-autoexpstats">
+      <iframe class="paper-frame" data-src="./autoexpstats.html?v=1" title="Trade Stats (Auto Experiment)"></iframe>
+    </div>
+    <div class="tab-content" id="tab-aitrader">
+      <div class="ae-subtabs">
+        <button class="ae-subtab active" data-aesub="aitpaper" title="AI Trader (Paper) - autonomous brain engine, simulated execution, full universe">AI Paper</button>
+        <button class="ae-subtab" data-aesub="aitlive" title="AI Trader (Live) - autonomous brain engine, REAL Dhan orders, full universe">AI Live</button>
+      </div>
+      <div class="ae-subpane active" id="ae-sub-aitpaper">
+        <iframe class="paper-frame" data-src="./aitrader.html?v=1" title="AI Trader (Paper) - autonomous brain engine (simulated)"></iframe>
+      </div>
+      <div class="ae-subpane" id="ae-sub-aitlive">
+        <iframe class="paper-frame" data-src="./aitraderlive.html?v=1" title="AI Trader (LIVE) - autonomous brain engine (real Dhan orders)"></iframe>
+      </div>
+    </div>
     <div class="tab-content" id="tab-equityresearch"><div id="rtEquityResearch"></div></div>
     <div class="tab-content" id="tab-equitypaper">
       <iframe class="paper-frame" data-src="./eqengine.html?mode=paper&amp;v=10" title="Equity Paper Engine"></iframe>
@@ -350,11 +380,11 @@
   import init, { select_symbol, update_oc_quotes, open_option_chart_by_sid, set_oi_trend_enabled, set_trade_lines, clear_trade_lines, set_chart_kind, chart_kind_json, set_chart_timeframe, set_nifty_bbpct_pane, set_formed_only } from "./pkg/algo_web.js?v=85";
   import { bootSidebar } from "./sidebar.js?v=30";
   import { bootConnection } from "./connection.js?v=15";
-  import { bootRealtime } from "./rt181.js?v=40";
-  import { bootRtStats } from "./rtstats.js?v=11";
+  import { bootRealtime } from "./rt181.js?v=44";
+  import { bootRtStats } from "./rtstats.js?v=12";
   import { bootBackup } from "./backup.js?v=3";
   import { bootAccount } from "./account.js?v=2";
-  import { bootMarketAnalysis } from "./marketanalysis.js?v=6";
+  import { bootMarketAnalysis } from "./marketanalysis.js?v=9";
   import { bootTargetLab } from "./targetlab.js?v=12";
   import { bootEquityResearch } from "./equity.js?v=10";
   import { bootUpdater } from "./updater.js?v=9";
@@ -362,7 +392,7 @@
   import { bootTextSize } from "./textsize.js?v=3";
   import { bootIndGroup } from "./indgroup.js?v=5";
   import { bootFloatMenu } from "./floatmenu.js?v=1";
-  import { mountSharedMarginHeader } from "./sharedmargin.js?v=7";
+  import { mountSharedMarginHeader } from "./sharedmargin.js?v=9";
   bootConnection();
   mountSharedMarginHeader(document.getElementById("reconnectOnDisconnect"));
   bootUpdater();
@@ -387,6 +417,25 @@
         if (target) setTimeout(() => target.scrollIntoView({ behavior: "smooth", block: "start" }), 60);
       }
       document.dispatchEvent(new CustomEvent("tabshown", { detail: t }));
+    });
+  });
+  // Auto Experiment sub-tabs: switch between the Run Auto Strategy experiment
+  // and the independent Paper clone engine inside one tab. Both iframes stay
+  // loaded (lazy-loaded on first show); only visibility is toggled.
+  document.querySelectorAll(".ae-subtab[data-aesub]").forEach((btn) => {
+    btn.addEventListener("click", () => {
+      const sub = btn.getAttribute("data-aesub");
+      document.querySelectorAll(".ae-subtab[data-aesub]").forEach((b) =>
+        b.classList.toggle("active", b === btn));
+      document.querySelectorAll(".ae-subpane").forEach((p) =>
+        p.classList.toggle("active", p.id === "ae-sub-" + sub));
+      // Make sure the freshly-shown iframe actually has its src.
+      const pane = document.getElementById("ae-sub-" + sub);
+      if (pane) {
+        pane.querySelectorAll("iframe[data-src]").forEach((frame) => {
+          if (!frame.getAttribute("src")) frame.setAttribute("src", frame.getAttribute("data-src"));
+        });
+      }
     });
   });
   // Mobile/tablet: the instrument sidebar becomes an off-canvas drawer so the
@@ -464,7 +513,7 @@
     });
     // Push the current chart selection to the paper panes so their order cards
     // are priced off the symbol the user is viewing.
-    if ((t === "papertrade" || t === "papertrade2" || t === "papertrade3" || t === "realtime2" || t === "realtime3") && pane.querySelector("iframe")) postChartSelection();
+    if ((t === "papertrade" || t === "papertrade2" || t === "papertrade3" || t === "autoexp" || t === "aitrader" || t === "realtime2" || t === "realtime3") && pane.querySelector("iframe")) postChartSelection();
   });
   // Bridge the main window's live chart selection into BOTH paper frames. The
   // paper pages read window.__chartSelection on demand, so a re-dispatch is

@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Auto Experiment - Dhan Algo</title>
+<link rel="stylesheet" href="./eqengine.css?v=2">
+<style>
+  #aeBull td, #aeBull th, #aeBear td, #aeBear th { white-space: nowrap; }
+  #aeBull td.combo, #aeBear td.combo { max-width: 240px; overflow: hidden; text-overflow: ellipsis; }
+  .ae-row-actions { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 8px 0; }
+  .ae-progress { color: var(--eq-dim); font-size: 11px; }
+  .ae-saved { color: var(--eq-up); font-size: 11px; }
+  .ae-split { display: flex; gap: 12px; flex-wrap: wrap; }
+  .ae-col { flex: 1 1 460px; min-width: 320px; }
+  .ae-col h3 { margin: 4px 0 6px; font-size: 12px; letter-spacing: .5px; text-transform: uppercase; }
+  .ae-bull h3 { color: var(--eq-up); }
+  .ae-bear h3 { color: var(--eq-down); }
+  .ae-col .eq-table-wrap { max-height: 420px; }
+  .ae-savebar { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 6px 0; }
+</style>
+</head>
+<body>
+<div class="eq-wrap">
+  <div class="eq-head">
+    <div>
+      <div class="eq-title">Auto Experiment - Run Auto Strategy</div>
+      <div class="eq-sub">Indicator-filter ke alag-alag combinations ko bana kar last N saal ke daily candles par backtest karta hai. Bullish aur bearish ki alag-alag ranked list dikhata hai, aur best strategies ko Universal Template Pool me save karta hai (serial + side + indicator-filter naam ke saath) - jise aap Paper Trade ya kisi bhi Realtime tab me import kar sakte ho.</div>
+    </div>
+    <div class="eq-spacer"></div>
+    <span class="eq-broker" id="aeBroker">-</span>
+  </div>
+
+  <div class="eq-settings">
+    <div class="eq-field">
+      <label>Universe</label>
+      <select id="aeUniverse" style="background:#090916;color:var(--eq-text);border:1px solid var(--eq-line);border-radius:4px;padding:4px 6px;font-size:11px">
+        <option value="commodities">Commodities (MCX)</option>
+        <option value="indices">Indices</option>
+        <option value="fno">F&amp;O Stocks</option>
+      </select>
+    </div>
+    <div class="eq-field">
+      <label>Years</label>
+      <input id="aeYears" type="number" min="1" max="8" step="1" value="3">
+    </div>
+    <div class="eq-field">
+      <label>Min trades</label>
+      <input id="aeMinTrades" type="number" min="1" max="1000" step="1" value="8">
+    </div>
+    <button class="eq-btn primary" id="aeRun">Run Auto Strategy</button>
+    <button class="eq-btn danger" id="aeStop">Stop</button>
+    <button class="eq-btn" id="aeClear">Clear</button>
+  </div>
+
+  <div class="ae-row-actions">
+    <span class="ae-progress" id="aeProgress">Idle</span>
+    <span class="eq-spacer"></span>
+    <span class="ae-saved" id="aeSaved"></span>
+  </div>
+
+  <div class="eq-error" id="aeError"></div>
+
+  <div class="eq-mini" id="aeCards"></div>
+
+  <div class="ae-savebar">
+    <button class="eq-btn" id="aeSaveBull" title="Save every bullish winner to the Universal Template Pool">Save Bullish to Pool</button>
+    <button class="eq-btn" id="aeSaveBear" title="Save every bearish winner to the Universal Template Pool">Save Bearish to Pool</button>
+    <button class="eq-btn primary" id="aeSaveAll" title="Save every result (both sides) to the Universal Template Pool">Save All to Pool</button>
+  </div>
+
+  <div class="ae-split">
+    <div class="ae-col ae-bull">
+      <h3>Bullish Strategies (best performing)</h3>
+      <div class="eq-table-wrap">
+        <table class="eq-t" id="aeBull">
+          <thead>
+            <tr>
+              <th>#</th><th>Symbol</th><th>Universe</th><th>Indicator filter combo</th>
+              <th>Exit</th><th>Trades</th><th>Win %</th><th>P&amp;L</th><th>Max DD</th><th>PF</th>
+            </tr>
+          </thead>
+          <tbody id="aeBullBody"><tr><td colspan="10" class="eq-empty">No results yet - press Run Auto Strategy.</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+    <div class="ae-col ae-bear">
+      <h3>Bearish Strategies (best performing)</h3>
+      <div class="eq-table-wrap">
+        <table class="eq-t" id="aeBear">
+          <thead>
+            <tr>
+              <th>#</th><th>Symbol</th><th>Universe</th><th>Indicator filter combo</th>
+              <th>Exit</th><th>Trades</th><th>Win %</th><th>P&amp;L</th><th>Max DD</th><th>PF</th>
+            </tr>
+          </thead>
+          <tbody id="aeBearBody"><tr><td colspan="10" class="eq-empty">No results yet - press Run Auto Strategy.</td></tr></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</div>
+<script type="module">
+  import { bootAutoExp } from "./autoexp.js?v=2";
+  bootAutoExp();
+</script>
+</body>
+</html>

@@ -12,7 +12,7 @@
 // button is the master switch: ON starts + arms + force-ticks, OFF stops.
 
 import { istTime } from "./ist.js?v=1";
-import { mountSharedMargin, realtimeEngineId } from "./sharedmargin.js?v=7";
+import { mountSharedMargin, realtimeEngineId } from "./sharedmargin.js?v=8";
 
 const API = {
   snapshot: () => get("/api/rt/snapshot"),

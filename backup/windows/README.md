@@ -7,9 +7,13 @@ Build: cross-compiled from Linux with `x86_64-pc-windows-gnu` (mingw-w64), so
 the executables depend only on standard Windows system DLLs plus
 `WebView2Loader.dll` (bundled below) - no VC++ runtime or admin needed.
 
-This build includes the "Ignore fake breakouts / reversals" anti-fake entry
-gate (NIFTY + indices + commodities trend engines) and the liquid F&O scanner
-fix, on top of the bid/ask paper-fill feature.
+This build includes the "Trend check before entry" gate (composite underlying
+spot-trend read: confirmation-indicator net + EMA20 slope + price vs EMA20,
+with a sideways/range regime veto; enforced both at scan time and again at the
+execution instant), the AI Trader (Paper + Live) autonomous brain engines, the
+Auto Experiment engine, and the Market Analysis refresh fix (concurrent bounded
+sections + quote-cache fast path, ~20ms instead of 120s+), on top of the
+anti-fake entry gate, liquid F&O scanner fix and bid/ask paper fills.
 
 ## What is in this folder
 

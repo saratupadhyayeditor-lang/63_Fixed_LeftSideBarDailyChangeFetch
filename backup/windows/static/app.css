@@ -117,6 +117,19 @@
      real and paper engines each own a clean DOM + JS scope. */
   .paper-frame { flex: 1 1 auto; width: 100%; min-height: 0; border: 0; display: block; background: var(--bg); }
 
+  /* Auto Experiment hosts two sub-views in one tab: the Run Auto Strategy
+     backtest and the independent Paper clone engine. */
+  .ae-subtabs { display: flex; gap: 6px; padding: 6px 8px 0; flex-wrap: wrap; }
+  .ae-subtab {
+    background: #0d0d1e; color: #9a9ac8; border: 1px solid #2d2d50;
+    border-bottom: 0; border-radius: 6px 6px 0 0; padding: 5px 14px;
+    font-size: 11px; font-weight: 700; cursor: pointer;
+  }
+  .ae-subtab.active { background: #18213a; color: #e6e6ff; border-color: #3a5a9e; }
+  .ae-subpane { display: none; flex: 1 1 auto; min-height: 0; }
+  .ae-subpane.active { display: flex; flex-direction: column; }
+  .ae-subpane .paper-frame { flex: 1 1 auto; }
+
   .chart-toolbar {
     display: flex; align-items: center; gap: 8px;
     padding: 5px 8px; border-bottom: 1px solid var(--border);
