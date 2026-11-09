@@ -18,6 +18,18 @@ export function bootSidebar(api) {
     ws: null,
     wsRetry: 0,
     wsLastMsg: 0,
+    indexTickAt: 0,
+    // Coalesce the per-frame quote pushes into one paint per animation frame.
+    // The feed flushes every 120ms but a busy scanner can burst several frames
+    // back-to-back; rendering on every frame is what made the sidebar/rows look
+    // steppy. A single rAF render per frame keeps every tick but paints once.
+    renderPending: false,
+    // Last time the market-watch rows were re-sorted by day change. Re-sorting on
+    // every tick made rows visibly jump around; the ranking only needs to refresh
+    // a few times a second while the LTP/chg numbers still update every frame.
+    lastSortAt: 0,
+    // Last time the merged quote map was pushed into the option-chain tab.
+    ocPushAt: 0,
     watchdogTimer: null,
     pollTimer: null,
     polling: false,
@@ -428,6 +440,12 @@ export function bootSidebar(api) {
   }
 
   function updateWatchlist(qm) {
+    const now = Date.now();
+    // Re-rank the Gainers/Losers boxes only a few times a second. Re-sorting on
+    // every tick made rows visibly jump as two symbols fought for the same slot;
+    // the numbers still update on every frame, only the ordering is cadence-bound.
+    const doSort = now - state.lastSortAt >= SORT_MIN_MS;
+    if (doSort) state.lastSortAt = now;
     const cats = document.querySelectorAll("#marketWatch .mw-cat");
     for (const cat of cats) {
       const rows = Array.from(cat.querySelectorAll(".mw-row"));
@@ -451,6 +469,7 @@ export function bootSidebar(api) {
           quoted.push(row);
         }
       }
+      if (!doSort) continue;
       const bullBox = cat.querySelector(".mw-bull");
       const bearBox = cat.querySelector(".mw-bear");
       const load = cat.querySelector(".mw-load");
@@ -519,10 +538,29 @@ export function bootSidebar(api) {
     window.dispatchEvent(new CustomEvent("chartselection", { detail: window.__chartSelection }));
   }
 
+  const SORT_MIN_MS = 400;
+
+  // Schedule a single paint on the next animation frame. Multiple quote frames
+  // that land within one frame collapse into one repaint, so a burst from the
+  // 120ms feed flush cannot cause several layouts in a row (the "steppy" look).
   function render() {
-    // Repaint whenever fresh quotes arrive. The live feed pushes ticks, and the
-    // REST fallback (see pollRestFallback) rebroadcasts Dhan REST quotes on /ws
-    // while the feed is rate-limited, so the day-change column keeps moving.
+    if (state.renderPending) return;
+    state.renderPending = true;
+    const raf =
+      typeof requestAnimationFrame === "function"
+        ? requestAnimationFrame
+        : (cb) => setTimeout(cb, 16);
+    raf(() => {
+      state.renderPending = false;
+      paint();
+    });
+  }
+
+  function paint() {
+    // Repaint with the freshest merged quote store. The live feed pushes ticks,
+    // and the REST fallback (see pollRestFallback) rebroadcasts Dhan REST quotes
+    // on /ws while the feed is rate-limited, so the day-change column keeps
+    // moving.
     const qm = state.quotes;
     publishSelection(qm);
     const sel = $("symbolSelect");
@@ -550,13 +588,26 @@ export function bootSidebar(api) {
     updateWatchlist(qm);
     updateCommodityWatch(qm);
     updateChartPnL(qm);
-    if (api.update_oc_quotes) {
-      try {
-        api.update_oc_quotes(JSON.stringify(qm));
-      } catch (e) {
-        /* option-chain tab not ready */
+    // The option-chain tab only needs a refresh while it is actually visible;
+    // pushing the whole quote map on every frame is wasted work (and JSON
+    // serialization) when the operator is on another tab. Throttle it too.
+    if (api.update_oc_quotes && optionChainVisible()) {
+      const now = Date.now();
+      if (now - state.ocPushAt >= 250) {
+        state.ocPushAt = now;
+        try {
+          api.update_oc_quotes(JSON.stringify(qm));
+        } catch (e) {
+          /* option-chain tab not ready */
+        }
       }
     }
+  }
+
+  function optionChainVisible() {
+    // The active tab is mirrored onto <body data-tab>; the option-chain pane is
+    // only rendered while its tab is active.
+    return document.body.getAttribute("data-tab") === "optionchain";
   }
 
   function updateChartPnL(qm) {
@@ -663,7 +714,17 @@ export function bootSidebar(api) {
         try {
           const m = JSON.parse(ev.data);
           if (m.type === "quotes") {
-            mergeQuotes(m.data || {});
+            const data = m.data || {};
+            // Track when an index quote last arrived over the websocket so the
+            // REST index poller can stay idle while the feed is delivering live
+            // IDX_I ticks, and only wake as a fallback when they go quiet.
+            for (const k in data) {
+              if (k.startsWith("IDX_I:")) {
+                state.indexTickAt = Date.now();
+                break;
+              }
+            }
+            mergeQuotes(data);
             render();
           }
         } catch (e) {
@@ -790,10 +851,12 @@ export function bootSidebar(api) {
   }
 
   // Dhan's live feed does not push IDX_I packets on every account (stocks keep
-  // ticking while the indices stay frozen on their subscribe snapshot). Poll
-  // just the five indices over REST on a slow cadence so the sidebar daily
-  // change and the chart's index price keep moving even then. The server gate
-  // keeps this from piling requests onto Dhan's rate limit.
+  // Index ticks normally arrive over the websocket. This poller is now purely a
+  // fallback for the accounts where Dhan parks IDX_I on a frozen subscribe
+  // snapshot: it only fetches over REST when no index quote has landed on the
+  // socket for a while, so a live index feed never pays the REST round-trip (or
+  // its rate-limit cost) at all.
+  const INDEX_WS_GRACE_MS = 8000;
   let indexDelay = 5000;
   let indexSig = "";
   function scheduleIndexPoll(ms) {
@@ -810,6 +873,10 @@ export function bootSidebar(api) {
     // The broad fallback above already refreshes every row when the socket is
     // down or silent; do not double the Dhan quote load in that state.
     if (window.__feedDown || wsStreamStale()) return true;
+    // Live index ticks are flowing over /ws: skip REST entirely.
+    if (state.indexTickAt && Date.now() - state.indexTickAt < INDEX_WS_GRACE_MS) {
+      return true;
+    }
     const secs = securitiesList().filter(
       (s) => s.exchange_segment === "IDX_I"
     );

@@ -1,4 +1,4 @@
-# Windows build (v0.1.32)
+# Windows build (v0.1.32 + websocket snapshot push)
 
 Pre-built Windows x86_64 binaries for this repo, built from the exact source in
 this commit. Everything needed to install and run on Windows is here.
@@ -7,7 +7,22 @@ Build: cross-compiled from Linux with `x86_64-pc-windows-gnu` (mingw-w64), so
 the executables depend only on standard Windows system DLLs plus
 `WebView2Loader.dll` (bundled below) - no VC++ runtime or admin needed.
 
-Headline of this build: **the MCX commodities section no longer stuck on `-`.**
+Headline of this build: **per-engine WebSocket snapshot push replaces the 1s
+REST live-display poll.** Each Realtime/Paper/AI tab now receives a pushed
+`rt-snapshot` frame (~400ms cadence) over `/api/.../stream` instead of polling
+the REST snapshot every second. Position P&L marks to the live websocket quote
+cache (fixes stale ~3s LTP), movers/liquid render straight from the snapshot,
+and the sidebar coalesces paints via rAF. REST is intentionally retained for
+candle history/seed, orders/modify/exit, account/margin/positions, catalog and
+feed-down fallback.
+
+Note: the single-file `algo-desktop-windows-x86_64-portable.exe` launcher is
+from the previous v0.1.32 build - it requires running the Windows binary, which
+cannot be produced on this Linux build host without Wine. Use
+`AlgoTradingSetup.exe` (installer) or the `algo-desktop-windows-x86_64.zip`
+(unzip-and-run) for the current build; both contain the updated binaries.
+
+Headline of the previous build: **the MCX commodities section no longer stuck on `-`.**
 The old bundled MCX list used made-up ids (`500001..500015`) that are not Dhan
 contracts at all, so their quotes never resolved and the sidebar showed no
 daily change. On a fresh install that list was also served during the
