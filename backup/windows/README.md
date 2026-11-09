@@ -1,4 +1,4 @@
-# Windows build (v0.1.32 + websocket snapshot push)
+# Windows build (v0.1.32 + opposite-side entry fix)
 
 Pre-built Windows x86_64 binaries for this repo, built from the exact source in
 this commit. Everything needed to install and run on Windows is here.
@@ -7,7 +7,18 @@ Build: cross-compiled from Linux with `x86_64-pc-windows-gnu` (mingw-w64), so
 the executables depend only on standard Windows system DLLs plus
 `WebView2Loader.dll` (bundled below) - no VC++ runtime or admin needed.
 
-Headline of this build: **per-engine WebSocket snapshot push replaces the 1s
+Headline of this build: **option entries no longer fire against the trend.**
+The per-strike premium gate used to evaluate each leg with its SPOT-side filter
+set (CE=bullish, PE=bearish) on the leg's OWN option premium chart. A put
+premium rises only when the underlying falls, so gating a PE with bearish
+filters on its premium fired the put exactly when that premium was falling
+(underlying rising) - the trade opened against the move and the trail/overall SL
+booked the loss. The same inversion let a bullish tape still fire
+bearish-filtered legs. The premium-chart gate now forces the rising-premium
+(bullish) filter set for BOTH legs (like premium-only run mode); the spot gate
+and the scanner pin still own the true side.
+
+Also in this build: **per-engine WebSocket snapshot push replaces the 1s
 REST live-display poll.** Each Realtime/Paper/AI tab now receives a pushed
 `rt-snapshot` frame (~400ms cadence) over `/api/.../stream` instead of polling
 the REST snapshot every second. Position P&L marks to the live websocket quote
@@ -17,7 +28,7 @@ candle history/seed, orders/modify/exit, account/margin/positions, catalog and
 feed-down fallback.
 
 Note: the single-file `algo-desktop-windows-x86_64-portable.exe` launcher is
-from the previous v0.1.32 build - it requires running the Windows binary, which
+from an earlier v0.1.32 build - it requires running the Windows binary, which
 cannot be produced on this Linux build host without Wine. Use
 `AlgoTradingSetup.exe` (installer) or the `algo-desktop-windows-x86_64.zip`
 (unzip-and-run) for the current build; both contain the updated binaries.
