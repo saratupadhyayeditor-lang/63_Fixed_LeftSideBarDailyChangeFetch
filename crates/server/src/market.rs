@@ -437,7 +437,12 @@ fn bar_owner_key(sec_id: i64, exch: &str) -> String {
 
 impl MarketState {
     pub fn new() -> Self {
-        let (bc, _) = broadcast::channel(16);
+        // A tight buffer (16) made a busy scanner's 120ms flush batches overrun
+        // any slow websocket writer, which then saw `RecvError::Lagged` and used
+        // to silently drop those batches - that is the "prices step/skip" stutter.
+        // A much larger ring plus a snapshot resync on lag (see `ws_loop`) lets a
+        // bursty feed batch coalesce instead of losing ticks.
+        let (bc, _) = broadcast::channel(1024);
         MarketState {
             quotes: Arc::new(Mutex::new(HashMap::new())),
             bc,
@@ -957,7 +962,22 @@ async fn ws_loop(mut socket: WebSocket, st: DhanState) {
                             break;
                         }
                     }
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    // A slow client fell behind the broadcast ring: it missed some
+                    // 120ms quote batches. Instead of silently continuing (which
+                    // leaves that tab's prices frozen on stale values until the
+                    // next matching tick), send a full snapshot now so the client
+                    // resyncs to the freshest book in one frame.
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        let data = mk
+                            .quotes
+                            .lock()
+                            .map(|g| Value::Object(g.iter().map(|(k, v)| (k.clone(), v.clone())).collect()))
+                            .unwrap_or_else(|_| json!({}));
+                        let payload = json!({ "type": "quotes", "data": data }).to_string();
+                        if socket.send(Message::Text(payload)).await.is_err() {
+                            break;
+                        }
+                    }
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
             }

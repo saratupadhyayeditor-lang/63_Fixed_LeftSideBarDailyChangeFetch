@@ -36,6 +36,7 @@ use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use tokio::sync::{broadcast, Notify};
 
 use dhan_hq::models::{
     ExchangeSegment, LegName, MarginRequest, MarginResponse, ModifyOrderRequest, OrderRequest, OrderType,
@@ -2518,6 +2519,17 @@ pub struct RealtimeState {
     /// which is what produced hundreds of `no-premium` blocker hits and kept the
     /// option chain / quote surface busy.
     no_premium_until: Arc<Mutex<HashMap<String, i64>>>,
+    /// Live snapshot push channel for this engine's `/ws` tab. Every connected
+    /// tab subscribes here and receives the same ready-to-render snapshot at the
+    /// pusher cadence, replacing the old 1s REST poll. `receiver_count()` is the
+    /// number of live tabs, so the pusher never builds a snapshot (and never
+    /// touches the doc lock or the quote cache) while nobody is watching.
+    snap_bc: broadcast::Sender<String>,
+    /// Set when the operator changed something the push stream cannot infer
+    /// (button posts, settings saves, engine toggles). The pusher wakes on it and
+    /// emits an immediate frame so the UI reacts the instant the write lands
+    /// instead of waiting for the next cadence tick.
+    snap_notify: Arc<Notify>,
 }
 
 /// One row of the per-instrument trend readout. `prev` is the instrument's last
@@ -3244,6 +3256,13 @@ impl RealtimeState {
                 apply_auto_trade_preset(&mut doc.settings);
             }
             doc.settings.auto_trade_on = true;
+        } else if !doc.settings.auto_trade_on {
+            // The hidden preset trail (`ai_trail_tp`) has no operator control, so
+            // a saved file from an earlier Auto Trading session must not keep
+            // arming it after Auto Trading was switched off - that was the
+            // "Trail SL still applies when its box is unchecked" report. Open
+            // positions are safe: each stores its own trail at entry.
+            doc.settings.ai_trail_tp = false;
         }
         // A stored `pointTrailBrokerOnly` from the old rule is cleared ONLY when
         // the position carries no broker-owned trail. A position routed to a
@@ -3340,6 +3359,11 @@ impl RealtimeState {
             scanner_busy: Arc::new(AtomicBool::new(false)),
             no_premium_until: Arc::new(Mutex::new(HashMap::new())),
             seed_inflight: Arc::new(Mutex::new(std::collections::HashSet::new())),
+            // Small ring: the pusher only emits ~2.5 frames/sec and a slow tab is
+            // better served by the next fresh frame than by replaying stale ones,
+            // so on lag the receiver simply resyncs from the newest broadcast.
+            snap_bc: broadcast::channel(8).0,
+            snap_notify: Arc::new(Notify::new()),
         };
         // Resume the operator's saved master-switch state: ON stays ON (armed
         // unless today's auto square-off already ran), OFF stays OFF.
@@ -3349,6 +3373,7 @@ impl RealtimeState {
         st.clone().spawn_scanners();
         st.clone().spawn_guard();
         st.clone().spawn_nifty_watch();
+        st.clone().spawn_snapshot_push();
         st
     }
 
@@ -3403,6 +3428,10 @@ impl RealtimeState {
             }
         };
         let _ = write_atomic(&state_path(self.state_file), bytes.as_bytes());
+        // Any persisted mutation (engine toggle, settings save, strategy edit,
+        // entry/exit, square-off) should reach connected tabs immediately instead
+        // of waiting out the push cadence. Coalesces with the periodic frame.
+        self.nudge_snapshot();
     }
 
     fn log(&self, level: &str, msg: &str) {
@@ -4676,6 +4705,63 @@ impl RealtimeState {
     // -----------------------------------------------------------------------
     // Engine loop
     // -----------------------------------------------------------------------
+
+    /// How often the live snapshot pusher emits a frame. The old UI polled
+    /// `/snapshot` once a second; ~2.5 Hz makes position LTP / P&L / scanner
+    /// readouts move smoothly instead of stepping in whole seconds, while keeping
+    /// the frame rate far below the feed's 120ms batch cadence so a tab is never
+    /// flooded. The push is skipped entirely when no tab is subscribed.
+    const SNAPSHOT_PUSH_MS: u64 = 400;
+
+    /// Wake the pusher so an operator action (engine toggle, settings save,
+    /// strategy edit, entry/exit) is reflected on the very next frame instead of
+    /// waiting out [`Self::SNAPSHOT_PUSH_MS`]. Cheap and coalescing: repeated
+    /// calls before the pusher runs collapse into one frame.
+    fn nudge_snapshot(&self) {
+        self.snap_notify.notify_one();
+    }
+
+    /// Push the full engine snapshot to every connected tab over `/ws`.
+    ///
+    /// This replaces the 1s REST poll for the live display. It only builds when a
+    /// tab is actually subscribed (`receiver_count() > 0`), so an unattended
+    /// engine pays nothing. `snap_of` is REST-free (it reads caches and atomics
+    /// only), so a frame build never queues behind a Dhan call or a rate-limit
+    /// hold - the exact failure mode the old inline snapshot could suffer.
+    fn spawn_snapshot_push(self) {
+        tokio::spawn(async move {
+            loop {
+                // No subscriber: wait for either a nudge or the cadence timeout,
+                // re-checking cheaply. A notify that lands between the count
+                // check and the select is still latched by tokio, so an operator
+                // action during an idle period is not lost.
+                let has_subs = self.snap_bc.receiver_count() > 0;
+                if has_subs {
+                    let payload = {
+                        let snap = snap_of(&self);
+                        json!({ "type": "rt-snapshot", "data": snap }).to_string()
+                    };
+                    // `send` errors only when there are zero receivers, which the
+                    // count check above already ruled out (a disconnect in the
+                    // gap just drops this one frame - harmless).
+                    let _ = self.snap_bc.send(payload);
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_millis(Self::SNAPSHOT_PUSH_MS)) => {}
+                        _ = self.snap_notify.notified() => {}
+                    }
+                } else {
+                    // Idle: no frame build at all. Wake on the next operator nudge
+                    // OR after a short nap so a newly connected tab (which sends a
+                    // subscribe frame, then reads its own initial snapshot) is
+                    // picked up promptly even if it did not nudge.
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_millis(Self::SNAPSHOT_PUSH_MS)) => {}
+                        _ = self.snap_notify.notified() => {}
+                    }
+                }
+            }
+        });
+    }
 
     /// Background scanner pass: Top Movers, Liquid F&O and every trend section.
     ///
@@ -7713,25 +7799,70 @@ impl RealtimeState {
         // gainer / loser dropdown picks and hand-added names. A gainer is pinned
         // to the call leg and a loser to the put leg (same rule as Top Movers);
         // a hand-added stock builds both legs and lets the indicator gate choose
-        // the side. No sideways/trend gate here - this scanner is its own
-        // universe and the indicator filters still decide WHEN a leg enters.
+        // the side.
+        //
+        // While NIFTY Trend Following is ON it owns the side of these stock legs
+        // EXACTLY like the Top Movers block above: a bullish NIFTY read arms ONLY
+        // the Liquid top gainers (CE) and a bearish read ONLY the Liquid top
+        // losers (PE). Before this the liquid scanner kept building its gainer CE
+        // and loser PE unconditionally, so a Liquid top loser could enter a put
+        // while the committed NIFTY trend was bullish (and vice versa) - the Top
+        // Movers legs were gated but the Liquid legs were not. No committed
+        // direction (dir == 0) arms nothing, and a sideways block suppresses both.
+        // The strict NET / ALL-LINES gates apply here too. Hand-added names still
+        // build both legs (the indicator gate picks the side), matching the way
+        // Top Movers builds its operator indices.
         if settings.liquid_on && self.allows_liquid_stocks() {
             let payload = self.liquid_cache.lock().map(|g| g.1.clone()).unwrap_or(Value::Null);
             if !indices_only {
-                for r in jarr(&payload, "gainers") {
-                    add(&mut out, &mut seen, ji(&r, "securityId"), Some(true), allow_bull, allow_bear, true, true, settings);
+                let sideways_block = settings.no_trade_sideways
+                    && nifty_dir_feature_on(settings)
+                    && self.nifty_sideways.load(Ordering::Relaxed);
+                let (liquid_bull, liquid_bear) = if sideways_block {
+                    (false, false)
+                } else if nifty_dir_feature_on(settings) {
+                    let dir = self.nifty_dir.load(Ordering::Relaxed);
+                    (
+                        dir > 0 && self.nifty_strict_side_ok(settings, true),
+                        dir < 0 && self.nifty_strict_side_ok(settings, false),
+                    )
+                } else {
+                    (true, true)
+                };
+                if liquid_bull {
+                    for r in jarr(&payload, "gainers") {
+                        add(&mut out, &mut seen, ji(&r, "securityId"), Some(true), allow_bull, allow_bear, true, true, settings);
+                    }
                 }
-                for r in jarr(&payload, "losers") {
-                    add(&mut out, &mut seen, ji(&r, "securityId"), Some(false), allow_bull, allow_bear, true, true, settings);
+                if liquid_bear {
+                    for r in jarr(&payload, "losers") {
+                        add(&mut out, &mut seen, ji(&r, "securityId"), Some(false), allow_bull, allow_bear, true, true, settings);
+                    }
                 }
                 for r in jarr(&payload, "added") {
                     add(&mut out, &mut seen, ji(&r, "securityId"), None, allow_bull, allow_bear, true, true, settings);
                 }
             }
-            if settings.liquid_gainer > 0 {
+            // The explicit "Top gainer" / "Top loser" dropdown picks are the same
+            // scanner legs, so they follow the same committed-direction gate.
+            let (pick_bull, pick_bear) = if settings.no_trade_sideways
+                && nifty_dir_feature_on(settings)
+                && self.nifty_sideways.load(Ordering::Relaxed)
+            {
+                (false, false)
+            } else if nifty_dir_feature_on(settings) {
+                let dir = self.nifty_dir.load(Ordering::Relaxed);
+                (
+                    dir > 0 && self.nifty_strict_side_ok(settings, true),
+                    dir < 0 && self.nifty_strict_side_ok(settings, false),
+                )
+            } else {
+                (true, true)
+            };
+            if settings.liquid_gainer > 0 && pick_bull {
                 add(&mut out, &mut seen, settings.liquid_gainer, Some(true), allow_bull, allow_bear, true, true, settings);
             }
-            if settings.liquid_loser > 0 {
+            if settings.liquid_loser > 0 && pick_bear {
                 add(&mut out, &mut seen, settings.liquid_loser, Some(false), allow_bull, allow_bear, true, true, settings);
             }
         }
@@ -11377,30 +11508,33 @@ impl RealtimeState {
         let atr = if let Some(a) = self.cached_atr(&key, 60_000) {
             a
         } else {
-            // Paper never REST-seeds a candle series; it reads the live websocket
-            // series only, so paper execution stays completely REST-free.
-            let candles = if self.paper {
-                let raw = match self
-                    .dhan
-                    .market
-                    .live_bars_for(strat.security_id, &strat.exchange_segment, &strat.timeframe, LIVE_BAR_TTL)
-                {
-                    Some(c) if c.len() >= 15 => c,
-                    _ => return None,
-                };
-                // Same chart-type switch as `live_candles`, so the paper ATR can
-                // never read a different series than the rest of the engine.
-                let es = self.doc().map(|d| d.settings.clone()).unwrap_or_default();
-                apply_engine_chart(raw, &es)
-            } else {
-                let fut = self
-                    .live_candles(strat.security_id, &strat.exchange_segment, &strat.instrument, &strat.timeframe);
-                match tokio::time::timeout(Duration::from_millis(1500), fut).await {
-                    Ok(Ok(c)) if c.len() >= 15 => c,
-                    _ => return None,
-                }
+            // Read the ATR off the SAME tick-native series the scan evaluates,
+            // for BOTH paper and live. The old paper-only branch bypassed
+            // `live_candles`, read the raw 2s-TTL bars directly and demanded 15+
+            // of them, so a freshly resolved option strike (only a handful of
+            // bars warm) always tripped the gate and returned `None`. That made
+            // every AI risk mode - "SL auto", "AI Stop-Loss" and "AI TP %" -
+            // silently fall back to 0, so nothing was ever applied (the operator's
+            // "these controls do nothing" report). `live_candles` already seeds a
+            // cold series and falls back to the last known one, exactly like the
+            // scan, so the ATR is always available once the scan has warmed it.
+            let candles = match tokio::time::timeout(
+                Duration::from_millis(1500),
+                self.live_candles(strat.security_id, &strat.exchange_segment, &strat.instrument, &strat.timeframe),
+            )
+            .await
+            {
+                Ok(Ok(c)) if c.len() >= 3 => c,
+                _ => return None,
             };
-            let settings: algo_core::model::Settings = Default::default();
+            // Wilder ATR needs `length` bars before it produces a value. A fresh
+            // strike may only have a few even after warming, so adapt the period to
+            // what is actually available (2..=14) instead of demanding 15 and
+            // reporting nothing. Fewer bars still give a usable volatility read,
+            // which is what the AI stop/target sizing needs.
+            let len = atr_period_for_bars(candles.len()) as f64;
+            let settings: algo_core::model::Settings =
+                std::iter::once(("length".to_string(), json!(len))).collect();
             let out = algo_core::compute("atr", &candles, &settings);
             let a = out
                 .first()
@@ -11426,7 +11560,6 @@ impl RealtimeState {
         let trail_atr = trail_mult * atr;
         Some((sl.max(0.05), tp.max(0.05), atr, trail_atr))
     }
-
     fn cached_atr(&self, key: &str, max_age_ms: i64) -> Option<f64> {
         let g = self.atr_cache.lock().ok()?;
         let (at, v) = g.get(key)?;
@@ -11436,7 +11569,6 @@ impl RealtimeState {
             None
         }
     }
-
     /// Paper-only simulated execution latency.
     ///
     /// Queues a qualifying entry and places it `delay_ms` after the condition
@@ -14859,6 +14991,13 @@ fn clear_auto_trade_entry_gates(s: &mut Settings) {
     s.no_trade_sideways = false;
     s.index_trend_on = false;
     s.comm_trend_on = false;
+    // The preset arms a hidden profit trail (`ai_trail_tp`) that has NO visible
+    // checkbox in any engine. Leaving it set after Auto Trading is switched OFF
+    // meant every NEW entry still inherited a trail the operator could not see
+    // or turn off - the "Trail SL applies even when unchecked" report. Open
+    // trades are unaffected: each position stores its own trail / pointTrail at
+    // entry time, so they keep the protection they were opened with.
+    s.ai_trail_tp = false;
 }
 
 fn series_value(s: &algo_core::model::SeriesOut, from_end: usize) -> Option<f64> {    let n = s.data.len();
@@ -17847,6 +17986,16 @@ fn paper_slice_fills(plan: &[i64], lot: f64, px: f64, at: i64) -> (Vec<Value>, f
 }
 
 
+/// ATR period to use for the AI SL / TP / trail, adapted to the bars actually
+/// available. Wilder smoothing only emits a value once at least `period` bars
+/// exist, so a freshly resolved option strike (which has almost no history) used
+/// to make the AI risk modes silently return nothing. Clamp the period into
+/// `2..=14` so a short warm series still yields a usable volatility read; the
+/// caller already guarantees `>= 3` bars.
+fn atr_period_for_bars(bars: usize) -> usize {
+    bars.saturating_sub(1).clamp(2, 14)
+}
+
 /// Resolve the entry stop/target/trail set with the old AST precedence:
 /// Risk:Reward > AI TP for targets, and Manual SL / Trail SL floor the stop.
 /// Returns `(sl, tp, trail_pct, point_trail_points)`.
@@ -17908,7 +18057,12 @@ fn levels_for(
     // point stop is the exact point equivalent of the percentage stop. Unlinked,
     // the operator's manual points value (or the method-config jump) is used and
     // the two mechanisms compete. Available on every engine.
-    let link_points = settings.trail_points_from_pct && trail > 0.0 && ltp > 0.0;
+    // The point-trail box is authoritative: deriving a jump from the Trail SL %
+    // must never arm points the operator did not tick. "Pts = % (auto)" only
+    // changes WHERE the points come from (the % instead of the typed value); it
+    // does not by itself switch the point trail on.
+    let link_points =
+        settings.trail_points_from_pct && settings.manual_point_trail_sl && trail > 0.0 && ltp > 0.0;
     let point_trail = if link_points {
         round_to_tick(ltp * trail / 100.0).max(0.05)
     } else if settings.manual_point_trail_sl {
@@ -18863,7 +19017,40 @@ fn snap_of(rt: &RealtimeState) -> Value {
     // below while the lock is already held.
     let real_available = if rt.paper { 0.0 } else { rt.available_funds().unwrap_or(0.0) };
     let d = rt.doc.lock().unwrap_or_else(|e| e.into_inner());
-    let ltp_map = rt.ltp.lock().map(|m| m.clone()).unwrap_or_default();
+    let mut ltp_map = rt.ltp.lock().map(|m| m.clone()).unwrap_or_default();
+    // Overlay the LIVE websocket quote cache on top of the REST-seeded `ltp`
+    // map. The real engine only refreshes `ltp` via a throttled REST call (~3s),
+    // so without this the per-tick push (and the old 1s poll) kept painting P&L
+    // from an up-to-3s-old premium. Reading the shared Dhan feed cache here makes
+    // the open-position LTP - and therefore P&L / trail / SL display - tick at
+    // the websocket cadence, with zero extra REST calls.
+    {
+        // Positions are already borrowed from the held `d` guard above, so the
+        // cache read cannot deadlock against `self.doc`.
+        let secs: Vec<(i64, String)> = d
+            .positions
+            .iter()
+            .map(|p| (ji(p, "securityId"), js(p, "exchangeSegment")))
+            .collect();
+        if !secs.is_empty() {
+            if let Ok(q) = rt.dhan.market.quotes.lock() {
+                for (sid, exch) in secs {
+                    if sid <= 0 {
+                        continue;
+                    }
+                    let key = crate::market::quote_key(sid, &exch);
+                    if let Some(ltp) = q
+                        .get(&key)
+                        .and_then(|v| v.get("ltp"))
+                        .and_then(|x| x.as_f64())
+                        .filter(|p| *p > 0.0)
+                    {
+                        ltp_map.insert(sid, ltp);
+                    }
+                }
+            }
+        }
+    }
     let positions: Vec<Value> = d
         .positions
         .iter()
@@ -18896,6 +19083,10 @@ fn snap_of(rt: &RealtimeState) -> Value {
     let broker_positions = enrich_broker_positions(&broker_positions_raw, &ltp_map);
     let broker_holdings = rt.broker_holdings.lock().map(|h| h.clone()).unwrap_or_default();
     let movers = rt.movers_cache.lock().map(|g| g.1.clone()).unwrap_or(Value::Null);
+    // Liquid F&O scanner readout joined the snapshot so the pushed frames can
+    // refresh its chips at the same cadence as Top Movers - previously it rode
+    // on a separate REST call inside the 1s poll.
+    let liquid = rt.liquid_cache.lock().map(|g| g.1.clone()).unwrap_or(Value::Null);
     let picked_strikes = rt
         .picked_strikes
         .lock()
@@ -19181,6 +19372,7 @@ fn snap_of(rt: &RealtimeState) -> Value {
         "brokerPositions": broker_positions,
         "holdings": broker_holdings,
         "movers": movers,
+        "liquid": liquid,
         "niftyPicks": rt.nifty_picks.lock().map(|g| g.1.clone()).unwrap_or(Value::Null),
         "niftyTrend": nifty_trend,
         "blockers": rt.blockers_snapshot(30 * 60 * 1000),
@@ -19196,6 +19388,80 @@ fn snap_of(rt: &RealtimeState) -> Value {
 
 pub async fn snapshot(State(rt): State<RealtimeState>) -> impl IntoResponse {
     Json(snap_of(&rt))
+}
+
+/// Per-engine live snapshot push (`GET /api/<engine>/stream`).
+///
+/// The tab opens this websocket and receives a `{type:"rt-snapshot", data:{…}}`
+/// frame at the pusher cadence - the same payload the old 1s `/snapshot` poll
+/// returned, so the UI renders it through the identical code path. It sends an
+/// immediate snapshot on connect (no wait for the first push), answers app-level
+/// `ping` frames with `pong` (half-open detection), and resyncs from the newest
+/// broadcast on `Lagged` (a slow tab gets the freshest book instead of replaying
+/// stale frames). It only reads the same caches `snapshot` does, so it adds no
+/// REST/Dhan load.
+pub async fn stream_ws(ws: axum::extract::WebSocketUpgrade, State(rt): State<RealtimeState>) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| stream_loop(socket, rt))
+}
+
+async fn stream_loop(mut socket: axum::extract::ws::WebSocket, rt: RealtimeState) {
+    use axum::extract::ws::Message;
+    use futures_util::StreamExt;
+    let mut rx = rt.snap_bc.subscribe();
+    // Immediate initial frame so the tab paints without waiting for the cadence.
+    let initial = json!({ "type": "rt-snapshot", "data": snap_of(&rt) }).to_string();
+    if socket.send(Message::Text(initial)).await.is_err() {
+        return;
+    }
+    loop {
+        tokio::select! {
+            incoming = socket.next() => {
+                match incoming {
+                    Some(Ok(Message::Text(text))) => {
+                        // App-level liveness ping: answer at once so a half-open
+                        // tunnel is detected by the client's stale-frame timer.
+                        let is_ping = serde_json::from_str::<Value>(&text)
+                            .ok()
+                            .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(|s| s == "ping"))
+                            .unwrap_or(false);
+                        if is_ping {
+                            if socket
+                                .send(Message::Text("{\"type\":\"pong\"}".to_string()))
+                                .await
+                                .is_err()
+                            {
+                                break;
+                            }
+                        }
+                    }
+                    Some(Ok(Message::Ping(p))) => {
+                        let _ = socket.send(Message::Pong(p)).await;
+                    }
+                    Some(Ok(_)) => {}
+                    Some(Err(_)) | None => break,
+                }
+            }
+            broadcast = rx.recv() => {
+                match broadcast {
+                    Ok(msg) => {
+                        if socket.send(Message::Text(msg)).await.is_err() {
+                            break;
+                        }
+                    }
+                    // A slow tab fell behind the ring. Rather than replay stale
+                    // frames, hand it the newest full snapshot so it resyncs to
+                    // the freshest book in one frame.
+                    Err(broadcast::error::RecvError::Lagged(_)) => {
+                        let fresh = json!({ "type": "rt-snapshot", "data": snap_of(&rt) }).to_string();
+                        if socket.send(Message::Text(fresh)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        }
+    }
 }
 
 /// Full closed-trade ledger (newest first), fetched on demand by the UI instead
@@ -20743,6 +21009,7 @@ macro_rules! rt_routes {
     ($p:literal) => {
         Router::new()
             .route(concat!($p, "/snapshot"), get(snapshot))
+            .route(concat!($p, "/stream"), get(stream_ws))
             .route(concat!($p, "/closed"), get(closed_get))
             .route(concat!($p, "/settings"), post(settings_post))
             .route(concat!($p, "/method"), post(method_post))
@@ -22310,6 +22577,46 @@ mod gate_tests {
         assert!(
             rt.scanner_targets(&rt.doc().unwrap().settings).is_empty(),
             "this test covers the waiting state: the engine run set is still empty"
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_position_pnl_marks_to_the_live_websocket_quote() {
+        // The real engine only refreshes its `ltp` map through a throttled REST
+        // call (~3s), so the pushed snapshot must overlay the live websocket
+        // quote cache on top of it. Otherwise the per-tick push would paint P&L
+        // from a stale premium and the whole point of the fast stream is lost.
+        let market = crate::market::MarketState::new();
+        let dhan = crate::broker::DhanState::new(market.clone());
+        let rt = RealtimeState::new(dhan);
+        let sid = 55555;
+        // REST-seeded entry price; the live cache carries a NEWER premium.
+        if let Some(mut d) = rt.doc() {
+            d.positions.push(json!({
+                "id": "p1",
+                "securityId": sid,
+                "exchangeSegment": "NSE_FNO",
+                "side": "BUY",
+                "qty": 50,
+                "fillPrice": 100.0,
+                "entry": 100.0,
+            }));
+        }
+        market.set_quote(
+            crate::market::quote_key(sid, "NSE_FNO"),
+            json!({ "ltp": 125.0 }),
+        );
+        let snap = snap_of(&rt);
+        let pos = &snap["positions"][0];
+        assert_eq!(pos["ltp"], json!(125.0), "LTP comes from the live websocket cache");
+        assert_eq!(
+            pos["pnl"], json!(1250.0),
+            "(125 - 100) * 50 must be marked to the live premium"
+        );
+        // The pushed snapshot also carries the Liquid F&O readout now.
+        assert!(
+            snap.get("liquid").is_some(),
+            "snapshot must include the liquid scanner block for the push"
         );
     }
 
@@ -24923,6 +25230,27 @@ mod gate_tests {
     }
 
     #[test]
+    fn unchecked_point_trail_never_derives_from_the_percent_link() {
+        // "Pts = % (auto)" defaults to true, so a saved Trail SL % must not, by
+        // itself, arm a point trail the operator never ticked - the "Point Trail
+        // SL applies even when unchecked" report.
+        let mut s = Settings::default();
+        assert!(s.trail_points_from_pct, "link defaults on");
+        s.manual_trail_sl = true;
+        s.manual_trail_sl_pct = 10.0;
+        // Point trail box OFF, but a stale typed value is present.
+        s.manual_point_trail_sl = false;
+        s.manual_point_trail_sl_points = 999.0;
+        let (_, _, trail, pts) = levels_for(&s, &json!({}), "BUY", 50.0, 0.0, 0.0, 0.0);
+        assert!((trail - 10.0).abs() < 1e-9, "percent trail still armed");
+        assert_eq!(pts, 0.0, "unchecked point trail must stay 0, got {pts}");
+        // Ticking it now derives the jump from the percent link.
+        s.manual_point_trail_sl = true;
+        let (_, _, _, pts2) = levels_for(&s, &json!({}), "BUY", 50.0, 0.0, 0.0, 0.0);
+        assert!((pts2 - 5.0).abs() < 1e-9, "auto pts={pts2}");
+    }
+
+    #[test]
     fn percent_and_point_trails_compete_and_report_the_source() {
         // BUY 100, peak 30, 10% trail -> 127; auto points (10) -> 120. The
         // percentage is tighter, so it owns the exit.
@@ -25385,6 +25713,62 @@ mod gate_tests {
         s2.liquid_on = true;
         s2.liquid_list = vec![11536];
         assert!(p2.liquid_owned_ids(&s2).is_empty());
+    }
+
+    #[tokio::test]
+    async fn liquid_legs_follow_the_committed_nifty_direction() {
+        // While NIFTY Trend Following is ON it owns the Liquid F&O stock legs too:
+        // bullish arms only the Liquid top gainers (CE), bearish only the Liquid
+        // top losers (PE) - exactly like the Top Movers legs. Before the fix the
+        // liquid scanner kept building both sides regardless of the committed
+        // NIFTY direction, so a Liquid loser could enter a put during a bullish
+        // trend (and a gainer a call during a bearish one).
+        let market = crate::market::MarketState::new();
+        let dhan = crate::broker::DhanState::new(market);
+        let rt = RealtimeState::new_paper(dhan);
+        let gainer = 2885; // RELIANCE (liquid basket member)
+        let loser = 11536; // TCS (liquid basket member)
+        if let Ok(mut g) = rt.liquid_cache.lock() {
+            *g = (
+                now_ms(),
+                json!({
+                    "on": true,
+                    "gainers": [{"securityId": gainer, "last": 100.0}],
+                    "losers": [{"securityId": loser, "last": 100.0}],
+                    "added": []
+                }),
+            );
+        }
+        let mut s = Settings::default();
+        s.liquid_on = true;
+        s.nifty_trend_on = true;
+        s.filters.insert("BullSlTrend".into(), true);
+        s.filters.insert("BearSlTrend".into(), true);
+        let ce = format!("scan:{}:CE", gainer);
+        let pe = format!("scan:{}:PE", loser);
+        let has = |out: &[Strategy], key: &str| out.iter().any(|t| t.id == key);
+
+        // Bullish NIFTY -> Liquid top gainer CE only.
+        rt.nifty_dir.store(1, Ordering::Relaxed);
+        let out = rt.scanner_targets(&s);
+        assert!(has(&out, &ce), "bullish NIFTY arms the Liquid top gainer CE leg");
+        assert!(!has(&out, &pe), "bullish NIFTY must NOT arm the Liquid top loser PE leg");
+
+        // Bearish NIFTY -> Liquid top loser PE only.
+        rt.nifty_dir.store(-1, Ordering::Relaxed);
+        let out = rt.scanner_targets(&s);
+        assert!(has(&out, &pe), "bearish NIFTY arms the Liquid top loser PE leg");
+        assert!(!has(&out, &ce), "bearish NIFTY must NOT arm the Liquid top gainer CE leg");
+
+        // No committed direction -> no liquid leg (never guess a side).
+        rt.nifty_dir.store(0, Ordering::Relaxed);
+        let out = rt.scanner_targets(&s);
+        assert!(!has(&out, &ce) && !has(&out, &pe), "neutral NIFTY arms no liquid leg");
+
+        // Master OFF: both liquid sides build again (old behaviour).
+        s.nifty_trend_on = false;
+        let out = rt.scanner_targets(&s);
+        assert!(has(&out, &ce) && has(&out, &pe), "with the trend master off both liquid legs build");
     }
 
     #[test]
@@ -26225,6 +26609,51 @@ mod gate_tests {
         assert!(!spot_candle_color_ok(false, 100.0, 101.0), "bear + green must skip");
         assert!(!spot_candle_color_ok(false, 100.0, 100.0), "bear + doji must skip");
     }
+
+    #[test]
+    fn ai_atr_period_adapts_to_the_bars_available() {
+        // A freshly resolved option strike may have only a handful of bars; the
+        // AI risk modes must still produce a volatility read instead of silently
+        // returning nothing (which made "SL auto / AI Stop-Loss / AI TP %" look
+        // like they did nothing).
+        assert_eq!(atr_period_for_bars(3), 2, "3 bars -> 2-period ATR");
+        assert_eq!(atr_period_for_bars(5), 4);
+        assert_eq!(atr_period_for_bars(15), 14, "caps at the standard 14");
+        assert_eq!(atr_period_for_bars(60), 14, "never above 14");
+        assert_eq!(atr_period_for_bars(2), 2, "floor stays 2, never 0/1");
+        assert_eq!(atr_period_for_bars(0), 2);
+    }
+
+    #[test]
+    fn ai_levels_produce_values_from_short_series() {
+        // The adaptive ATR must yield a positive stop / target / trail off a
+        // short warm-up series, so `levels_for` actually applies the AI modes.
+        let candles = ramp(6, 100.0, 1.0);
+        let len = atr_period_for_bars(candles.len()) as f64;
+        let s: algo_core::model::Settings =
+            std::iter::once(("length".to_string(), json!(len))).collect();
+        let out = algo_core::compute("atr", &candles, &s);
+        let atr = out
+            .first()
+            .and_then(|s| s.data.last())
+            .map(|p| p.value)
+            .filter(|v| *v > 0.0)
+            .expect("short series must still produce a positive ATR");
+        let ltp = 100.0;
+        let (sl_mult, trail_mult, rr) = (1.5, 1.0, 3.0);
+        let (sl, tp, trail) = (ltp - sl_mult * atr, ltp + sl_mult * atr * rr, trail_mult * atr);
+        assert!(sl > 0.0 && sl < ltp, "stop below entry: {sl}");
+        assert!(tp > ltp, "target above entry: {tp}");
+        assert!(trail > 0.0, "trail positive: {trail}");
+        // And the levels are actually consumed by `levels_for` when the AI modes
+        // are ticked (this is the end-to-end guarantee the operator asked for).
+        let mut set = Settings::default();
+        set.ai_sl = true;
+        set.ai_tp_pct = true;
+        let (sl2, tp2, _, _) = levels_for(&set, &json!({}), "BUY", ltp, sl, tp, trail);
+        assert!((sl2 - sl.max(0.0)).abs() < 1e-9, "AI SL applied: {sl2}");
+        assert!((tp2 - tp.max(0.0)).abs() < 1e-9, "AI TP applied: {tp2}");
+    }
 }
 
 
@@ -26801,8 +27230,8 @@ mod account_tests {
     fn clearing_auto_trade_stops_entries_but_keeps_trade_protection() {
         let mut s = Settings::default();
         apply_auto_trade_preset(&mut s);
-        let (sl, trail, target) = (s.sl_auto, s.ai_trail_tp, s.target_auto_on);
-        assert!(sl && trail && target);
+        let (sl, target) = (s.sl_auto, s.target_auto_on);
+        assert!(sl && s.ai_trail_tp && target);
 
         clear_auto_trade_entry_gates(&mut s);
 
@@ -26811,9 +27240,15 @@ mod account_tests {
         assert!(!s.movers_on);
         assert!(!s.index_trend_on);
         assert!(!s.comm_trend_on);
-        // Protection untouched: an open trade must never lose its stop.
+        // The hidden preset trail has no operator checkbox, so it MUST be released
+        // here - otherwise every new entry would keep inheriting a trail the
+        // operator cannot see or turn off ("Trail SL applies even when
+        // unchecked"). Open positions are unaffected: each stores its own trail
+        // at entry.
+        assert!(!s.ai_trail_tp);
+        // Protection still read live by the manage loop must survive: an open
+        // trade must never lose its ATR stop or Target-Lab cut.
         assert_eq!(s.sl_auto, sl);
-        assert_eq!(s.ai_trail_tp, trail);
         assert_eq!(s.target_auto_on, target);
     }
 

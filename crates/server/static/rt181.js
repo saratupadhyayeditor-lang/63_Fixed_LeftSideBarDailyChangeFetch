@@ -175,6 +175,23 @@ let refreshSeq = 0;
 let refreshInFlight = false;
 let refreshQueued = false;
 let filtersBusy = false;
+// Live snapshot push (`/api/<engine>/stream`). The engine pushes the full
+// snapshot over a websocket at ~2.5 Hz, so the pane paints at feed cadence
+// instead of stepping once a second. REST is kept as a slow reconcile/fallback:
+// the 1s timer only re-fetches when the socket has gone quiet, so a healthy
+// stream costs zero REST while a dead one recovers in about a second.
+let streamWs = null;
+let streamConnected = false;
+let streamRetry = 0;
+let streamLastFrameAt = 0;
+let streamPingTimer = null;
+let streamWatchdog = null;
+let streamPingAt = 0;
+let lastSnapshot = null;
+let pendingPaint = false;
+// REST side-loaders (data pool / scanners / AST) run on this ~1s gate so the
+// faster push cadence cannot multiply Dhan/REST traffic.
+let lastSideLoadAt = 0;
 // The strike-selection base ("Only +green premium strikes" + "Opposite side
 // fallback") must stay ON because the "Execute Trade In" dropdown is designed to
 // run on it. If a legacy snapshot arrives with either off, it is turned back on
@@ -2953,7 +2970,7 @@ function wire() {
     };
   }
   const trPct = $("rtEngTrailSlPct");
-  if (trPct) trPct.oninput = () => pushSetting({ manualTrailSl: true, manualTrailSlPct: num(trPct.value) });
+  if (trPct) trPct.oninput = () => pushSetting({ manualTrailSl: !!(trCb && trCb.checked), manualTrailSlPct: num(trPct.value) });
   const netTpCb = $("rtEngNetTp");
   const netTpMin = $("rtEngNetTpMin");
   const netTpGb = $("rtEngNetTpGiveback");
@@ -2974,7 +2991,7 @@ function wire() {
     };
   }
   const ptrPts = $("rtEngPointTrailSlPts");
-  if (ptrPts) ptrPts.oninput = () => pushSetting({ manualPointTrailSl: true, manualPointTrailSlPoints: num(ptrPts.value) });
+  if (ptrPts) ptrPts.oninput = () => pushSetting({ manualPointTrailSl: !!(ptrCb && ptrCb.checked), manualPointTrailSlPoints: num(ptrPts.value) });
   const pfCb = $("rtEngPtsFromPct");
   if (pfCb)
     pfCb.onchange = () => {
@@ -4332,15 +4349,62 @@ function renderSnapshot(s) {
   // count moves (or on the slow throttle inside loadDayStats).
   loadDayStats(closedTotal);
   renderHoldings(s);
-  loadPool();
-  loadScanners();
-  loadAstSections();
+  // The pushed snapshot already carries the scanner readouts (`movers`, `liquid`)
+  // so they paint at push cadence here. The REST-backed side-loaders (pool / AST /
+  // diag, and the slower scanner refresh) are NOT fired per frame - they run on
+  // the ~1s `refreshSideLoaders` gate so a fast push cannot multiply REST load.
+  renderMoversFromSnapshot(s);
+  renderLiquidFromSnapshot(s);
   renderConditionLog();
   renderBlockers(s);
   renderQuickRun();
   renderStrikes();
   // Paper Trade 3 only: mirror the NIFTY-trend pane state to the parent chart.
   syncNiftyBbPctPane(s);
+}
+
+// Paint the Top Movers chips straight from the pushed snapshot's `movers` block.
+// This is the same markup `loadScanners` renders, but sourced from the snapshot
+// (no REST) so the readout tracks the push cadence. Falls back silently when the
+// block is missing so a scan still in progress never blanks the row.
+function renderMoversFromSnapshot(s) {
+  const m = s && s.movers;
+  if (!m || typeof m !== "object") return;
+  const ml = document.getElementById("rtMoversList");
+  if (!ml) return;
+  const cfg = (s && s.settings) || {};
+  if (!(cfg.moversOn && !cfg.manualStrikesEnabled)) {
+    ml.style.display = "none";
+    return;
+  }
+  const symName = (id) => {
+    const c = CATALOG.symbols.find((x) => num(x.id) === num(id));
+    return c ? c.name : id;
+  };
+  const chip = (r) =>
+    `<span style="display:inline-flex;align-items:center;gap:3px;background:#16163a;border:1px solid #2d2d50;border-radius:8px;padding:1px 4px;margin:1px">` +
+    `<span>${esc(symName(r.securityId))} (${num(r.changePct).toFixed(2)}%)</span>` +
+    `<button data-sc-remove="${num(r.securityId)}" data-sc-name="${esc(symName(r.securityId))}" title="Remove - engine will not pick/trade this" style="background:none;border:none;color:#ef5350;cursor:pointer;font-size:11px;padding:0 2px;line-height:1">\u00d7</button></span>`;
+  const fmt = (rows) => (rows || []).map(chip).join(" ") || "--";
+  ml.style.display = "block";
+  ml.innerHTML =
+    `<b style="color:#00d4aa">Gainers</b> ${fmt(m.gainers)}<br>` +
+    `<b style="color:#ef5350">Losers</b> ${fmt(m.losers)}<br>` +
+    `<span style="color:#888">Bias: ${m.bias > 0 ? "gainers lead -> CE" : m.bias < 0 ? "losers lead -> PE" : "balanced"}` +
+    ` (up ${num(m.up)} / down ${num(m.down)})</span>`;
+  ml.querySelectorAll("[data-sc-remove]").forEach((b) => {
+    b.onclick = (e) => {
+      e.preventDefault();
+      removeScannerPick(num(b.getAttribute("data-sc-remove")), b.getAttribute("data-sc-name"));
+    };
+  });
+}
+
+// Paint the Liquid F&O readout from the pushed snapshot's `liquid` block.
+function renderLiquidFromSnapshot(s) {
+  const m = s && s.liquid;
+  if (!m || typeof m !== "object") return;
+  renderLiquidReadout(m);
 }
 
 // Live Top Movers + NIFTY trend readouts (auto CE/PE side source).
@@ -4351,7 +4415,6 @@ async function loadScanners() {
   if (now - scannerPollAt < 250) return;
   scannerPollAt = now;
   const cfg = (STATE && STATE.settings) || {};
-  const ml = document.getElementById("rtMoversList");
   const tl = document.getElementById("rtNiftyTrendList");
   const cl = document.getElementById("rtCommodityStatus");
   const symName = (id) => {
@@ -4363,42 +4426,17 @@ async function loadScanners() {
   // instead of waiting for the next poll, and the commodity picker is always
   // populated regardless of the master toggle.
   //
-  // Liquid F&O readout is fetched FIRST and isolated in its own try/catch: the
-  // Top Movers endpoint can be slow (or briefly fail) and used to sit ahead of
-  // this block in one shared try, which starved #rtLiquidList - the readout
-  // never rendered while movers was awaiting. Each scanner now stands alone.
+  // Top Movers and Liquid F&O readouts now arrive in the pushed snapshot
+  // (`renderMoversFromSnapshot` / `renderLiquidFromSnapshot`), so this REST pass
+  // only fills what the snapshot does NOT carry: the one-time liquid universe for
+  // the picker, the NIFTY trend readout and the commodity picker.
   if (!PAPER2) {
     try {
       await loadLiquidUniverse();
-      const lq = await API.liquid();
-      renderLiquidReadout(lq);
     } catch (_e) { /* best-effort */ }
     syncLiquidSelects(cfg);
   }
   try {
-    const m = await API.movers();
-    if (ml && cfg.moversOn && !cfg.manualStrikesEnabled) {
-      ml.style.display = "block";
-      const chip = (r) =>
-        `<span style="display:inline-flex;align-items:center;gap:3px;background:#16163a;border:1px solid #2d2d50;border-radius:8px;padding:1px 4px;margin:1px">` +
-        `<span>${esc(symName(r.securityId))} (${num(r.changePct).toFixed(2)}%)</span>` +
-        `<button data-sc-remove="${num(r.securityId)}" data-sc-name="${esc(symName(r.securityId))}" title="Remove - engine will not pick/trade this" style="background:none;border:none;color:#ef5350;cursor:pointer;font-size:11px;padding:0 2px;line-height:1">\u00d7</button></span>`;
-      const fmt = (rows) => (rows || []).map(chip).join(" ") || "--";
-      ml.innerHTML =
-        `<b style="color:#00d4aa">Gainers</b> ${fmt(m && m.gainers)}<br>` +
-        `<b style="color:#ef5350">Losers</b> ${fmt(m && m.losers)}<br>` +
-        `<span style="color:#888">Bias: ${m && m.bias > 0 ? "gainers lead -> CE" : m && m.bias < 0 ? "losers lead -> PE" : "balanced"}` +
-        ` (up ${(m && m.up) || 0} / down ${(m && m.down) || 0})</span>`;
-      ml.querySelectorAll("[data-sc-remove]").forEach((b) => {
-        b.onclick = (e) => {
-          e.preventDefault();
-          removeScannerPick(num(b.getAttribute("data-sc-remove")), b.getAttribute("data-sc-name"));
-        };
-      });
-    } else if (ml) {
-      ml.style.display = "none";
-    }
-
     const t = await API.trend();
     if (tl && cfg.niftyTrendOn && !cfg.manualStrikesEnabled) {
       tl.style.display = "block";
@@ -8005,6 +8043,153 @@ function paintSections() {
   rt.querySelectorAll(".account-section").forEach((sec, i) => paint(sec, i + 3));
 }
 
+// ---------------------------------------------------------------------------
+// Live snapshot stream (`/api/<engine>/stream`)
+//
+// The engine pushes the full snapshot over a websocket at ~2.5 Hz so the pane
+// paints at feed cadence instead of stepping once a second. The rendered payload
+// is identical to the old 1s `/snapshot` REST response, so it flows through the
+// same `renderSnapshot` path. REST stays as a slow reconcile/fallback so a dead
+// socket (or a background-throttled one) never freezes the pane.
+// ---------------------------------------------------------------------------
+// A frame older than this means the socket is silent (tunnel drop / half-open):
+// repaint from REST and tear the socket down so `onclose` re-establishes it.
+const STREAM_STALE_MS = 6000;
+const STREAM_PING_MS = 4000;
+
+// Resolve the stream URL for THIS engine tab. Paper / Realtime-2/3 frames route
+// their REST calls through a patched `fetch` (`/api/rt` -> `/api/<engine>`), but a
+// websocket URL is built by us, so derive it from the same base the pane already
+// resolved for chart overlays instead of relying on the `fetch` rewrite.
+function streamBasePath() {
+  try {
+    if (window.__PAPER__) return window.__PAPER_BASE__ || "/api/paper";
+    return window.__RT_BASE__ || "/api/rt";
+  } catch (_) {
+    return "/api/rt";
+  }
+}
+
+function streamUrl() {
+  const loc = window.location;
+  const scheme = loc.protocol === "https:" ? "wss" : "ws";
+  return scheme + "://" + loc.host + streamBasePath() + "/stream";
+}
+
+function connectStream() {
+  if (streamWs) {
+    const st = streamWs.readyState;
+    if (st === WebSocket.OPEN || st === WebSocket.CONNECTING) return;
+  }
+  let ws;
+  try {
+    ws = new WebSocket(streamUrl());
+  } catch (_) {
+    scheduleStreamReconnect();
+    return;
+  }
+  streamWs = ws;
+  ws.onopen = () => {
+    streamConnected = true;
+    streamRetry = 0;
+    streamLastFrameAt = Date.now();
+    startStreamPing();
+  };
+  ws.onmessage = (ev) => {
+    let msg;
+    try {
+      msg = JSON.parse(ev.data);
+    } catch (_) {
+      return;
+    }
+    if (!msg || msg.type !== "rt-snapshot" || !msg.data) return;
+    streamLastFrameAt = Date.now();
+    lastSnapshot = msg.data;
+    schedulePaint();
+  };
+  ws.onclose = () => {
+    if (streamWs === ws) streamWs = null;
+    streamConnected = false;
+    stopStreamPing();
+    scheduleStreamReconnect();
+  };
+  ws.onerror = () => {
+    try { ws.close(); } catch (_) {}
+  };
+}
+
+function scheduleStreamReconnect() {
+  if (streamWatchdog) return;
+  const delay = Math.min(8000, 500 * Math.pow(2, Math.min(streamRetry, 4)));
+  streamRetry += 1;
+  streamWatchdog = setTimeout(() => {
+    streamWatchdog = null;
+    if (active()) {
+      // Paint from REST while the socket is being rebuilt so the pane stays
+      // fresh during a tunnel flap.
+      refresh();
+      connectStream();
+    }
+  }, delay);
+}
+
+function streamPingNow() {
+  if (streamWs && streamWs.readyState === WebSocket.OPEN) {
+    try { streamWs.send(JSON.stringify({ type: "ping" })); } catch (_) {}
+  }
+}
+
+function startStreamPing() {
+  stopStreamPing();
+  streamPingAt = Date.now();
+  streamPingTimer = setInterval(() => {
+    if (!streamWs || streamWs.readyState !== WebSocket.OPEN) return;
+    // A silent socket (no frame within the stale window) is torn down so its
+    // `onclose` rebuilds it - the same half-open detection the chart feed uses.
+    if (Date.now() - streamLastFrameAt > STREAM_STALE_MS) {
+      try { streamWs.close(); } catch (_) {}
+      return;
+    }
+    streamPingNow();
+  }, STREAM_PING_MS);
+}
+
+function stopStreamPing() {
+  if (streamPingTimer) {
+    clearInterval(streamPingTimer);
+    streamPingTimer = null;
+  }
+}
+
+// Coalesce pushed frames into one paint per animation frame: a burst of frames
+// (or a burst of feed ticks folded into several frames) collapses to a single
+// DOM render, never one per frame.
+function schedulePaint() {
+  if (pendingPaint) return;
+  pendingPaint = true;
+  const run = () => {
+    pendingPaint = false;
+    if (!lastSnapshot) return;
+    // A hidden tab keeps receiving frames (they refresh `lastSnapshot`, so the
+    // pane is current the instant it is shown again) but skips the heavy DOM
+    // repaint. The visibility handler repaints from REST on return.
+    if (!active()) return;
+    renderSnapshot(lastSnapshot);
+  };
+  if (typeof requestAnimationFrame === "function") requestAnimationFrame(run);
+  else setTimeout(run, 16);
+}
+
+// The REST-backed panels that are NOT part of the pushed snapshot. Kept on a
+// ~1s throttle instead of riding every frame.
+function refreshSideLoaders() {
+  lastSideLoadAt = Date.now();
+  loadPool();
+  loadScanners();
+  loadAstSections();
+  loadDiagThrottled();
+}
+
 export function bootRealtime() {
   if (booted) return;
   booted = true;
@@ -8013,12 +8198,28 @@ export function bootRealtime() {
   paintSections();
   bootLinkMonitor();
   loadCatalog();
+  // Paint the first frame from REST so the pane is never blank while the
+  // websocket handshake completes; the stream then takes over.
   refresh();
+  connectStream();
   timer = setInterval(() => {
-    if (active()) refresh();
+    if (!active()) return;
+    // The stream is the primary path. Only fall back to the REST poll when the
+    // socket is down (reconnecting) or has gone quiet past the stale window, so
+    // a healthy stream costs zero REST calls while a broken one still recovers.
+    const stale = !streamConnected || (Date.now() - streamLastFrameAt > STREAM_STALE_MS);
+    if (stale) refresh();
+    else if (Date.now() - lastSideLoadAt > 1000) refreshSideLoaders();
   }, 1000);
   document.addEventListener("visibilitychange", () => {
-    if (!document.hidden && active()) refresh();
+    if (document.hidden) return;
+    // Coming back to a hidden tab: the socket may have been throttled by the
+    // browser, so repaint from REST immediately and re-open if it died.
+    if (active()) {
+      refresh();
+      if (!streamConnected) connectStream();
+      else streamPingNow();
+    }
   });
   document.addEventListener("click", (e) => {
     const t = e.target;

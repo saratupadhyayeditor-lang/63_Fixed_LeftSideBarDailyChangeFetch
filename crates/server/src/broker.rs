@@ -476,16 +476,16 @@ impl DhanState {
         }
     }
 
-    /// Subscribe the scanner's UNDERLYING universe in Ticker mode (LTP only).
+    /// Subscribe the scanner's UNDERLYING universe in Quote mode.
     ///
-    /// The scanners re-register their whole universe on every pass, and the
-    /// universe only needs an LTP plus the prev-close backfill for its
-    /// gain/loss ranking - no volume, OI or depth. Sending it as Full pulled
-    /// 21-field quote packets for hundreds of underlyings on every pass, which
-    /// is where most of the websocket bandwidth (and the "corrupt message"
-    /// resets that churned the socket) came from. Option strikes still go
-    /// through [`Self::watch_options_now`] in Full mode because IV, OI and the
-    /// order pricing need them.
+    /// The scanners run a whole universe per pass and rank it by day change, so
+    /// each underlying needs the day close as well as the LTP. Quote mode
+    /// delivers both on every tick (and Dhan auto-sends the PrevClose + OI
+    /// packets for a Quote subscription), so the ranking no longer waits on a
+    /// REST prev-close backfill. Indices stay on Ticker: Dhan only emits the
+    /// compact Index Packet in that mode and a heavier mode stopped their ticks.
+    /// Option strikes still go through [`Self::watch_options_now`] in Full mode
+    /// because IV, OI and the order pricing need the depth packet.
     pub fn watch_scanner_now(&self, secs: &[(i64, String)]) {
         if secs.is_empty() {
             return;
@@ -529,7 +529,14 @@ impl DhanState {
         let subs: Vec<FeedSubscription> = fresh
             .iter()
             .filter_map(|(sid, exch)| {
-                exchange_segment(exch).map(|seg| FeedSubscription::with_mode(seg, *sid, FeedMode::Ticker))
+                exchange_segment(exch).map(|seg| {
+                    let mode = if exch.eq_ignore_ascii_case("IDX_I") {
+                        FeedMode::Ticker
+                    } else {
+                        FeedMode::Quote
+                    };
+                    FeedSubscription::with_mode(seg, *sid, mode)
+                })
             })
             .collect();
         if subs.is_empty() {
@@ -2436,9 +2443,19 @@ fn feed_subscriptions() -> Vec<FeedSubscription> {
     securities()
         .into_iter()
         .filter_map(|(sid, exch)| {
-            // Watchlist symbols and indices ride on Ticker mode; Dhan delivers
-            // IDX_I as an Index Packet (response code 1) only in this mode.
-            let mode = FeedMode::Ticker;
+            // Indices ride on Ticker mode: Dhan delivers IDX_I as a compact Index
+            // Packet (response code 1) only in this mode, and promoting an index
+            // to a heavier mode stopped its ticks on real accounts. Everything
+            // else (F&O stocks + MCX commodities) subscribes in Quote mode so
+            // every tick already carries the day OHLC + volume, and Dhan
+            // auto-sends the PrevClose and OI packets for a Quote subscription.
+            // That removes the REST round-trip that used to backfill the daily
+            // change seconds (or minutes) later.
+            let mode = if exch.eq_ignore_ascii_case("IDX_I") {
+                FeedMode::Ticker
+            } else {
+                FeedMode::Quote
+            };
             exchange_segment(&exch).map(|s| FeedSubscription::with_mode(s, sid, mode))
         })
         .collect()
@@ -2487,10 +2504,12 @@ fn live_quote(
     iv_at: &mut HashMap<String, Instant>,
     oi_base: &mut HashMap<String, f64>,
 ) -> Value {
-    // Dhan's feed never sends a PrevClose packet, so the authoritative previous
-    // close comes from the REST / daily-candle seed map. When a symbol is missing
-    // there, fall back to the last cached close so a live tick can never zero out
-    // an already-good change / change_pct.
+    // The authoritative previous close now arrives over the websocket: the
+    // PrevClose packet (auto-sent on every subscription, all modes) and the Quote
+    // / Full packets' day-close field both seed this map in the feed loop. The
+    // REST / daily-candle seed is only a fallback for a symbol that has not
+    // streamed yet. When it is still missing, fall back to the last cached close
+    // so a live tick can never zero out an already-good change / change_pct.
     let mut close = closes.get(key).copied().unwrap_or(0.0);
     if close <= 0.0 {
         close = market
@@ -2584,7 +2603,10 @@ async fn run_feed(
     let mut iv_at: HashMap<String, Instant> = HashMap::new();
     let mut oi_base: HashMap<String, f64> = HashMap::new();
     let mut pending: HashMap<String, Value> = HashMap::new();
-    let mut flush = tokio::time::interval(Duration::from_millis(400));
+    // Coalesce ticks into a short batch so a busy scanner does not flood the
+    // socket, but keep the window tight enough that prices feel live rather than
+    // stepping in visible chunks.
+    let mut flush = tokio::time::interval(Duration::from_millis(120));
     flush.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
@@ -2659,8 +2681,31 @@ async fn run_feed(
                 match pkt {
                     FeedPacket::PrevClose { segment, security_id, prev_close, .. } => {
                         if let Some(exch) = segment_exchange(segment) {
-                            if let Ok(mut g) = closes.lock() {
-                                g.insert(quote_key(security_id as i64, exch), prev_close as f64);
+                            if is_gift_nifty(security_id as i64, exch) {
+                                continue;
+                            }
+                            let key = quote_key(security_id as i64, exch);
+                            if prev_close > 0.0 {
+                                if let Ok(mut g) = closes.lock() {
+                                    g.insert(key.clone(), prev_close as f64);
+                                }
+                                // Dhan auto-sends this packet on every
+                                // subscription (all modes, including the compact
+                                // index Ticker). Republish the current LTP against
+                                // the fresh close right away so the daily change
+                                // shows on the websocket immediately instead of
+                                // waiting for the next trade tick or a REST seed.
+                                let ltp = market
+                                    .quotes
+                                    .lock()
+                                    .ok()
+                                    .and_then(|g| g.get(&key).and_then(|e| e.get("ltp")).and_then(|v| v.as_f64()))
+                                    .unwrap_or(0.0);
+                                if ltp > 0.0 {
+                                    let q = live_quote_locked(&closes, &key, security_id as i64, ltp, now, &market, &extras, &mut iv_at, &mut oi_base);
+                                    market.set_quote(key.clone(), q.clone());
+                                    pending.insert(key, q);
+                                }
                             }
                         }
                     }
@@ -2685,12 +2730,22 @@ async fn run_feed(
                             pending.insert(key, q);
                         }
                     }
-                    FeedPacket::Quote { segment, security_id, ltp, volume, .. } => {
+                    FeedPacket::Quote { segment, security_id, ltp, volume, day_close, .. } => {
                         if let Some(exch) = segment_exchange(segment) {
                             if is_gift_nifty(security_id as i64, exch) {
                                 continue;
                             }
                             let key = quote_key(security_id as i64, exch);
+                            // Quote mode carries the day close in the packet (Dhan
+                            // sends it once the session is closed; during the
+                            // session the auto-sent PrevClose packet covers it).
+                            // Seeding the shared close map right here makes the
+                            // daily change websocket-native - no REST backfill wait.
+                            if day_close > 0.0 {
+                                if let Ok(mut g) = closes.lock() {
+                                    g.insert(key.clone(), day_close as f64);
+                                }
+                            }
                             extras.entry(key.clone()).or_insert((0.0, 0.0, 0.0, 0.0)).0 = volume as f64;
                             let q = live_quote_locked(&closes, &key, security_id as i64, ltp as f64, now, &market, &extras, &mut iv_at, &mut oi_base);
                             if key.starts_with("IDX_I:") {
@@ -2701,12 +2756,20 @@ async fn run_feed(
                             pending.insert(key, q);
                         }
                     }
-                    FeedPacket::Full { segment, security_id, ltp, volume, oi, depth, .. } => {
+                    FeedPacket::Full { segment, security_id, ltp, volume, oi, day_close, depth, .. } => {
                         if let Some(exch) = segment_exchange(segment) {
                             if is_gift_nifty(security_id as i64, exch) {
                                 continue;
                             }
                             let key = quote_key(security_id as i64, exch);
+                            // Same day-close seeding as the Quote packet so a Full
+                            // (option strike) subscription also refreshes the daily
+                            // change straight from the websocket.
+                            if day_close > 0.0 {
+                                if let Ok(mut g) = closes.lock() {
+                                    g.insert(key.clone(), day_close as f64);
+                                }
+                            }
                             let (bid, ask) = depth
                                 .first()
                                 .map(|d| (d.bid_price as f64, d.ask_price as f64))
@@ -3150,12 +3213,12 @@ mod rate_hold_tests {
         assert!(!st.rate_limited());
     }
 
-    /// A scanner underlying is subscribed on Ticker mode; when the strike path
+    /// A scanner underlying is subscribed on Quote mode; when the strike path
     /// later asks for the SAME security id it must still emit a Full-mode
-    /// subscribe, otherwise the scanner's Ticker registration would silently
-    /// suppress the strike's IV/OI/volume stream.
+    /// subscribe, otherwise the scanner's Quote registration would silently
+    /// suppress the strike's IV/OI/volume/depth stream.
     #[tokio::test]
-    async fn scanner_ticker_does_not_block_full_promotion() {
+    async fn scanner_quote_does_not_block_full_promotion() {
         let st = state();
         let (tx, mut rx) = mpsc::unbounded_channel();
         if let Ok(mut g) = st.feed_tx.lock() {
@@ -3164,7 +3227,7 @@ mod rate_hold_tests {
         st.watch_scanner_now(&[(11536, "NSE_EQ".to_string())]);
         let first = rx.try_recv().expect("scanner subscribe must be sent");
         let FeedCommand::Subscribe(first) = first else { panic!("expected subscribe") };
-        assert_eq!(first[0].mode, FeedMode::Ticker);
+        assert_eq!(first[0].mode, FeedMode::Quote);
         // Re-running the scanner pass is deduplicated (no socket churn).
         st.watch_scanner_now(&[(11536, "NSE_EQ".to_string())]);
         assert!(rx.try_recv().is_err(), "repeat scanner pass must not resubscribe");
