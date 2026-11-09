@@ -8365,14 +8365,28 @@ impl RealtimeState {
             // the premium-only equivalent of the spot gate above: instead of one
             // chart deciding for the whole ladder, each strike decides for itself.
             if !premium_strikes.is_empty() {
+                // CRITICAL: the per-strike gate runs on each leg's OWN option
+                // PREMIUM chart, where BOTH a CE premium and a PE premium RISE
+                // when their leg is in favour. The spot convention (CE = bullish
+                // filters, PE = bearish filters) does NOT hold here: a put
+                // premium only rises while the underlying falls, so gating a PE
+                // leg with BEARISH filters on its premium fired the put exactly
+                // when that premium was FALLING (underlying rising) - the trade
+                // opened against the move and the trail/overall SL took the
+                // loss. Force the rising-premium (bullish) filter set for BOTH
+                // legs on the premium chart, exactly like the premium-only run
+                // mode already does; the SPOT gate above (and the scanner pin)
+                // still owns the true side, so nothing here guesses a side.
+                let mut premium_gate_settings = gate_settings.clone();
+                premium_gate_settings.premium_only = true;
                 for (s, c) in &premium_strikes {
                     let _gate_scope = IndScope::enter();
-                    let flip_on = gate_settings.flip_trigger_on;
+                    let flip_on = premium_gate_settings.flip_trigger_on;
                     let cond_ok = flip_on || synth || conditions_met(&s.conditions, c, offset);
                     let fg = if flip_on {
-                        flip_trigger_pass(&gate_settings, s, c, offset)
+                        flip_trigger_pass(&premium_gate_settings, s, c, offset)
                     } else {
-                        filter_gate(&gate_settings, s, c, offset)
+                        filter_gate(&premium_gate_settings, s, c, offset)
                     };
                     if cond_ok && fg {
                         passing_strikes.push(s.clone());
@@ -8383,7 +8397,7 @@ impl RealtimeState {
                             &format!("premium strike PASS {} -> {}", strat.name, s.trading_symbol),
                         );
                     } else {
-                        let gate_expl = filter_gate_explain(&gate_settings, s, c, offset);
+                        let gate_expl = filter_gate_explain(&premium_gate_settings, s, c, offset);
                         self.log_throttled(
                             &format!("strike-fail:{}:{}", strat.id, s.security_id),
                             60_000,
@@ -27507,6 +27521,50 @@ mod per_strike_premium_gate_tests {
             .collect();
         assert_eq!(fire, vec!["CE-ATM", "CE-OTM2"], "only rising strike charts fire");
         assert!(!fire.contains(&"CE-OTM1"), "a falling strike is never carried along");
+    }
+
+    /// A put leg's premium RISES only when the underlying FALLS. Gating that leg
+    /// with the SPOT bearish filters on its own premium chart (the old
+    /// behaviour) fired the put exactly when the premium was FALLING (the
+    /// underlying RISING) - an entry straight into the move that the
+    /// trail/overall SL then booked as a loss. The premium-chart gate must
+    /// instead require a RISING premium for BOTH legs, so a falling put premium
+    /// is a no-trade. This pins the fix that forces `premium_only` on the
+    /// per-strike premium gate.
+    #[test]
+    fn premium_gate_never_buys_a_put_into_a_falling_premium() {
+        let mut s = Settings::default();
+        s.filters.insert("BearIncDown".into(), true);
+        s.filters.insert("BullIncUp".into(), true);
+        let pe = Strategy {
+            category: "BEARISH".into(),
+            side: "BUY".into(),
+            ..Strategy::default()
+        };
+        let falling_premium = ramp(60, 200.0, -1.0);
+        let rising_premium = ramp(60, 100.0, 1.0);
+
+        // OLD (buggy) path: the spot-side gate passes a FALLING put premium,
+        // firing the put into the up-move.
+        assert!(!s.premium_only, "sanity: this is the non-premium spot-side gate");
+        assert!(
+            filter_gate(&s, &pe, &falling_premium, 0),
+            "demonstrates the bug: the spot-side gate passes a FALLING put premium"
+        );
+
+        // FIXED: the premium-chart gate forces the rising-premium (bullish) set
+        // for both legs, so a falling put premium is rejected and only a rising
+        // premium fires the put.
+        let mut premium_gate = s.clone();
+        premium_gate.premium_only = true;
+        assert!(
+            !filter_gate(&premium_gate, &pe, &falling_premium, 0),
+            "a falling put premium must NOT fire the put leg"
+        );
+        assert!(
+            filter_gate(&premium_gate, &pe, &rising_premium, 0),
+            "a rising put premium must pass for the put leg"
+        );
     }
 
     /// "Strike: Option Type" must narrow the universe, not just label it: Call
