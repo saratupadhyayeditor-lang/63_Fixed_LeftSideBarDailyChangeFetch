@@ -5510,6 +5510,12 @@ impl RealtimeState {
                 missing.push((*id, seg.clone()));
             }
         }
+        // Drop segments whose quote session is closed: the feed is "live" but a
+        // closed cash/F&O segment delivers no ticks, so the cache stays empty and
+        // this fallback would REST-fetch the whole universe every pass. Dhan
+        // answers those with an empty payload yet still spends the shared data
+        // slot and trips 429s that starve the sidebar's historical backfill.
+        missing.retain(|(_, seg)| crate::broker::segment_session_open(seg));
         if missing.is_empty() {
             if rows.is_empty() {
                 self.log_throttled(

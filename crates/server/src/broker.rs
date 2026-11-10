@@ -379,6 +379,14 @@ impl DhanState {
                 if !urgent && self.user_active() {
                     continue;
                 }
+                // Outside the exchange session nothing can fill/reject, so the
+                // 2s positions poll only burns the shared ~1 req/s data slot that
+                // the overnight sidebar backfill needs (it was tripping 429s that
+                // stretched one historical candle to ~19s). Poll slowly then, and
+                // always honour an urgent order-triggered kick immediately.
+                if !urgent && !market_open_now() {
+                    tokio::time::sleep(Duration::from_secs(55)).await;
+                }
                 self.dhan_acct_throttle().await;
                 let Some(client) = self.session_client().await else { continue };
                 match client.positions().await {
@@ -1102,6 +1110,14 @@ impl DhanState {
             std::collections::BTreeMap::new();
         for (sid, exch) in secs {
             if *sid <= 0 {
+                continue;
+            }
+            // Never spend Dhan's single data slot on a segment whose quote
+            // session is closed: it answers with an empty payload but still
+            // counts against the ~1 req/s budget, tripping 429s that starve the
+            // historical backfill (a lone candle then took ~18s). Callers fall
+            // back to the cached quote, which already holds the last close/ltp.
+            if !segment_session_open(exch) {
                 continue;
             }
             groups.entry(exch.to_uppercase()).or_default().push(*sid);
@@ -2434,6 +2450,38 @@ fn market_open_now() -> bool {
     secs >= 9 * 3600 + 15 * 60 && secs <= 23 * 3600 + 30 * 60
 }
 
+/// Whether the given exchange segment's quote session is open right now (IST).
+/// Dhan answers a CLOSED segment's `/marketfeed/quote` with an empty payload
+/// while still spending the shared ~1 req/s data slot, which starves the
+/// historical backfill (one candle then takes ~18s) and trips 429s. Callers use
+/// this to serve the cached quote instead of burning the slot for nothing.
+///
+/// Cash / F&O / index segments run 09:15-15:30 on weekdays; MCX commodities run
+/// the longer 09:00-23:30 evening session. Unknown segments are treated as open
+/// so a new segment is never silently starved of a live quote.
+pub(crate) fn segment_session_open(exch: &str) -> bool {
+    let ist = now_secs() + 19_800;
+    segment_session_open_at(exch, ist)
+}
+
+/// Pure core of [`segment_session_open`] (IST seconds since the epoch).
+pub(crate) fn segment_session_open_at(exch: &str, ist: i64) -> bool {
+    let days = ist.div_euclid(86_400);
+    let weekday = (days + 4).rem_euclid(7);
+    let secs = ist.rem_euclid(86_400);
+    let weekend = weekday == 0 || weekday == 6;
+    match exch.to_uppercase().as_str() {
+        "MCX_COMM" => {
+            !weekend && secs >= 9 * 3600 && secs <= 23 * 3600 + 30 * 60
+        }
+        "NSE_EQ" | "BSE_EQ" | "NSE_FNO" | "BSE_FNO" | "IDX_I" | "NSE_CURRENCY"
+        | "BSE_CURRENCY" => {
+            !weekend && secs >= 9 * 3600 + 15 * 60 && secs <= 15 * 3600 + 30 * 60
+        }
+        _ => true,
+    }
+}
+
 /// Derived connection link state for the header/popups and the disconnect
 /// monitor. Pure (no state) so it can be unit-tested exhaustively:
 /// - `offline`    no Dhan session at all -> needs Client ID + Token
@@ -3551,6 +3599,32 @@ mod rate_hold_tests {
         // Weekend: Saturday and Sunday are closed all day.
         assert!(!cash_session_open_at(1_794_657_600), "Saturday");
         assert!(!cash_session_open_at(1_794_744_000), "Sunday");
+    }
+
+    #[test]
+    fn segment_session_window_gates_each_exchange() {
+        // 2026-11-10 00:00 IST, a Tuesday.
+        let day0 = 1_794_268_800i64;
+        let at = |h: i64, m: i64| day0 + h * 3600 + m * 60;
+        // Cash / F&O / index: 09:15-15:30 only.
+        for seg in ["NSE_EQ", "BSE_EQ", "NSE_FNO", "BSE_FNO", "IDX_I"] {
+            assert!(!segment_session_open_at(seg, at(9, 14)), "{seg} pre-open");
+            assert!(segment_session_open_at(seg, at(9, 15)), "{seg} open");
+            assert!(segment_session_open_at(seg, at(15, 30)), "{seg} close edge");
+            assert!(!segment_session_open_at(seg, at(15, 31)), "{seg} post-close");
+            assert!(!segment_session_open_at(seg, at(20, 0)), "{seg} evening");
+        }
+        // MCX runs the longer 09:00-23:30 evening session.
+        assert!(!segment_session_open_at("MCX_COMM", at(8, 59)));
+        assert!(segment_session_open_at("MCX_COMM", at(9, 0)));
+        assert!(segment_session_open_at("MCX_COMM", at(20, 0)));
+        assert!(segment_session_open_at("MCX_COMM", at(23, 30)));
+        assert!(!segment_session_open_at("MCX_COMM", at(23, 31)));
+        // Unknown segments stay open so a new one is never silently starved.
+        assert!(segment_session_open_at("SOMETHING_NEW", at(20, 0)));
+        // Weekends close every segment all day.
+        assert!(!segment_session_open_at("MCX_COMM", 1_794_657_600), "Saturday");
+        assert!(!segment_session_open_at("NSE_EQ", 1_794_744_000), "Sunday");
     }
 
     #[test]
