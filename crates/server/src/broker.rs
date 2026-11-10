@@ -1458,6 +1458,18 @@ impl DhanState {
         // Publish the previous session's cached closes before any Dhan call, so
         // the sidebar paints its daily-change column immediately on startup.
         self.load_prev_close_cache();
+        // Keep the saved LTPs fresh while live ticks stream in: without this the
+        // snapshot would hold only the prices from the first backfill pass, and a
+        // later same-day reload would paint stale values.
+        {
+            let st = self.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                    st.save_prev_close_cache();
+                }
+            });
+        }
         let st = self.clone();
         tokio::spawn(async move { st.daily_fill_loop().await });
     }
@@ -1472,7 +1484,10 @@ impl DhanState {
         let Ok(store): Result<PrevCloseStore, _> = serde_json::from_str(&text) else {
             return;
         };
-        // A stale snapshot would show the wrong daily change; only reuse today's.
+        // A snapshot from another session carries the wrong previous close, so
+        // only today's is reused for the change% math. (The historical backfill
+        // covers the next session; this cache exists to kill the blank/slow
+        // sidebar after a same-day reload.)
         if store.day != ist_day_string() || store.closes.is_empty() {
             return;
         }
@@ -1486,49 +1501,63 @@ impl DhanState {
             if *close <= 0.0 {
                 continue;
             }
-            let cached = self
-                .market
-                .quotes
-                .lock()
-                .ok()
-                .and_then(|g| g.get(k).cloned());
-            let ltp = cached
-                .as_ref()
-                .and_then(|v| v.get("ltp"))
-                .and_then(|v| v.as_f64())
+            // Price to paint: the last traded price saved with the snapshot. On
+            // a same-day reload the exchange is usually closed, so this is the
+            // same last print the previous run showed - correct, not synthetic.
+            let ltp = store
+                .ltps
+                .get(k)
+                .copied()
+                .filter(|v| *v > 0.0)
                 .unwrap_or(0.0);
-            // Keep whatever LTP is already cached; the live tick replaces it.
-            let Some(base) = cached else {
-                continue;
-            };
             if ltp <= 0.0 {
-                let _ = base;
                 continue;
             }
             let change = ltp - *close;
             let pct = change / *close * 100.0;
-            let mut q = base;
-            q["ltp"] = json!(round2(ltp));
-            q["close"] = json!(round2(*close));
-            q["change"] = json!(round2(change));
-            q["change_pct"] = json!(round2(pct));
+            let q = json!({
+                "ltp": round2(ltp),
+                "close": round2(*close),
+                "change": round2(change),
+                "change_pct": round2(pct),
+                "at": now_secs(),
+                "live": 1,
+                "cached": 1,
+            });
             self.market.set_quote(k.clone(), q.clone());
             published.insert(k.clone(), q);
         }
         if !published.is_empty() {
+            tracing::info!(
+                "prev-close cache restored {} sidebar rows from {}",
+                published.len(),
+                store.day
+            );
             self.market.broadcast_quotes(&published);
         }
     }
 
-    /// Persist the current `closes` map (called after a successful seed pass).
+    /// Persist the current `closes` map plus each row's last traded price.
     fn save_prev_close_cache(&self) {
         let closes = self.closes.lock().map(|g| g.clone()).unwrap_or_default();
         if closes.is_empty() {
             return;
         }
+        // Snapshot every cached LTP so the next start can paint the day-change
+        // column immediately (a close alone cannot produce a change).
+        let quotes = self.market.quotes.lock().map(|g| g.clone()).unwrap_or_default();
+        let mut ltps: HashMap<String, f64> = HashMap::new();
+        for (k, v) in &quotes {
+            if let Some(ltp) = v.get("ltp").and_then(|x| x.as_f64()) {
+                if ltp > 0.0 && closes.contains_key(k) {
+                    ltps.insert(k.clone(), ltp);
+                }
+            }
+        }
         let store = PrevCloseStore {
             day: ist_day_string(),
             closes,
+            ltps,
         };
         if let Ok(bytes) = serde_json::to_vec(&store) {
             let path = prev_close_path();
@@ -1547,6 +1576,9 @@ impl DhanState {
         // Let the REST quote snapshot seed the cache first (the old app waited
         // 12s) so most symbols are already filled and we never flood Dhan.
         tokio::time::sleep(Duration::from_secs(12)).await;
+        // Last time the on-disk snapshot was refreshed (see the periodic save in
+        // the loop below). Starts in the past so the first pass always writes.
+        let mut last_save = Instant::now() - Duration::from_secs(60);
         loop {
             // Seed as long as a Dhan session exists - a closed market must still
             // show each symbol's previous close / daily change. A disconnected
@@ -1613,13 +1645,17 @@ impl DhanState {
             // to saturate Dhan's single data slot for minutes, tripping 429s that
             // then starved the very REST seed meant to fill the sidebar - the
             // reason F&O stocks and commodities stayed blank while a handful of
-            // indices (priority + quick) got through. Cap the work per pass and
-            // bail out the moment the gate is holding a 429 penalty.
-            const DAILY_FILL_PER_PASS: usize = 12;
+            // indices (priority + quick) got through. While the cash session is
+            // OPEN cap the work per pass (the REST seed competes for the slot);
+            // when it is CLOSED that seed is skipped, so this historical path is
+            // the only source left and it runs the full list - otherwise the
+            // sidebar would still fill "one by one" overnight.
+            let cash_open = cash_session_open_now();
+            let per_pass = if cash_open { 12 } else { usize::MAX };
             let mut processed = 0usize;
             let mut filled_this_pass = 0usize;
             for (sid, exch) in list {
-                if processed >= DAILY_FILL_PER_PASS {
+                if processed >= per_pass {
                     break;
                 }
                 if self.rate_limited() {
@@ -1633,14 +1669,22 @@ impl DhanState {
                     .ok()
                     .and_then(|g| g.get(&key).cloned());
                 let is_synth = cached.as_ref().and_then(|v| v.get("synth")).is_some();
-                let has_close = !is_synth
-                    && cached
-                        .as_ref()
-                        .and_then(|v| v.get("close"))
-                        .and_then(|c| c.as_f64())
-                        .map(|c| c > 0.0)
-                        .unwrap_or(false);
-                if has_close {
+                let close_val = cached
+                    .as_ref()
+                    .and_then(|v| v.get("close"))
+                    .and_then(|c| c.as_f64())
+                    .unwrap_or(0.0);
+                let ltp_val = cached
+                    .as_ref()
+                    .and_then(|v| v.get("ltp"))
+                    .and_then(|c| c.as_f64())
+                    .unwrap_or(0.0);
+                let has_close = !is_synth && close_val > 0.0;
+                // A row needs BOTH a close and a price to show a daily change.
+                // Dhan's PrevClose packet fills `close` without an LTP, so
+                // skipping on `has_close` alone left those rows blank forever -
+                // the sidebar showed a dash even though its close was known.
+                if has_close && ltp_val > 0.0 {
                     continue;
                 }
                 // Option strikes get their previous close from the batched chain
@@ -1695,9 +1739,12 @@ impl DhanState {
             }
             // Persist the newest closes so the next start paints the sidebar from
             // disk instead of re-fetching the whole catalog over the rate-limited
-            // quote/candle APIs.
-            if filled_this_pass > 0 {
+            // quote/candle APIs. A live session fills the rows from ticks (so this
+            // pass finds nothing to do), hence the periodic refresh below keeps
+            // the saved LTPs current rather than frozen at the first pass.
+            if filled_this_pass > 0 || last_save.elapsed() >= Duration::from_secs(30) {
                 self.save_prev_close_cache();
+                last_save = Instant::now();
             }
             // A rate-limited pass must not spin: wait out the penalty before the
             // next pass instead of hammering the closed gate every 2s.
@@ -1778,14 +1825,20 @@ impl DhanState {
                     .ok()
                     .and_then(|g| g.get(&key).cloned());
                 let is_synth = cached.as_ref().and_then(|v| v.get("synth")).is_some();
-                let has_close = !is_synth
-                    && cached
-                        .as_ref()
-                        .and_then(|v| v.get("close"))
-                        .and_then(|c| c.as_f64())
-                        .map(|c| c > 0.0)
-                        .unwrap_or(false);
-                !has_close
+                let close_val = cached
+                    .as_ref()
+                    .and_then(|v| v.get("close"))
+                    .and_then(|c| c.as_f64())
+                    .unwrap_or(0.0);
+                let ltp_val = cached
+                    .as_ref()
+                    .and_then(|v| v.get("ltp"))
+                    .and_then(|c| c.as_f64())
+                    .unwrap_or(0.0);
+                // Keep any row that still lacks EITHER half of the daily change.
+                // A PrevClose-only row has a close but no price, and the REST
+                // quote is the cheapest way to fill that price.
+                !(!is_synth && close_val > 0.0 && ltp_val > 0.0)
             });
             if !list.is_empty() {
                 self.prev_close_attempts
@@ -3190,6 +3243,12 @@ struct PrevCloseStore {
     day: String,
     #[serde(default)]
     closes: HashMap<String, f64>,
+    /// Last traded price seen for each quote key when the snapshot was written.
+    /// Previous close alone cannot paint a row (change = ltp - close), so the
+    /// price has to travel with it - otherwise a restart shows an empty
+    /// daily-change column until the slow historical backfill reaches each row.
+    #[serde(default)]
+    ltps: HashMap<String, f64>,
 }
 
 fn prev_close_path() -> std::path::PathBuf {
@@ -3500,20 +3559,29 @@ mod rate_hold_tests {
         let mut closes = HashMap::new();
         closes.insert("IDX_I:13".to_string(), 24_986.4);
         closes.insert("2885".to_string(), 1_324.0);
+        let mut ltps = HashMap::new();
+        ltps.insert("IDX_I:13".to_string(), 25_044.65);
+        ltps.insert("2885".to_string(), 1_324.4);
         let today = PrevCloseStore {
             day: ist_day_string(),
             closes: closes.clone(),
+            ltps: ltps.clone(),
         };
         let text = serde_json::to_string(&today).unwrap();
         let back: PrevCloseStore = serde_json::from_str(&text).unwrap();
         assert_eq!(back.day, today.day);
         assert_eq!(back.closes.len(), 2);
         assert_eq!(back.closes["IDX_I:13"], 24_986.4);
+        // The LTP travels with the close, so a reload can paint change% at once.
+        assert_eq!(back.ltps["IDX_I:13"], 25_044.65);
+        let change = back.ltps["IDX_I:13"] - back.closes["IDX_I:13"];
+        assert!((change - 58.25).abs() < 1e-6);
 
         // A snapshot from another session must be rejected, not reused.
         let stale = PrevCloseStore {
             day: "1999-01-01".to_string(),
             closes,
+            ltps,
         };
         assert_ne!(stale.day, ist_day_string());
     }
