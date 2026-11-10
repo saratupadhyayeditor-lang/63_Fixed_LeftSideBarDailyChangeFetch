@@ -305,6 +305,15 @@ pub struct DhanState {
     /// Throttles position-poll failure logging so an expired token does not
     /// write a warning every 2 seconds.
     positions_warn_at: Arc<Mutex<Instant>>,
+    /// Set once the batched REST prev-close seed has completed a pass. The
+    /// per-symbol daily-candle fallback waits for this so it cannot starve the
+    /// seed of Dhan's single data slot (which used to leave F&O stocks and
+    /// commodities blank while only the priority indices got filled).
+    prev_close_seeded: Arc<std::sync::atomic::AtomicBool>,
+    /// Number of seed passes attempted. Used as a safety valve: if the batched
+    /// seed keeps failing (Dhan down / no quote for the set), the per-symbol
+    /// fallback must not wait forever, so it starts after a few attempts.
+    prev_close_attempts: Arc<std::sync::atomic::AtomicU32>,
 }
 
 impl DhanState {
@@ -332,6 +341,8 @@ impl DhanState {
             positions_cache: Arc::new(Mutex::new(Vec::new())),
             positions_kick: Arc::new(tokio::sync::Notify::new()),
             positions_warn_at: Arc::new(Mutex::new(Instant::now() - Duration::from_secs(60))),
+            prev_close_seeded: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            prev_close_attempts: Arc::new(std::sync::atomic::AtomicU32::new(0)),
         };
         st.spawn_daily_fill();
         st.spawn_seed_prev_close();
@@ -1444,8 +1455,88 @@ impl DhanState {
     }
 
     fn spawn_daily_fill(&self) {
+        // Publish the previous session's cached closes before any Dhan call, so
+        // the sidebar paints its daily-change column immediately on startup.
+        self.load_prev_close_cache();
         let st = self.clone();
         tokio::spawn(async move { st.daily_fill_loop().await });
+    }
+
+    /// Restore `closes` from the on-disk snapshot and publish one quote row per
+    /// symbol that has no live price yet, so the sidebar's day-change column is
+    /// populated the instant the app starts - before Dhan answers anything.
+    fn load_prev_close_cache(&self) {
+        let Ok(text) = std::fs::read_to_string(prev_close_path()) else {
+            return;
+        };
+        let Ok(store): Result<PrevCloseStore, _> = serde_json::from_str(&text) else {
+            return;
+        };
+        // A stale snapshot would show the wrong daily change; only reuse today's.
+        if store.day != ist_day_string() || store.closes.is_empty() {
+            return;
+        }
+        if let Ok(mut c) = self.closes.lock() {
+            for (k, v) in &store.closes {
+                c.insert(k.clone(), *v);
+            }
+        }
+        let mut published: HashMap<String, Value> = HashMap::new();
+        for (k, close) in &store.closes {
+            if *close <= 0.0 {
+                continue;
+            }
+            let cached = self
+                .market
+                .quotes
+                .lock()
+                .ok()
+                .and_then(|g| g.get(k).cloned());
+            let ltp = cached
+                .as_ref()
+                .and_then(|v| v.get("ltp"))
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            // Keep whatever LTP is already cached; the live tick replaces it.
+            let Some(base) = cached else {
+                continue;
+            };
+            if ltp <= 0.0 {
+                let _ = base;
+                continue;
+            }
+            let change = ltp - *close;
+            let pct = change / *close * 100.0;
+            let mut q = base;
+            q["ltp"] = json!(round2(ltp));
+            q["close"] = json!(round2(*close));
+            q["change"] = json!(round2(change));
+            q["change_pct"] = json!(round2(pct));
+            self.market.set_quote(k.clone(), q.clone());
+            published.insert(k.clone(), q);
+        }
+        if !published.is_empty() {
+            self.market.broadcast_quotes(&published);
+        }
+    }
+
+    /// Persist the current `closes` map (called after a successful seed pass).
+    fn save_prev_close_cache(&self) {
+        let closes = self.closes.lock().map(|g| g.clone()).unwrap_or_default();
+        if closes.is_empty() {
+            return;
+        }
+        let store = PrevCloseStore {
+            day: ist_day_string(),
+            closes,
+        };
+        if let Ok(bytes) = serde_json::to_vec(&store) {
+            let path = prev_close_path();
+            let tmp = path.with_extension("json.tmp");
+            if std::fs::write(&tmp, bytes).is_ok() {
+                let _ = std::fs::rename(&tmp, &path);
+            }
+        }
     }
 
     /// Walk the registered watch set and backfill change / change_pct from daily
@@ -1462,6 +1553,24 @@ impl DhanState {
             // (no-session) state stops this, so nothing is seeded while offline.
             if self.client().await.is_none() {
                 tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+            // Give the batched REST prev-close seed first claim on the data slot.
+            // This per-symbol historical fallback used to run first and burn the
+            // whole ~1 req/s budget on 189 separate candle calls, so the single
+            // batched quote call that fills the ENTIRE sidebar kept coming back
+            // 429 - exactly why indices trickled in one by one while F&O stocks
+            // and commodities stayed blank. After a few failed seed attempts the
+            // fallback starts anyway so a broken batch cannot block it forever.
+            if !self
+                .prev_close_seeded
+                .load(std::sync::atomic::Ordering::Relaxed)
+                && self
+                    .prev_close_attempts
+                    .load(std::sync::atomic::Ordering::Relaxed)
+                    < 3
+            {
+                tokio::time::sleep(Duration::from_millis(500)).await;
                 continue;
             }
             // Yield Dhan's single data slot while the operator is interacting
@@ -1498,7 +1607,24 @@ impl DhanState {
                 "NSE_EQ" => 2,
                 _ => 3,
             });
+            // This is a *fallback*, not the primary fill: the batched REST quote
+            // seed covers the whole sidebar in one call per segment. Walking the
+            // 189-symbol catalog here with one historical-candle call each used
+            // to saturate Dhan's single data slot for minutes, tripping 429s that
+            // then starved the very REST seed meant to fill the sidebar - the
+            // reason F&O stocks and commodities stayed blank while a handful of
+            // indices (priority + quick) got through. Cap the work per pass and
+            // bail out the moment the gate is holding a 429 penalty.
+            const DAILY_FILL_PER_PASS: usize = 12;
+            let mut processed = 0usize;
+            let mut filled_this_pass = 0usize;
             for (sid, exch) in list {
+                if processed >= DAILY_FILL_PER_PASS {
+                    break;
+                }
+                if self.rate_limited() {
+                    break;
+                }
                 let key = quote_key(sid, &exch);
                 let cached = self
                     .market
@@ -1563,9 +1689,20 @@ impl DhanState {
                     one.insert(key, q);
                     self.market.broadcast_quotes(&one);
                 }
+                processed += 1;
+                filled_this_pass += 1;
                 tokio::time::sleep(Duration::from_millis(200)).await;
             }
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            // Persist the newest closes so the next start paints the sidebar from
+            // disk instead of re-fetching the whole catalog over the rate-limited
+            // quote/candle APIs.
+            if filled_this_pass > 0 {
+                self.save_prev_close_cache();
+            }
+            // A rate-limited pass must not spin: wait out the penalty before the
+            // next pass instead of hammering the closed gate every 2s.
+            let wait = if self.rate_limited() { 30 } else { 2 };
+            tokio::time::sleep(Duration::from_secs(wait)).await;
         }
     }
 
@@ -1587,11 +1724,30 @@ impl DhanState {
     async fn seed_prev_close_loop(&self) {
         // Let the session settle before the first call.
         tokio::time::sleep(Duration::from_secs(3)).await;
+        // Consecutive clean-but-empty REST passes. Dhan legitimately answers
+        // `{}` for a segment whose session is closed, so a short 5s retry would
+        // hammer it (and trip 429s). Back off 30s, 60s, 90s, then 120s.
+        let mut empty_passes: u32 = 0;
         loop {
             // Refresh the previous close as long as a Dhan session exists, so a
             // closed market still shows history. Offline (no session) stops it.
             if self.client().await.is_none() {
                 tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+            // Outside exchange hours Dhan answers the cash quote API with an empty
+            // `NSE_EQ: {}` (see the `status=success` probe), yet that call still
+            // consumes the shared ~1 req/s data slot and trips 429s. Skip it while
+            // the cash session is closed and let the per-symbol daily-candle
+            // fallback fill prev-close / daily change from history - that is what
+            // keeps the F&O rows populated overnight and on holidays.
+            if !cash_session_open_now() {
+                // No cash quotes to seed right now, so release the per-symbol
+                // daily-candle fallback immediately - otherwise it would wait on
+                // a seed pass that never runs and every F&O row stays blank.
+                self.prev_close_seeded
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
+                tokio::time::sleep(Duration::from_secs(120)).await;
                 continue;
             }
             // Yield Dhan's single data slot while the operator is interacting
@@ -1632,6 +1788,8 @@ impl DhanState {
                 !has_close
             });
             if !list.is_empty() {
+                self.prev_close_attempts
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if let Some(real) = self.fetch_rest_quotes(&list).await {
                     let mut accepted: HashMap<String, Value> = HashMap::new();
                     for (k, v) in &real {
@@ -1668,6 +1826,30 @@ impl DhanState {
                     if !accepted.is_empty() {
                         self.market.broadcast_quotes(&accepted);
                     }
+                    // The batched seed has now had its first clean pass, so the
+                    // per-symbol daily-candle fallback may start using the slot.
+                    self.prev_close_seeded
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
+                    if !accepted.is_empty() {
+                        self.save_prev_close_cache();
+                    }
+                    // A clean-but-empty pass means Dhan has nothing to quote for
+                    // this set right now (a closed cash session returns
+                    // `NSE_EQ: {}` with `status=success`). Back off instead of
+                    // re-asking every few seconds: the per-symbol daily-candle
+                    // fallback fills those rows from history in the meantime.
+                    if accepted.is_empty() {
+                        empty_passes = empty_passes.saturating_add(1);
+                        let wait = (30u64 * empty_passes as u64).min(120);
+                        tokio::time::sleep(Duration::from_secs(wait)).await;
+                        continue;
+                    }
+                    empty_passes = 0;
+                } else {
+                    // Rate-limited / no session: retry once the adaptive gate
+                    // reopens, don't wait the long quiet interval.
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                    continue;
                 }
             }
             tokio::time::sleep(Duration::from_secs(120)).await;
@@ -2168,6 +2350,26 @@ impl DhanState {
 /// True during the Indian exchange session (IST 09:15-23:30, Mon-Fri), which
 /// covers both the cash/F&O day and the MCX evening session. Used to gate the
 /// silent-feed watchdog so a closed market does not cause reconnect churn.
+/// True during the NSE/BSE cash session (09:15-15:30 IST, weekdays). Used to
+/// skip the REST quote seed outside hours: Dhan answers the cash segment with an
+/// empty payload then, yet the call still burns the shared data slot.
+fn cash_session_open_now() -> bool {
+    let ist = now_secs() + 19_800;
+    cash_session_open_at(ist)
+}
+
+/// Pure core of [`cash_session_open_now`] (IST seconds since the epoch) so the
+/// weekday/time boundaries can be unit-tested without depending on the clock.
+fn cash_session_open_at(ist: i64) -> bool {
+    let days = ist.div_euclid(86_400);
+    let weekday = (days + 4).rem_euclid(7);
+    if weekday == 0 || weekday == 6 {
+        return false;
+    }
+    let secs = ist.rem_euclid(86_400);
+    secs >= 9 * 3600 + 15 * 60 && secs <= 15 * 3600 + 30 * 60
+}
+
 fn market_open_now() -> bool {
     let ist = now_secs() + 19_800; // UTC -> IST
     let days = ist.div_euclid(86_400);
@@ -2973,6 +3175,41 @@ fn now_secs() -> i64 {
         .unwrap_or(0)
 }
 
+/// On-disk previous-close snapshot, keyed by quote key.
+///
+/// The sidebar's daily change is `ltp - prev_close`. `prev_close` is a per-day
+/// constant, yet it only ever lived in memory, so every restart (and every
+/// reconnect before the seed loop ran) re-derived the whole catalog from Dhan's
+/// rate-limited quote/candle APIs - which is why the left sidebar showed blank
+/// F&O rows and filled in "slowly, one by one". Persisting the map makes the
+/// next start paint the whole sidebar from the last session instantly.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct PrevCloseStore {
+    /// Trading day the snapshot belongs to (IST yyyy-mm-dd).
+    #[serde(default)]
+    day: String,
+    #[serde(default)]
+    closes: HashMap<String, f64>,
+}
+
+fn prev_close_path() -> std::path::PathBuf {
+    let dir = std::env::var("ALGODHAN_DATA_DIR")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from("data"));
+    let _ = std::fs::create_dir_all(&dir);
+    dir.join("algodhan_prev_close.json")
+}
+
+/// IST calendar day used to reject a stale snapshot (a previous close from an
+/// older session would show a wrong daily change).
+fn ist_day_string() -> String {
+    let ist = now_secs() + 19_800;
+    let (y, m, d) = civil_from_days(ist.div_euclid(86_400));
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
 /// Days since Unix epoch to (year, month, day) - Howard Hinnant's algorithm.
 fn civil_from_days(z: i64) -> (i64, i64, i64) {
     let z = z + 719468;
@@ -3239,5 +3476,45 @@ mod rate_hold_tests {
         // ...and its own dedup keeps it from re-sending on the next tick.
         st.watch_options_now(&[(11536, "NSE_EQ".to_string())]);
         assert!(rx.try_recv().is_err(), "repeat strike pass must not resubscribe");
+    }
+
+    #[test]
+    fn cash_session_window_is_0915_to_1530_ist() {
+        // 2026-11-10 00:00 IST, which is a Tuesday.
+        let day0 = 1_794_268_800i64;
+        let at = |h: i64, m: i64| cash_session_open_at(day0 + h * 3600 + m * 60);
+        assert!(!at(9, 14));
+        assert!(at(9, 15));
+        assert!(at(12, 0));
+        assert!(at(15, 30));
+        assert!(!at(15, 31));
+        assert!(!at(23, 30), "MCX evening session is not the cash session");
+        // Weekend: Saturday and Sunday are closed all day.
+        assert!(!cash_session_open_at(1_794_657_600), "Saturday");
+        assert!(!cash_session_open_at(1_794_744_000), "Sunday");
+    }
+
+    #[test]
+    fn prev_close_snapshot_round_trips_and_rejects_stale_day() {
+        // Serialise through the same shape the disk snapshot uses.
+        let mut closes = HashMap::new();
+        closes.insert("IDX_I:13".to_string(), 24_986.4);
+        closes.insert("2885".to_string(), 1_324.0);
+        let today = PrevCloseStore {
+            day: ist_day_string(),
+            closes: closes.clone(),
+        };
+        let text = serde_json::to_string(&today).unwrap();
+        let back: PrevCloseStore = serde_json::from_str(&text).unwrap();
+        assert_eq!(back.day, today.day);
+        assert_eq!(back.closes.len(), 2);
+        assert_eq!(back.closes["IDX_I:13"], 24_986.4);
+
+        // A snapshot from another session must be rejected, not reused.
+        let stale = PrevCloseStore {
+            day: "1999-01-01".to_string(),
+            closes,
+        };
+        assert_ne!(stale.day, ist_day_string());
     }
 }
